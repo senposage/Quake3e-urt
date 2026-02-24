@@ -1528,7 +1528,6 @@ void SV_Frame( int msec ) {
 	// update ping based on the all received frames
 	SV_CalcPings();
 
-	if (com_dedicated->integer) SV_BotFrame (sv.time);
 
 #ifdef USE_MV
     svs.emptyFrame = qtrue;
@@ -1563,6 +1562,9 @@ void SV_Frame( int msec ) {
 			while ( sv.gameTimeResidual >= _gameMsec ) {
 				sv.gameTimeResidual -= _gameMsec;
 				sv.gameTime += _gameMsec;
+				// Bot AI ticks in lockstep with GAME_RUN_FRAME at sv_gameHz rate.
+				// Previously fired at sv_fps rate causing bot movement desync.
+				if (com_dedicated->integer) SV_BotFrame( sv.gameTime );
 				VM_Call( gvm, 1, GAME_RUN_FRAME, sv.gameTime );
 #ifdef USE_MV
 				svs.emptyFrame = qfalse; // ok, run recorder
