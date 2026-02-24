@@ -892,6 +892,9 @@ void SV_Init( void )
 
     sv_busyWait = Cvar_Get ("sv_busyWait", "4", CVAR_ARCHIVE );
     Cvar_SetDescription(sv_busyWait, "Spin for last N milliseconds before each frame instead of sleeping.\nFixes stutter at high sv_fps. Costs ~1 CPU core. 0=disabled, 4=recommended.\nDefault: 4");
+
+    sv_pmoveMsec = Cvar_Get ("sv_pmoveMsec", "8", CVAR_ARCHIVE | CVAR_SERVERINFO );
+    Cvar_SetDescription(sv_pmoveMsec, "Maximum physics step size in milliseconds. Enforces consistent movement\nregardless of client framerate. 8=125fps equivalent. 0=disabled.\nDefault: 8");
     Cvar_SetDescription(sv_fps, "Set the max frames per second the server sends the client\nDefault: 20");
 
     //Cvar_CheckRange( sv_fps, "20", "125", CV_INTEGER );
@@ -975,6 +978,7 @@ void SV_Init( void )
 	Cvar_SetGroup( sv_gameHz, CVG_SERVER );
 	Cvar_SetGroup( sv_snapshotFps, CVG_SERVER );
 	Cvar_SetGroup( sv_busyWait, CVG_SERVER );
+	Cvar_SetGroup( sv_pmoveMsec, CVG_SERVER );
 
 	// force initial check
 	SV_TrackCvarChanges();

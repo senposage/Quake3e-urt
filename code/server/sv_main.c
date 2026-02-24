@@ -31,6 +31,7 @@ cvar_t	*sv_fps;				// time rate for running non-clients
 cvar_t	*sv_gameHz;				// rate at which level.time advances, independent of sv_fps
 cvar_t	*sv_snapshotFps;			// max snapshot send rate, independent of sv_fps
 cvar_t	*sv_busyWait;				// spin last N ms before frame instead of sleeping, for precise timing at high sv_fps
+cvar_t	*sv_pmoveMsec;				// max physics step size, enforces consistent movement regardless of client framerate
 cvar_t	*sv_timeout;			// seconds without any message
 cvar_t	*sv_zombietime;			// seconds to sink messages after disconnect
 cvar_t	*sv_rconPassword;		// password for remote server commands
@@ -1327,15 +1328,40 @@ void SV_TrackCvarChanges( void )
 		Com_DPrintf( "sv_minRate adjusted to 1000\n" );
 	}
 
-	Cvar_ResetGroup( CVG_SERVER, qfalse );
+	// When sv_fps changes at runtime, clamp the time residual so it doesn't
+	// represent more than one frame at the new rate — prevents double-ticking
+	// or a stall on the first frame after the change.
+	if ( sv_fps->modified || sv_snapshotFps->modified ) {
+		qboolean fpsChanged = sv_fps->modified;
+		int newFrameMsec = 1000 / sv_fps->integer;
 
-	if ( sv.state == SS_DEAD || !svs.clients )
-		return;
-
-	for ( i = 0, cl = svs.clients; i < sv_maxclients->integer; i++, cl++ ) {
-		if ( cl->state >= CS_CONNECTED ) {
-			SV_UserinfoChanged( cl, qfalse, qfalse ); // do not update userinfo, do not run filter
+		if ( fpsChanged ) {
+			// Clamp residual to just under one frame at the new rate.
+			// Prevents burst-ticking when going from low to high sv_fps
+			// (e.g. 20->125: residual of 49ms would fire 6 frames at once).
+			if ( sv.timeResidual < 0 )
+				sv.timeResidual = 0;
+			if ( sv.timeResidual >= newFrameMsec )
+				sv.timeResidual = newFrameMsec - 1;
+			sv.gameTimeResidual = 0;
+			Com_DPrintf( "sv_fps changed to %d — residuals reset\n", sv_fps->integer );
 		}
+
+		sv_fps->modified = qfalse;
+
+		Cvar_ResetGroup( CVG_SERVER, qfalse );
+
+		if ( sv.state == SS_DEAD || !svs.clients )
+			return;
+
+		// Recalculate snapshotMsec for all clients when fps or snapshot rate changes
+		for ( i = 0, cl = svs.clients; i < sv_maxclients->integer; i++, cl++ ) {
+			if ( cl->state >= CS_CONNECTED ) {
+				SV_UserinfoChanged( cl, qfalse, qfalse );
+			}
+		}
+	} else {
+		Cvar_ResetGroup( CVG_SERVER, qfalse );
 	}
 }
 
@@ -1388,7 +1414,7 @@ void SV_Frame( int msec ) {
 	int		startTime;
 	int		i, n;
 
-	if ( Cvar_CheckGroup( CVG_SERVER ) )
+	if ( Cvar_CheckGroup( CVG_SERVER ) || sv_fps->modified )
 		SV_TrackCvarChanges(); // update rate settings, etc.
 
 	// the menu kills the server with this cvar
@@ -1426,6 +1452,12 @@ void SV_Frame( int msec ) {
 	}
 
 	sv.timeResidual += msec;
+
+	// Hard clamp: never accumulate more than one frame worth of residual.
+	// Prevents burst-ticking after sv_fps changes regardless of whether
+	// the modified flag was caught. Safe to do every frame.
+	if ( sv.timeResidual >= frameMsec * 2 )
+		sv.timeResidual = frameMsec - 1;
 
 	if ( !com_dedicated->integer )
 		SV_BotFrame( sv.time + sv.timeResidual );
