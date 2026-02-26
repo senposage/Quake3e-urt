@@ -42,8 +42,10 @@ USE_SERVER_DEMO    = 1
 
 USE_RENDERER_DLOPEN = 0
 
-CNAME            = ftwgl-20211117
-DNAME            = quake3e.ded
+BUILD_TIME       = $(shell date +%Y%m%d-%H%M%S)
+GIT_REV          = $(shell git rev-parse --short HEAD 2>/dev/null || echo $(BUILD_TIME))
+CNAME            = ftwgl-$(GIT_REV)
+DNAME            = quake3e.ded-$(GIT_REV)
 
 RENDERER_PREFIX  = $(CNAME)
 
