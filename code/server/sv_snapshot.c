@@ -958,32 +958,46 @@ static void SV_BuildCommonSnapshot( void )
 	// setup start index
 	index = sf->start;
 	{
-		// Extrapolation offset: number of ms since the last GAME_RUN_FRAME.
 		// When sv_fps > sv_gameHz, BG_PlayerStateToEntityState only updates ent->s at
-		// sv_gameHz rate. Without correction, consecutive 60Hz snapshots contain identical
-		// player positions until the next game frame — visible as stutter on other players.
-		// BG_PlayerStateToEntityState stores velocity in pos.trDelta for TR_INTERPOLATE
-		// client entities, so we can forward-extrapolate to sv.time cheaply.
+		// sv_gameHz rate (20Hz). Without correction, consecutive 60Hz snapshots contain
+		// identical player positions until the next game frame — visible stutter.
+		//
+		// Two strategies depending on client type:
+		//
+		// REAL PLAYERS: read actual playerState_t position from the game module.
+		// ps->origin has the real post-Pmove position (updated every usercmd before
+		// SV_Frame). This gives every snapshot the true physics position — no prediction
+		// error, no sawtooth from direction changes between game frames.
+		//
+		// BOTS: velocity-based extrapolation (trBase += trDelta * dt). Bot AI only
+		// ticks at sv_gameHz so their velocity is constant between game frames —
+		// linear prediction is accurate. Their ps->origin doesn't update between
+		// game frames so we can't use the playerState approach.
 		const int gameMsec = 1000 / ( sv_gameHz && sv_gameHz->integer > 0 ? sv_gameHz->integer : sv_fps->integer );
 		float extrapolateMs = (float)( sv.time - sv.gameTime );
 		if ( extrapolateMs > (float)gameMsec )
-			extrapolateMs = (float)gameMsec; // safety cap — prevent overshoot from clock drift
+			extrapolateMs = (float)gameMsec;
 
 		for ( i = 0 ; i < count ; i++, index = (index+1) % svs.numSnapshotEntities ) {
-			//index %= svs.numSnapshotEntities;
 			svs.snapshotEntities[ index ] = list[ i ]->s;
 
-			// Forward-extrapolate alive client entity positions to the current engine tick.
-			// Guard: number < maxclients (client slot) + TR_INTERPOLATE (alive/non-spectator
-			// in UT4 — spectators/dead are ET_INVISIBLE but still TR_INTERPOLATE; extrapolating
-			// them is harmless since cgame won't render them).
+			// Fix up client entity positions between game frames.
+			// Guard: client slot (number < maxclients) + TR_INTERPOLATE (alive player).
 			if ( extrapolateMs > 0.0f ) {
 				entityState_t *es = &svs.snapshotEntities[ index ];
 				if ( es->number < sv_maxclients->integer && es->pos.trType == TR_INTERPOLATE ) {
-					const float dt = extrapolateMs * 0.001f;
-					es->pos.trBase[0] += es->pos.trDelta[0] * dt;
-					es->pos.trBase[1] += es->pos.trDelta[1] * dt;
-					es->pos.trBase[2] += es->pos.trDelta[2] * dt;
+					if ( svs.clients[ es->number ].netchan.remoteAddress.type == NA_BOT ) {
+						// Bot: constant velocity between game frames — extrapolate
+						const float dt = extrapolateMs * 0.001f;
+						es->pos.trBase[0] += es->pos.trDelta[0] * dt;
+						es->pos.trBase[1] += es->pos.trDelta[1] * dt;
+						es->pos.trBase[2] += es->pos.trDelta[2] * dt;
+					} else {
+						// Real player: use actual Pmove position + current velocity
+						playerState_t *ps = SV_GameClientNum( es->number );
+						VectorCopy( ps->origin, es->pos.trBase );
+						VectorCopy( ps->velocity, es->pos.trDelta );
+					}
 				}
 			}
 

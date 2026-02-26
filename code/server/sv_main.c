@@ -1348,6 +1348,7 @@ void SV_TrackCvarChanges( void )
 		}
 
 		sv_fps->modified = qfalse;
+		sv_snapshotFps->modified = qfalse;
 
 		Cvar_ResetGroup( CVG_SERVER, qfalse );
 
@@ -1459,9 +1460,6 @@ void SV_Frame( int msec ) {
 	if ( sv.timeResidual >= frameMsec * 2 )
 		sv.timeResidual = frameMsec - 1;
 
-	if ( !com_dedicated->integer )
-		SV_BotFrame( sv.time + sv.timeResidual );
-
 	// if time is about to hit the 32nd bit, kick all clients
 	// and clear sv.time, rather
 	// than checking for negative time wraparound everywhere.
@@ -1566,8 +1564,7 @@ void SV_Frame( int msec ) {
 				sv.gameTimeResidual -= _gameMsec;
 				sv.gameTime += _gameMsec;
 				// Bot AI ticks in lockstep with GAME_RUN_FRAME at sv_gameHz rate.
-				// Previously fired at sv_fps rate causing bot movement desync.
-				if (com_dedicated->integer) SV_BotFrame( sv.gameTime );
+				SV_BotFrame( sv.gameTime );
 				VM_Call( gvm, 1, GAME_RUN_FRAME, sv.gameTime );
 #ifdef USE_MV
 				svs.emptyFrame = qfalse; // game frame fired — allow multiview recorder this tick
