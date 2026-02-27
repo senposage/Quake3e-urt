@@ -171,7 +171,7 @@ Reference: `docs/ghidra-cgame-patches.md`.
 | rcon map load broken | Likely fixed (same root cause) — needs confirmation |
 | Bleed/bandage timing | **FIXED** (confirmed live) |
 | Fast strafe visual stutter | **FIXED** (confirmed live) |
-| Bot movement | Shelved |
+| Bot movement | **FIXED** (resolved) |
 | cgame jitter tolerance | **IN PROGRESS** |
 
 ---
