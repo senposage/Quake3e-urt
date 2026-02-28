@@ -1273,7 +1273,7 @@ dmaHD_Update
 Called once each time through the main loop
 ============
 */
-void dmaHD_Update( void )
+void dmaHD_Update( int msec )
 {
     if (!s_soundStarted || s_soundMuted) return;
     // add raw data from streamed samples
