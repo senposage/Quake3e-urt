@@ -1566,10 +1566,10 @@ void SV_Frame( int msec ) {
 		//
 		// sv_gameHz <= 0 (disabled): effective rate = sv_fps. GAME_RUN_FRAME fires
 		//   every engine tick — sv.gameTime == sv.time always, no gap exists.
-		//   extrapolateMs == 0 in SV_BuildCommonSnapshot, so sv_extrapolate is a
-		//   complete no-op. sv_smoothClients still runs (TR_LINEAR is set every tick)
-		//   but there are no stale positions to correct — entity state is already
-		//   current because GAME_RUN_FRAME just fired on the same tick.
+		//   sv_extrapolate still runs: real players get a harmless ps->origin read
+		//   (same value BG_PlayerStateToEntityState wrote); bots get dt=0 (unchanged).
+		//   Critically, sv_bufferMs ring buffer queries still run and apply delayed
+		//   positions when configured. sv_smoothClients TR_LINEAR also runs every tick.
 		{
 			int _gameHz = (sv_gameHz && sv_gameHz->integer > 0) ? sv_gameHz->integer : sv_fps->integer;
 			int _gameMsec;

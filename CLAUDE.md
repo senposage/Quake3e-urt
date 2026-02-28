@@ -116,8 +116,8 @@ Com_Frame → SV_Frame(msec)
 ```
 
 **sv_gameHz modes:**
-- `sv_gameHz > 0` (e.g. 20): `GAME_RUN_FRAME` fires at sv_gameHz Hz. `sv.gameTime` lags `sv.time`; the gap drives the extrapolation patch in `SV_BuildCommonSnapshot`.
-- `sv_gameHz <= 0` (disabled): effective rate = sv_fps. `GAME_RUN_FRAME` fires every engine tick; `sv.gameTime == sv.time` always. `sv_extrapolate` is a no-op. `sv_smoothClients` still runs.
+- `sv_gameHz > 0` (e.g. 20): `GAME_RUN_FRAME` fires at sv_gameHz Hz. `sv.gameTime` lags `sv.time`; the gap drives the bot velocity extrapolation in `SV_BuildCommonSnapshot`.
+- `sv_gameHz <= 0` (disabled): effective rate = sv_fps. `GAME_RUN_FRAME` fires every engine tick; `sv.gameTime == sv.time` always. Bot dt=0 (position unchanged); real-player `ps->origin` read is harmless (same value GAME_RUN_FRAME wrote). `sv_bufferMs` ring buffer queries still apply. `sv_smoothClients` TR_LINEAR still runs.
 
 **Startup/restart settlement frames** (`SV_SpawnServer`, `SV_MapRestart_f`): `sv.time` and `sv.gameTime` advance in lockstep (100ms steps, direct calls). This bypasses the `sv_gameHz` inner loop — sv_gameHz decoupling only applies during live gameplay in `SV_Frame`.
 
@@ -133,8 +133,9 @@ Com_Frame → SV_Frame(msec)
 - Player entity state is authored at game-frame cadence; at high snapshot rate this would otherwise duplicate positions.
 - `SV_BuildCommonSnapshot` fixes up player positions between game frames: real players use actual `ps->origin` (updated by Pmove every usercmd); bots use velocity extrapolation (`trBase += trDelta * dt`) since their `ps->origin` only updates at game-frame boundaries.
 - Guarded by player index and trajectory type checks. Velocity dead-zone check prevents idle-player vibration.
-- **`sv_extrapolate` path** only runs when `sv_gameHz > 0` and between game frames (`sv.time > sv.gameTime`, i.e. `extrapolateMs > 0`). When `sv_gameHz <= 0` (disabled), `sv.gameTime == sv.time` always so `extrapolateMs == 0` and `sv_extrapolate` is a complete no-op.
-- **`sv_smoothClients` path** runs on **every** tick — including game-frame ticks — to ensure TR_LINEAR is never interrupted by a stray TR_INTERPOLATE snapshot (which would cause 50ms-period stutter at sv_gameHz 20).
+- **Both `sv_extrapolate` and `sv_smoothClients` run on every tick** — including game-frame boundary ticks and when `sv_gameHz` is disabled. The old `extrapolateMs > 0` guard on `sv_extrapolate` was removed because it incorrectly blocked Phase 1 (the `sv_bufferMs` ring buffer query) from running at game-frame boundaries and entirely when `sv_gameHz` is disabled.
+- When `extrapolateMs == 0` (game-frame tick or sv_gameHz disabled): bot velocity extrapolation is `dt=0` (position unchanged); real-player `ps->origin` read is harmless (same value `BG_PlayerStateToEntityState` wrote).
+- **`sv_smoothClients` path** sets TR_LINEAR every tick to ensure the trajectory type is never interrupted by a stray TR_INTERPOLATE snapshot on game-frame boundaries.
 
 ### Antilag (sv_antilag.c)
 

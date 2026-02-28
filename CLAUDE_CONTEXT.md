@@ -128,7 +128,7 @@ Com_Frame (real wall clock)
 **Key points:**
 - `sv.time` / `svs.time` advance at `sv_fps` rate (60Hz = every 16ms)
 - `sv.gameTime` / `level.time` advance at `sv_gameHz` rate (20Hz = every 50ms) **when sv_gameHz > 0**
-- When `sv_gameHz <= 0` (disabled): effective rate = `sv_fps`; `GAME_RUN_FRAME` fires every engine tick; `sv.gameTime == sv.time` always — no gap, `sv_extrapolate` is a no-op
+- When `sv_gameHz <= 0` (disabled): effective rate = `sv_fps`; `GAME_RUN_FRAME` fires every engine tick; `sv.gameTime == sv.time` always — no gap. Bot velocity extrapolation: dt=0 (no change); real-player ps->origin read: harmless (same value GAME_RUN_FRAME wrote). `sv_bufferMs` ring buffer queries still run.
 - Client usercmds arrive and are processed at `sv_fps` rate via `SV_ClientThink`
 - `SV_BotFrame` was previously called before this loop at sv_fps rate — caused bot AI/movement desync. Now correctly placed inside the sv_gameHz inner loop.
 - `SV_SendClientMessages` moved inside the sv_fps loop — see Packet Flow section below.
@@ -264,10 +264,11 @@ The cgame interpolates these and sees two dead frames followed by a sudden jump.
 
 ### Fix: Engine-Side Position Fixup (sv_snapshot.c)
 
-`SV_BuildCommonSnapshot` corrects player entity positions between game frames before the snapshot is stamped. The key value is `extrapolateMs = sv.time - sv.gameTime`:
+`SV_BuildCommonSnapshot` corrects player entity positions before the snapshot is stamped. Both `sv_extrapolate` and `sv_smoothClients` run on **every** tick — including game-frame boundary ticks and when `sv_gameHz` is disabled. There is no `extrapolateMs > 0` guard on `sv_extrapolate`; removing it ensures the `sv_bufferMs` ring buffer query (Phase 1) runs consistently on every tick.
 
-- **sv_gameHz > 0** (normal mode): `extrapolateMs` is positive between game frames (0 to `1000/sv_gameHz` ms). The fixup activates and corrects stale `ent->s` positions.
-- **sv_gameHz <= 0** (disabled): `sv.gameTime == sv.time` always, so `extrapolateMs == 0`. The `sv_extrapolate` path is a no-op — entity state is already current because `GAME_RUN_FRAME` just fired.
+`extrapolateMs = sv.time - sv.gameTime` drives the bot velocity path only:
+- **sv_gameHz > 0**: `extrapolateMs` is positive between game frames → bot positions advance; real-player `ps->origin` read provides fresh positions.
+- **sv_gameHz <= 0**: `extrapolateMs == 0` always → bot dt=0 (position unchanged); real-player `ps->origin` read is the same value `BG_PlayerStateToEntityState` wrote (harmless). `sv_bufferMs` delayed positions still apply.
 
 The approach differs by entity type:
 
