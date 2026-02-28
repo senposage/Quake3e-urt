@@ -88,8 +88,9 @@ static void SV_SmoothRecord( int clientNum ) {
 	slot = &hist->slots[idx];
 
 	if ( svs.clients[clientNum].netchan.remoteAddress.type == NA_BOT ) {
-		// Bot: ps->origin doesn't update between game frames.
-		// Extrapolate from entity state using velocity.
+		// Bot: ps->origin only updates at sv_gameHz rate (game-frame boundaries).
+		// Extrapolate from entity state using velocity. When sv_gameHz is disabled
+		// (sv.time == sv.gameTime), dt == 0 and the unmodified trBase is recorded.
 		sharedEntity_t *gent = SV_GentityNum( clientNum );
 		float dt = (float)( sv.time - sv.gameTime ) * 0.001f;
 		slot->origin[0] = gent->s.pos.trBase[0] + gent->s.pos.trDelta[0] * dt;
@@ -1204,6 +1205,15 @@ static void SV_BuildCommonSnapshot( void )
 		// ticks at sv_gameHz so their velocity is constant between game frames —
 		// linear prediction is accurate. Their ps->origin doesn't update between
 		// game frames so we can't use the playerState approach.
+		//
+		// sv_gameHz > 0 (e.g. 20): GAME_RUN_FRAME fires at sv_gameHz Hz. sv.gameTime
+		//   lags sv.time between game frames, so extrapolateMs = sv.time - sv.gameTime
+		//   is positive. The position fixup below activates and corrects stale ent->s.
+		//
+		// sv_gameHz <= 0 (disabled, falls back to sv_fps): GAME_RUN_FRAME fires every
+		//   engine tick. sv.gameTime == sv.time always, so extrapolateMs == 0 here.
+		//   The sv_extrapolate fixup is a no-op (entity state is already current);
+		//   sv_smoothClients still runs unconditionally to maintain TR_LINEAR on every tick.
 		const int gameMsec = 1000 / ( sv_gameHz && sv_gameHz->integer > 0 ? sv_gameHz->integer : sv_fps->integer );
 		float extrapolateMs = (float)( sv.time - sv.gameTime );
 		if ( extrapolateMs > (float)gameMsec )

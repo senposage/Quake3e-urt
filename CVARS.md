@@ -26,7 +26,9 @@ Rate at which `level.time` advances and `GAME_RUN_FRAME` fires. **MUST stay at 2
 
 **Why:** Decouples game logic rate from engine tick rate so sv_fps can be raised without breaking QVM timers (bleed, bandage, antiwarp, inactivity).
 
-**How:** Inner `while` loop in `SV_Frame()` accumulates `sv.gameTimeResidual` and fires `GAME_RUN_FRAME(sv.gameTime)` when it reaches `1000/sv_gameHz`.
+**How (sv_gameHz > 0):** Inner `while` loop in `SV_Frame()` accumulates `sv.gameTimeResidual` and fires `GAME_RUN_FRAME(sv.gameTime)` when it reaches `1000/sv_gameHz`. Between firings, `sv.gameTime` lags `sv.time` — this gap (`sv.time - sv.gameTime`) is what the extrapolation patch reads in `SV_BuildCommonSnapshot` to correct stale player entity positions.
+
+**How (sv_gameHz <= 0, disabled):** Effective rate falls back to `sv_fps`. `GAME_RUN_FRAME` fires on every engine tick; `sv.gameTime == sv.time` always, no gap. The `sv_extrapolate` fixup computes `extrapolateMs == 0` and is a complete no-op. `sv_smoothClients` (TR_LINEAR) still runs unconditionally on every tick.
 
 ---
 
@@ -62,7 +64,7 @@ Engine-side position correction for high sv_fps snapshots.
 
 **Why:** At sv_fps 60 with sv_gameHz 20, the entity state (`ent->s`) only updates every 3rd engine tick. Without correction, clients see players teleporting every 50ms instead of moving smoothly every 16ms.
 
-**How:** `sv_snapshot.c:SV_BuildCommonSnapshot()` checks `sv.time - sv.gameTime > 0` (between game frames). For real players, copies `ps->origin` → `es->pos.trBase` and `ps->velocity` → `es->pos.trDelta`. Velocity dead-zone check `DotProduct(velocity, velocity) > 100.0` prevents idle player vibration from Pmove ground snapping micro-oscillations. Note: `sv_extrapolate` skips the fixup at game-frame boundaries (no work needed); `sv_smoothClients` runs on every tick so TR_LINEAR is never interrupted.
+**How:** `sv_snapshot.c:SV_BuildCommonSnapshot()` computes `extrapolateMs = sv.time - sv.gameTime`. When `sv_gameHz > 0`, this value is positive between game frames (up to `1000/sv_gameHz` ms) and the fixup activates. When `sv_gameHz <= 0` (disabled), `sv.gameTime == sv.time` always so `extrapolateMs == 0` and `sv_extrapolate` is a complete no-op — entity state is already current because `GAME_RUN_FRAME` fired on the same tick. For real players, copies `ps->origin` → `es->pos.trBase` and `ps->velocity` → `es->pos.trDelta`. Velocity dead-zone check `DotProduct(velocity, velocity) > 100.0` prevents idle player vibration from Pmove ground snapping micro-oscillations. Note: `sv_extrapolate` skips the fixup at game-frame boundaries (no work needed); `sv_smoothClients` runs on every tick so TR_LINEAR is never interrupted.
 
 ---
 

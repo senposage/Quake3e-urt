@@ -4,8 +4,9 @@ sv_antilag.c - Engine-side shadow antilag system for Quake3e / UrbanTerror
 
 Architecture overview:
 ───────────────────────────────────────────────────────────────────────────
-  GAME TICK (sv_gameHz Hz)       → QVM sees this. level.time advances here.
-                                   QVM's own FIFO antilag runs here unchanged.
+  GAME TICK (sv_gameHz Hz, or sv_fps Hz when sv_gameHz <= 0)
+                               → QVM sees this. level.time advances here.
+                                 QVM's own FIFO antilag runs here unchanged.
 
   SHADOW SUB-TICK (sv_fps * sv_physicsScale Hz)
                                  → Engine only. Records entity positions into
@@ -21,6 +22,7 @@ Architecture overview:
 
 QVM CONTRACT (never violated):
   - level.time advances exactly (1000/sv_gameHz) ms per game frame
+    (or 1000/sv_fps when sv_gameHz <= 0 — GAME_RUN_FRAME fires every engine tick)
   - Entity state is stable and correct at every GAME_RUN_FRAME entry
   - G_Damage is called with valid entity pointers, same signature
   - trap_Trace returns results consistent with current game state
@@ -479,7 +481,7 @@ void SV_Antilag_Init( void ) {
     SV_Antilag_ComputeConfig();
 
     Com_Printf( "SV_Antilag: game=%dHz shadow=%dHz slots=%d covers~%dms maxRewind=%dms debug=%d rateDebug=%d\n",
-        sv_gameHz ? sv_gameHz->integer : 20,
+        (sv_gameHz && sv_gameHz->integer > 0) ? sv_gameHz->integer : (sv_fps ? sv_fps->integer : 20),
         1000 / sv_shadowTickMs,
         sv_shadowHistorySlots,
         sv_shadowHistorySlots * sv_shadowTickMs,

@@ -91,7 +91,7 @@ typedef struct {
 	int				restartTime;
 	int				time;
 
-	int				gameTime;			// QVM-facing level.time, advances at sv_gameHz
+	int				gameTime;			// QVM-facing level.time; advances at sv_gameHz rate (or sv_fps when sv_gameHz <= 0)
 	int				gameTimeResidual;	// accumulator for gameTime sub-tick
 
 	byte			baselineUsed[ MAX_GENTITIES ];

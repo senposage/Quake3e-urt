@@ -112,7 +112,7 @@ Com_Frame (real wall clock)
 
            emptyFrame = true  ← reset per sv_fps tick for USE_MV multiview recorder
            gameTimeResidual += frameMsec
-           while gameTimeResidual >= gameMsec (1000/sv_gameHz):
+           while gameTimeResidual >= gameMsec (1000/sv_gameHz, or 1000/sv_fps when sv_gameHz <= 0):
                gameTimeResidual -= gameMsec
                sv.gameTime += gameMsec
                SV_BotFrame(sv.gameTime)        ← IMPORTANT: bot AI ticks here, in lockstep
@@ -127,10 +127,12 @@ Com_Frame (real wall clock)
 
 **Key points:**
 - `sv.time` / `svs.time` advance at `sv_fps` rate (60Hz = every 16ms)
-- `sv.gameTime` / `level.time` advance at `sv_gameHz` rate (20Hz = every 50ms)
+- `sv.gameTime` / `level.time` advance at `sv_gameHz` rate (20Hz = every 50ms) **when sv_gameHz > 0**
+- When `sv_gameHz <= 0` (disabled): effective rate = `sv_fps`; `GAME_RUN_FRAME` fires every engine tick; `sv.gameTime == sv.time` always — no gap, `sv_extrapolate` is a no-op
 - Client usercmds arrive and are processed at `sv_fps` rate via `SV_ClientThink`
 - `SV_BotFrame` was previously called before this loop at sv_fps rate — caused bot AI/movement desync. Now correctly placed inside the sv_gameHz inner loop.
 - `SV_SendClientMessages` moved inside the sv_fps loop — see Packet Flow section below.
+- **Startup/restart settlement frames** (`SV_SpawnServer`, `SV_MapRestart_f`): `sv.time` and `sv.gameTime` advance in lockstep (100ms direct calls), bypassing the sv_gameHz inner loop. sv_gameHz decoupling is a live-gameplay-only concept.
 
 ### Client Think (sv_client.c — SV_ClientThink)
 
@@ -262,7 +264,12 @@ The cgame interpolates these and sees two dead frames followed by a sudden jump.
 
 ### Fix: Engine-Side Position Fixup (sv_snapshot.c)
 
-`SV_BuildCommonSnapshot` corrects player entity positions between game frames before the snapshot is stamped. The approach differs by entity type:
+`SV_BuildCommonSnapshot` corrects player entity positions between game frames before the snapshot is stamped. The key value is `extrapolateMs = sv.time - sv.gameTime`:
+
+- **sv_gameHz > 0** (normal mode): `extrapolateMs` is positive between game frames (0 to `1000/sv_gameHz` ms). The fixup activates and corrects stale `ent->s` positions.
+- **sv_gameHz <= 0** (disabled): `sv.gameTime == sv.time` always, so `extrapolateMs == 0`. The `sv_extrapolate` path is a no-op — entity state is already current because `GAME_RUN_FRAME` just fired.
+
+The approach differs by entity type:
 
 **Real players** — `ps->origin` is already the correct post-Pmove position (updated by `SV_ClientThink` every usercmd). We copy it directly:
 ```c

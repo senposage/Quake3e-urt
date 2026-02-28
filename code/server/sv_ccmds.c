@@ -325,6 +325,9 @@ static void SV_MapRestart_f( void ) {
 	SV_RestartGameProgs();
 
 	// run a few frames to allow everything to settle
+	// sv.time and sv.gameTime advance in lockstep here (100ms steps each),
+	// bypassing the sv_gameHz inner loop. sv_gameHz decoupling only applies
+	// during live gameplay in SV_Frame — not during startup/restart settlement.
 	for ( i = 0; i < 3; i++ )
 	{
 		sv.time += 100;
@@ -374,6 +377,8 @@ static void SV_MapRestart_f( void ) {
 	}
 
 	// run another frame to allow things to look at all the players
+	// sv.time and sv.gameTime advance in lockstep here (same direct pattern as
+	// the settlement loop above — bypasses sv_gameHz inner-loop logic).
 	sv.time += 100;
 	sv.gameTime += 100;
 	VM_Call( gvm, 1, GAME_RUN_FRAME, sv.gameTime );

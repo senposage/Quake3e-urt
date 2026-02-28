@@ -7,7 +7,7 @@ Quick reference for finding key code paths. All custom changes are in `code/serv
 ## Server Core
 
 ### Frame Loop
-- **`code/server/sv_main.c`** — `SV_Frame()`: outer sv_fps loop, inner sv_gameHz loop, snapshot dispatch, SV_BotFrame placement
+- **`code/server/sv_main.c`** — `SV_Frame()`: outer sv_fps loop, inner sv_gameHz loop (falls back to sv_fps when sv_gameHz <= 0), snapshot dispatch, SV_BotFrame placement
 - **`code/server/sv_init.c`** — All custom cvar registration (sv_fps, sv_gameHz, sv_snapshotFps, sv_pmoveMsec, sv_extrapolate, sv_smoothClients, sv_bufferMs, sv_velSmooth, sv_busyWait)
 
 ### Client Think / Physics
