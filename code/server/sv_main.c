@@ -1332,6 +1332,30 @@ void SV_TrackCvarChanges( void )
 		Com_DPrintf( "sv_minRate adjusted to 1000\n" );
 	}
 
+	// When sv_gameHz changes at runtime, clamp gameTimeResidual so it doesn't
+	// burst-fire multiple game frames on the next tick
+	// (e.g. 20→60 Hz: a 49ms residual would fire 3 game frames at once).
+	if ( sv_gameHz->modified ) {
+		int _gameHz = (sv_gameHz->integer > 0) ? sv_gameHz->integer : sv_fps->integer;
+		int newGameMsec;
+		if ( _gameHz < 1 )               _gameHz = 1;
+		if ( _gameHz > sv_fps->integer ) _gameHz = sv_fps->integer;
+		newGameMsec = 1000 / _gameHz;
+		if ( sv.gameTimeResidual < 0 )
+			sv.gameTimeResidual = 0;
+		if ( sv.gameTimeResidual >= newGameMsec )
+			sv.gameTimeResidual = newGameMsec - 1;
+		Com_DPrintf( "sv_gameHz changed to %d — gameTimeResidual clamped\n", sv_gameHz->integer );
+	}
+
+	// Flush the position ring buffer whenever any timing-affecting cvar changes.
+	// Old entries were recorded at a different tick rate or delay target and will
+	// produce wrong interpolated positions at the new settings.
+	if ( sv_fps->modified || sv_gameHz->modified || sv_bufferMs->modified || sv_velSmooth->modified ) {
+		SV_SmoothInit();
+		Com_DPrintf( "position ring buffer flushed due to timing cvar change\n" );
+	}
+
 	// When sv_fps changes at runtime, clamp the time residual so it doesn't
 	// represent more than one frame at the new rate — prevents double-ticking
 	// or a stall on the first frame after the change.
@@ -1347,10 +1371,16 @@ void SV_TrackCvarChanges( void )
 				sv.timeResidual = 0;
 			if ( sv.timeResidual >= newFrameMsec )
 				sv.timeResidual = newFrameMsec - 1;
-			// NOTE: do NOT reset sv.gameTimeResidual here. sv_gameHz doesn't
-			// change, so the accumulated game frame progress is still valid.
-			// Resetting it throws away up to 49ms of progress, causing a gap
-			// where no game frame fires — visible as bot/entity stutter.
+			// When sv_gameHz <= 0 the game frame rate equals sv_fps; clamp
+			// gameTimeResidual here too so the burst-fire protection covers
+			// that mode. When sv_gameHz > 0 the interval is unchanged and
+			// the accumulated progress remains valid — leave it alone.
+			if ( sv_gameHz->integer <= 0 ) {
+				if ( sv.gameTimeResidual < 0 )
+					sv.gameTimeResidual = 0;
+				if ( sv.gameTimeResidual >= newFrameMsec )
+					sv.gameTimeResidual = newFrameMsec - 1;
+			}
 			Com_DPrintf( "sv_fps changed to %d — timeResidual clamped\n", sv_fps->integer );
 		}
 

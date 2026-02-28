@@ -607,6 +607,7 @@ void SV_SpawnServer( const char *mapname, qboolean killBots ) {
 	sv.time = sv.time ? sv.time : 8;
 	sv.gameTime = sv.time;
 	sv.gameTimeResidual = 0;
+	SV_SmoothInit(); // flush stale ring buffer entries from the previous map
 
 	// load and spawn all other entities
 	SV_InitGameProgs();
