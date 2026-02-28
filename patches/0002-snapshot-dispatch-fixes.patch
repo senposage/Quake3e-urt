@@ -1,104 +1,53 @@
-From 28a1a8c3eaa87cf6d0f46b5289dfa69f25cb5d97 Mon Sep 17 00:00:00 2001
+From 4a1c1306cf9f5aeb59f4f8fd6dbde2c86d3c0f3f Mon Sep 17 00:00:00 2001
 From: senposage <onemoar@gmail.com>
 Date: Tue, 24 Feb 2026 19:20:43 -0500
-Subject: [PATCH]  SV_IssueNewSnapshot() + SV_SendClientMessages() moved inside
- the sv_fps while loop in sv_main.c. Each tick now dispatches its own snapshot
- opportunity. Two ticks = two dispatch calls = two snapshots. OS timing jitter
- no longer causes gaps.
+Subject: [PATCH] server: dispatch snapshot issue/send per sv_fps tick (vanilla
+ path)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit
 
-  SV_CheckTimeouts stays outside (once per Com_Frame is sufficient).
+Move `SV_IssueNewSnapshot()` and `SV_SendClientMessages()` into the inner
+`sv_fps` tick loop so each engine tick gets its own snapshot-dispatch
+opportunity. This avoids packet cadence gaps when multiple ticks are consumed
+inside one `Com_Frame` due to scheduler jitter.
 
-  The USE_MV emptyFrame flag is now reset to qtrue at the start of each sv_fps tick and cleared when a GAME_RUN_FRAME actually fires — multiview recording still happens at game-frame rate, just tied to tick boundaries instead of Com_Frame boundaries
+This rewrite intentionally stays on the vanilla `sv_fps` path only.
 ---
- code/server/sv_ccmds.c    |  8 ++++--
- code/server/sv_main.c     | 28 +++++++++++----------
- code/server/sv_snapshot.c | 53 +++++++++++++++++++++------------------
- 3 files changed, 49 insertions(+), 40 deletions(-)
+ code/server/sv_main.c | 23 ++++++++++++++---------
+ 1 file changed, 14 insertions(+), 9 deletions(-)
 
-diff --git a/code/server/sv_ccmds.c b/code/server/sv_ccmds.c
-index 2bb708b..c5000c4 100644
---- a/code/server/sv_ccmds.c
-+++ b/code/server/sv_ccmds.c
-@@ -319,6 +319,8 @@ static void SV_MapRestart_f( void ) {
- 
- 	// make sure that level time is not zero
- 	sv.time = sv.time ? sv.time : 8;
-+	sv.gameTime = sv.time;
-+	sv.gameTimeResidual = 0;
- 
- 	SV_RestartGameProgs();
- 
-@@ -326,7 +328,8 @@ static void SV_MapRestart_f( void ) {
- 	for ( i = 0; i < 3; i++ )
- 	{
- 		sv.time += 100;
--		VM_Call( gvm, 1, GAME_RUN_FRAME, sv.time );
-+		sv.gameTime += 100;
-+		VM_Call( gvm, 1, GAME_RUN_FRAME, sv.gameTime );
- 	}
- 
- 	sv.state = SS_GAME;
-@@ -372,7 +375,8 @@ static void SV_MapRestart_f( void ) {
- 
- 	// run another frame to allow things to look at all the players
- 	sv.time += 100;
--	VM_Call( gvm, 1, GAME_RUN_FRAME, sv.time );
-+	sv.gameTime += 100;
-+	VM_Call( gvm, 1, GAME_RUN_FRAME, sv.gameTime );
- 	svs.time += 100;
- }
- 
 diff --git a/code/server/sv_main.c b/code/server/sv_main.c
-index 3689ff6..33c6612 100644
+index 1958ae1..5b2bf7d 100644
 --- a/code/server/sv_main.c
 +++ b/code/server/sv_main.c
-@@ -1529,11 +1529,11 @@ void SV_Frame( int msec ) {
- 	SV_CalcPings();
- 
- 
--#ifdef USE_MV
--    svs.emptyFrame = qtrue;
--#endif
--
+@@ -1532,8 +1532,13 @@ void SV_Frame( int msec ) {
+ #ifdef USE_MV
+     svs.emptyFrame = qtrue;
+ #endif
++
  	// run the game simulation in chunks
-+	// Snapshot dispatch is inside this loop so each engine tick at sv_fps rate produces
-+	// its own snapshot send opportunity. Without this, OS scheduler jitter can cause
-+	// two ticks to fire in one Com_Frame with only one SV_SendClientMessages call,
-+	// creating a double-interval gap visible in the netgraph as late packets.
++	// Snapshot dispatch is inside this loop so each engine tick at sv_fps rate
++	// produces its own snapshot send opportunity. Without this, OS scheduler
++	// jitter can cause two ticks to fire in one Com_Frame with only one
++	// SV_SendClientMessages call, creating a double-interval gap.
  	while ( sv.timeResidual >= frameMsec ) {
  		sv.timeResidual -= frameMsec;
  		svs.time += frameMsec;
-@@ -1559,6 +1559,9 @@ void SV_Frame( int msec ) {
- 			if ( _gameHz > sv_fps->integer ) _gameHz = sv_fps->integer;
- 			_gameMsec = 1000 / _gameHz;
- 			sv.gameTimeResidual += frameMsec;
-+#ifdef USE_MV
-+			svs.emptyFrame = qtrue; // assume no game frame this sv_fps tick; cleared below if one fires
-+#endif
- 			while ( sv.gameTimeResidual >= _gameMsec ) {
- 				sv.gameTimeResidual -= _gameMsec;
- 				sv.gameTime += _gameMsec;
-@@ -1567,27 +1570,26 @@ void SV_Frame( int msec ) {
- 				if (com_dedicated->integer) SV_BotFrame( sv.gameTime );
- 				VM_Call( gvm, 1, GAME_RUN_FRAME, sv.gameTime );
- #ifdef USE_MV
--				svs.emptyFrame = qfalse; // ok, run recorder
-+				svs.emptyFrame = qfalse; // game frame fired — allow multiview recorder this tick
+@@ -1544,6 +1549,12 @@ void SV_Frame( int msec ) {
  #endif
- 			}
- 		}
+ 		if ( com_dedicated->integer ) SV_BotFrame( sv.time );
+ 		VM_Call( gvm, 1, GAME_RUN_FRAME, sv.time );
 +
-+		// Issue and dispatch snapshots once per sv_fps tick, not once per Com_Frame.
-+		// This ensures clients receive packets at the true tick rate regardless of
-+		// how many ticks fire per real-world Com_Frame call.
++		// Issue and dispatch snapshots once per sv_fps tick, not once per
++		// outer Com_Frame. This keeps packet cadence aligned with server ticks.
 +		SV_IssueNewSnapshot();
 +		SV_SendClientMessages();
- 	}
- 
- 	if ( com_speeds->integer ) {
++
+ #ifdef USE_MV
+ 		svs.emptyFrame = qfalse; // ok, run recorder
+ #endif
+@@ -1554,15 +1565,9 @@ void SV_Frame( int msec ) {
  		time_game = Sys_Milliseconds () - startTime;
  	}
  
@@ -113,75 +62,7 @@ index 3689ff6..33c6612 100644
 -	SV_SendClientMessages();
 -
  #ifdef USE_MV
--    svs.emptyFrame = qfalse;
+     svs.emptyFrame = qfalse;
      if ( sv_autoRecord->integer > 0 ) {
-         if ( sv_demoFile == FS_INVALID_HANDLE ) {
-             if ( SV_FindActiveClient( qtrue, -1, sv_autoRecord->integer ) >= 0 ) {
-diff --git a/code/server/sv_snapshot.c b/code/server/sv_snapshot.c
-index 3cd18aa..3820a1e 100644
---- a/code/server/sv_snapshot.c
-+++ b/code/server/sv_snapshot.c
-@@ -957,32 +957,35 @@ static void SV_BuildCommonSnapshot( void )
- 
- 	// setup start index
- 	index = sf->start;
--	for ( i = 0 ; i < count ; i++, index = (index+1) % svs.numSnapshotEntities ) {
--		//index %= svs.numSnapshotEntities;
--		svs.snapshotEntities[ index ] = list[ i ]->s;
--
--		// Velocity-based entity smoothing for player entities.
--		// BG_PlayerStateToEntityState() sets TR_INTERPOLATE (no velocity) for
--		// all players. At higher sv_fps, fast direction changes produce visible
--		// stutter because the client lerps straight lines between positions.
--		// Override to TR_LINEAR_STOP with velocity so the client can smooth the
--		// path between snapshots — equivalent to BG_PlayerStateToEntityStateExtraPolate
--		// which exists in the QVM but is never called.
--		// trDuration = snapshot interval in ms (how long this velocity is valid).
--		// Only applied to active players (ET_PLAYER), not spectators/dead (ET_INVISIBLE).
--		if ( svs.snapshotEntities[ index ].number < MAX_CLIENTS
--			&& svs.snapshotEntities[ index ].eType == ET_PLAYER
--			&& svs.snapshotEntities[ index ].pos.trType == TR_INTERPOLATE ) {
--			int _snapMsec = sv_snapshotFps && sv_snapshotFps->integer > 0
--				? 1000 / sv_snapshotFps->integer
--				: 1000 / sv_fps->integer;
--			svs.snapshotEntities[ index ].pos.trType     = TR_LINEAR_STOP;
--			svs.snapshotEntities[ index ].pos.trTime     = svs.time;
--			svs.snapshotEntities[ index ].pos.trDuration = _snapMsec + 10; // small buffer
--			// trDelta (velocity) was already set by BG_PlayerStateToEntityState
--		}
-+	{
-+		// Extrapolation offset: number of ms since the last GAME_RUN_FRAME.
-+		// When sv_fps > game-frame, BG_PlayerStateToEntityState only updates ent->s at
-+		// game-frame rate. Without correction, consecutive 60Hz snapshots contain identical
-+		// player positions until the next game frame — visible as stutter on other players.
-+		// BG_PlayerStateToEntityState stores velocity in pos.trDelta for TR_INTERPOLATE
-+		// client entities, so we can forward-extrapolate to sv.time cheaply.
-+		const float extrapolateMs = (float)( sv.time - sv.gameTime );
-+
-+		for ( i = 0 ; i < count ; i++, index = (index+1) % svs.numSnapshotEntities ) {
-+			//index %= svs.numSnapshotEntities;
-+			svs.snapshotEntities[ index ] = list[ i ]->s;
-+
-+			// Forward-extrapolate alive client entity positions to the current engine tick.
-+			// Guard: number < maxclients (client slot) + TR_INTERPOLATE (alive/non-spectator
-+			// in UT4 — spectators/dead are ET_INVISIBLE but still TR_INTERPOLATE; extrapolating
-+			// them is harmless since cgame won't render them).
-+			if ( extrapolateMs > 0.0f ) {
-+				entityState_t *es = &svs.snapshotEntities[ index ];
-+				if ( es->number < sv_maxclients->integer && es->pos.trType == TR_INTERPOLATE ) {
-+					const float dt = extrapolateMs * 0.001f;
-+					es->pos.trBase[0] += es->pos.trDelta[0] * dt;
-+					es->pos.trBase[1] += es->pos.trDelta[1] * dt;
-+					es->pos.trBase[2] += es->pos.trDelta[2] * dt;
-+				}
-+			}
- 
--		sf->ents[ i ] = &svs.snapshotEntities[ index ];
-+			sf->ents[ i ] = &svs.snapshotEntities[ index ];
-+		}
- 	}
- }
- 
 -- 
 2.43.0
-
