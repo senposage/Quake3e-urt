@@ -15,7 +15,7 @@ Engine tick and input sampling rate (Hz). Controls how often the server processe
 
 **How:** `sv_main.c:SV_Frame()` outer `while` loop runs at sv_fps rate. `sv.time` and `svs.time` advance by `1000/sv_fps` per tick.
 
-**Interpolation windows:** sv_fps 20=50ms, 60=16.7ms, 90=11.1ms, 125=8ms. Higher rates = tighter windows = less tolerance for network jitter.
+**Interpolation windows:** sv_fps 20=50ms, 60=16.7ms, 80=12.5ms, 100=10ms, 125=8ms. Higher rates = tighter windows = less tolerance for network jitter. The snapshot interval also sets the **minimum sv_bufferMs** for clean ring-buffer interpolation — see sv_bufferMs for the per-rate table.
 
 ---
 
@@ -123,10 +123,25 @@ Per-client position ring buffer with configurable delay.
 
 - **0** = disabled. No ring buffer position delay, no extra latency. `trBase` is always the current `ps->origin` (straight pass-through). This applies regardless of `sv_smoothClients` setting — when `sv_bufferMs 0`, there is zero added position latency even in TR_LINEAR mode. `sv_velSmooth` may still average the velocity vector but does not delay the position.
 - **-1** = auto. Computes `50 - (1000/sv_fps)` to match vanilla 50ms total latency:
-  - sv_fps 125: auto = 42ms buffer (8ms interval + 42ms delay = 50ms total)
-  - sv_fps 60: auto = 34ms buffer (16ms + 34ms = 50ms total)
   - sv_fps 20: auto = 0ms (already at 50ms, no delay needed)
+  - sv_fps 40: auto = 25ms buffer (25ms + 25ms = 50ms total)
+  - sv_fps 60: auto = 34ms buffer (16ms + 34ms = 50ms total)
+  - sv_fps 80: auto = 38ms buffer (12ms + 38ms = 50ms total)
+  - sv_fps 100: auto = 40ms buffer (10ms + 40ms = 50ms total)
+  - sv_fps 125: auto = 42ms buffer (8ms + 42ms = 50ms total)
 - **1-100** = manual delay in milliseconds.
+
+**Minimum values to avoid under/overshoot:** For the ring buffer to straddle a direction change (interpolate *through* the reversal rather than snap to the nearest entry), `bufMs` must be at least one full snapshot interval — `ceil(1000/sv_fps)`. Below this the lookup succeeds but falls within the most-recent interval, giving negligible position history.
+
+| sv_fps | Snapshot interval | Min bufMs | Auto (-1) bufMs | Total latency at auto |
+|--------|------------------|-----------|-----------------|-----------------------|
+| 20     | 50 ms            | 50 ms     | 0 ms            | 50 ms (vanilla)       |
+| 40     | 25 ms            | 25 ms     | 25 ms           | 50 ms                 |
+| 60     | 17 ms            | 17 ms     | 34 ms           | 50 ms                 |
+| 80     | 13 ms            | 13 ms     | 38 ms           | 50 ms                 |
+| 100    | 10 ms            | 10 ms     | 40 ms           | 50 ms                 |
+
+Note: at sv_fps ≥ 40 the auto value is *larger* than the minimum — it adds an extra stability margin to match the vanilla 50 ms total interpolation window. Using the bare minimum trades that margin for lower latency.
 
 **Why:** At high sv_fps, rapid direction changes produce sawtooth artifacts because each snapshot captures a slightly different velocity vector. The ring buffer provides two smoothing strategies:
 
