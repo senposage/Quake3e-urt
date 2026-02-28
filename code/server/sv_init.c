@@ -908,7 +908,8 @@ void SV_Init( void )
     Cvar_SetDescription(sv_smoothClients, "Set player trajectory type to TR_LINEAR for smoother client rendering.\n"
         "0 = TR_INTERPOLATE (cgame lerps between snapshot positions)\n"
         "1 = TR_LINEAR (cgame evaluates trBase + trDelta*dt continuously)\n"
-        "Overrides sv_extrapolate when enabled. Experimental.\n"
+        "Works independently of sv_extrapolate. Experimental.\n"
+        "sv_bufferMs 0 = no position latency (trBase = current ps->origin).\n"
         "Default: 0");
 
     sv_bufferMs = Cvar_Get ("sv_bufferMs", "0", CVAR_ARCHIVE );

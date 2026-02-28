@@ -76,7 +76,7 @@ Engine-side position correction for high sv_fps snapshots.
 
 **Why:** With `TR_INTERPOLATE`, cgame linearly interpolates between the previous and current snapshot positions. When a player reverses direction, the interpolation target is wrong until the next snapshot arrives — visible as a brief drift in the wrong direction. `TR_LINEAR` lets cgame compute position from velocity at any time, potentially smoother for direction changes.
 
-**How:** `sv_snapshot.c:SV_BuildCommonSnapshot()` sets `es->pos.trType = TR_LINEAR` and `es->pos.trTime = sv.time`. Requires `sv_extrapolate 1`. When `sv_smoothClients 1` is enabled, it uses the position resolved by `sv_bufferMs` (Phase 1) as the base, then applies velocity smoothing from `sv_velSmooth` (if enabled) for `trDelta`. The two settings now compose: `sv_bufferMs` controls the position source, `sv_smoothClients` controls the trajectory type.
+**How:** `sv_snapshot.c:SV_BuildCommonSnapshot()` sets `es->pos.trType = TR_LINEAR` and `es->pos.trTime = sv.time`. Works independently of `sv_extrapolate` — no longer requires it to be enabled. When `sv_smoothClients 1` is enabled, it uses the position resolved by `sv_bufferMs` (Phase 1) as the base, then applies velocity smoothing from `sv_velSmooth` (if enabled) for `trDelta`. The two settings now compose: `sv_bufferMs` controls the position source, `sv_smoothClients` controls the trajectory type.
 
 **Safety:** Idle players (velocity near zero) are NOT switched to TR_LINEAR — they stay TR_INTERPOLATE to prevent extrapolation drift/vibration. The DotProduct > 100.0 dead-zone check applies to both smoothed velocity (ring buffer path) and raw velocity (fallback path). Pmove operates on playerState only and does NOT interact with entityState trajectory type changes.
 
@@ -121,7 +121,7 @@ Maximum rewind window for antilag (ms). Players with ping above this get no anti
 
 Per-client position ring buffer with configurable delay.
 
-- **0** = disabled. No ring buffer, no extra latency. Falls through to direct position correction (sv_extrapolate).
+- **0** = disabled. No ring buffer position delay, no extra latency. `trBase` is always the current `ps->origin` (straight pass-through). This applies regardless of `sv_smoothClients` setting — when `sv_bufferMs 0`, there is zero added position latency even in TR_LINEAR mode. `sv_velSmooth` may still average the velocity vector but does not delay the position.
 - **-1** = auto. Computes `50 - (1000/sv_fps)` to match vanilla 50ms total latency:
   - sv_fps 125: auto = 42ms buffer (8ms interval + 42ms delay = 50ms total)
   - sv_fps 60: auto = 34ms buffer (16ms + 34ms = 50ms total)
