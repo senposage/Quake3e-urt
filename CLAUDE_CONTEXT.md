@@ -55,7 +55,7 @@ The default was intentionally set to match the QVM's assumed frame rate. A range
 // original — inside the sv_fps while loop
 VM_Call( gvm, 1, GAME_RUN_FRAME, sv.time );
 ```
-There was no separate `sv.gameTime`. At `sv_fps 60`, `level.time` would advance 16ms per engine tick instead of 50ms. The QVM antiwarp blank command injection `cmd.serverTime += 50` then fires a 50ms ghost usercmd every 16ms of real time — teleporting lagging players at 3× the intended rate. This is the hardest-breaking issue and the primary reason `sv_gameHz` must stay locked at 20.
+There was no separate `sv.gameTime`. At `sv_fps 60`, `level.time` would advance 16ms per engine tick instead of 50ms. The QVM antiwarp blank command injection `cmd.serverTime += 50` then fires a 50ms ghost usercmd every 16ms of real time — teleporting lagging players at 3× the intended rate. This was the hardest-breaking issue with UT4.2 QVM. Note: some of these constraints may have been relaxed in UT4.3.4 — further testing is needed before drawing firm conclusions.
 
 ### 3. No separate game clock — decoupling was impossible
 Because `GAME_RUN_FRAME` received `sv.time` directly and there was no `sv.gameTime` / `gameTimeResidual`, there was no mechanism to run the engine tick at one rate and the QVM at another. The two were the same variable.
@@ -112,7 +112,7 @@ Com_Frame (real wall clock)
 
            emptyFrame = true  ← reset per sv_fps tick for USE_MV multiview recorder
            gameTimeResidual += frameMsec
-           while gameTimeResidual >= gameMsec (1000/sv_gameHz):
+           while gameTimeResidual >= gameMsec (1000/sv_gameHz, or 1000/sv_fps when sv_gameHz <= 0):
                gameTimeResidual -= gameMsec
                sv.gameTime += gameMsec
                SV_BotFrame(sv.gameTime)        ← IMPORTANT: bot AI ticks here, in lockstep
@@ -127,10 +127,12 @@ Com_Frame (real wall clock)
 
 **Key points:**
 - `sv.time` / `svs.time` advance at `sv_fps` rate (60Hz = every 16ms)
-- `sv.gameTime` / `level.time` advance at `sv_gameHz` rate (20Hz = every 50ms)
+- `sv.gameTime` / `level.time` advance at `sv_gameHz` rate (20Hz = every 50ms) **when sv_gameHz > 0**
+- When `sv_gameHz <= 0` (disabled): effective rate = `sv_fps`; `GAME_RUN_FRAME` fires every engine tick; `sv.gameTime == sv.time` always — no gap. Bot velocity extrapolation: dt=0 (no change); real-player ps->origin read: harmless (same value GAME_RUN_FRAME wrote). `sv_bufferMs` ring buffer queries still run.
 - Client usercmds arrive and are processed at `sv_fps` rate via `SV_ClientThink`
 - `SV_BotFrame` was previously called before this loop at sv_fps rate — caused bot AI/movement desync. Now correctly placed inside the sv_gameHz inner loop.
 - `SV_SendClientMessages` moved inside the sv_fps loop — see Packet Flow section below.
+- **Startup/restart settlement frames** (`SV_SpawnServer`, `SV_MapRestart_f`): `sv.time` and `sv.gameTime` advance in lockstep (100ms direct calls), bypassing the sv_gameHz inner loop. sv_gameHz decoupling is a live-gameplay-only concept.
 
 ### Client Think (sv_client.c — SV_ClientThink)
 
@@ -262,7 +264,13 @@ The cgame interpolates these and sees two dead frames followed by a sudden jump.
 
 ### Fix: Engine-Side Position Fixup (sv_snapshot.c)
 
-`SV_BuildCommonSnapshot` corrects player entity positions between game frames before the snapshot is stamped. The approach differs by entity type:
+`SV_BuildCommonSnapshot` corrects player entity positions before the snapshot is stamped. Both `sv_extrapolate` and `sv_smoothClients` run on **every** tick — including game-frame boundary ticks and when `sv_gameHz` is disabled. There is no `extrapolateMs > 0` guard on `sv_extrapolate`; removing it ensures the `sv_bufferMs` ring buffer query (Phase 1) runs consistently on every tick.
+
+`extrapolateMs = sv.time - sv.gameTime` drives the bot velocity path only:
+- **sv_gameHz > 0**: `extrapolateMs` is positive between game frames → bot positions advance; real-player `ps->origin` read provides fresh positions.
+- **sv_gameHz <= 0**: `extrapolateMs == 0` always → bot dt=0 (position unchanged); real-player `ps->origin` read is the same value `BG_PlayerStateToEntityState` wrote (harmless). `sv_bufferMs` delayed positions still apply.
+
+The approach differs by entity type:
 
 **Real players** — `ps->origin` is already the correct post-Pmove position (updated by `SV_ClientThink` every usercmd). We copy it directly:
 ```c
@@ -311,9 +319,9 @@ Fix requires patching cgame QVM: `animationTime` should use `snap->serverTime` n
 
 ---
 
-## QVM Constraints — Why sv_gameHz Must Stay at 20
+## QVM Constraints — g_antiwarp and sv_gameHz
 
-The QVM has one hardcoded 20Hz assumption that would break gameplay if `sv_gameHz` were raised:
+The QVM has one hardcoded 20Hz assumption that is relevant when raising `sv_gameHz`:
 
 **`g_active.c` line ~1806 — antiwarp blank command injection:**
 
@@ -323,7 +331,15 @@ ent->client->pers.cmd.serverTime += 50;  // HARDCODED: assumes 1 game frame = 50
 ClientThink_real(ent);
 ```
 
-At `sv_gameHz 40` (25ms frames) this injects a 50ms blank cmd instead of 25ms — teleporting lagging players forward by double the intended distance. This is a QVM issue, not fixable engine-side without QVM changes.
+At `sv_gameHz 40` (25ms frames) this injects a 50ms blank cmd instead of 25ms —
+teleporting lagging players forward by double the intended distance. This is a QVM
+issue, not directly fixable engine-side without QVM changes.
+
+Note: some QVM-side constraints may have been relaxed in UT4.3.4 — do not treat 20
+as a hard requirement until further in-game testing confirms the behaviour.
+
+See **`docs/g-antiwarp-engine-feasibility.md`** for a full breakdown of what can
+and cannot be done engine-side and the recommended path forward.
 
 All other `+ 50` / `FRAMETIME` usages in the QVM are `nextthink` assignments compared against `level.time`. These are self-correcting at any `sv_gameHz` — they mean "fire next game tick" and do exactly that regardless of tick rate.
 

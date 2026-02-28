@@ -7,7 +7,7 @@ Quick reference for finding key code paths. All custom changes are in `code/serv
 ## Server Core
 
 ### Frame Loop
-- **`code/server/sv_main.c`** — `SV_Frame()`: outer sv_fps loop, inner sv_gameHz loop, snapshot dispatch, SV_BotFrame placement
+- **`code/server/sv_main.c`** — `SV_Frame()`: outer sv_fps loop, inner sv_gameHz loop (falls back to sv_fps when sv_gameHz <= 0), snapshot dispatch, SV_BotFrame placement
 - **`code/server/sv_init.c`** — All custom cvar registration (sv_fps, sv_gameHz, sv_snapshotFps, sv_pmoveMsec, sv_extrapolate, sv_smoothClients, sv_bufferMs, sv_velSmooth, sv_busyWait)
 
 ### Client Think / Physics
@@ -68,6 +68,7 @@ These files are in `UrbanTerror42_Source/` and are reference only. We cannot mod
 - **`CLAUDE.md`** — Claude Code project instructions
 - **`CVARS.md`** — All custom cvars with defaults, flags, rationale, and interaction table
 - **`docs/ghidra-cgame-patches.md`** — Three QVM binary patches for cgame (frameInterpolation clamp, TR_INTERPOLATE velocity extrapolation, nextSnap null fallback)
+- **`docs/g-antiwarp-engine-feasibility.md`** — Feasibility analysis for moving g_antiwarp into sv_antilag.c; covers what is/isn't engine-fixable and the recommended approach
 - **`docs/debug-session-2026-02-26-cl_snapScaling-stutter.md`** — cl_snapScaling oscillation investigation and removal
 - **`docs/debug-session-2026-02-27-smoothing-jitter.md`** — sv_smoothClients/sv_bufferMs stationary jitter investigation
 
@@ -103,4 +104,4 @@ These files are in `UrbanTerror42_Source/` and are reference only. We cannot mod
 | Dead-zone threshold | 100.0f | sv_snapshot.c (DotProduct check on velocity², threshold 100.0f = 10 ups magnitude) |
 | Ring buffer size | 32 | sv_snapshot.c |
 | FRAMETIME (QVM) | 100 | g_local.h (only nextthink, self-correcting) |
-| Antiwarp inject | 50ms | g_active.c (hardcoded, breaks at sv_gameHz != 20) |
+| Antiwarp inject | 50ms | g_active.c (hardcoded in UT4.2; behaviour at sv_gameHz != 20 may differ in 4.3.4 — pending testing) |

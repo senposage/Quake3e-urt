@@ -22,11 +22,15 @@ Engine tick and input sampling rate (Hz). Controls how often the server processe
 ### sv_gameHz
 **Default:** 20 | **Flags:** CVAR_ARCHIVE, CVAR_SERVERINFO | **File:** sv_init.c
 
-Rate at which `level.time` advances and `GAME_RUN_FRAME` fires. **MUST stay at 20** for UT4.3 — the QVM has a hardcoded `serverTime += 50` antiwarp injection in `g_active.c` that assumes 50ms game frames.
+Rate at which `level.time` advances and `GAME_RUN_FRAME` fires. Default 20 matches UT4.3's QVM antiwarp assumption (`serverTime += 50` in `g_active.c`). Some constraints may have been relaxed in UT4.3.4 — testing at higher values is ongoing; do not assume 20 is still a hard requirement until confirmed.
 
-**Why:** Decouples game logic rate from engine tick rate so sv_fps can be raised without breaking QVM timers (bleed, bandage, antiwarp, inactivity).
+**Why:** Decouples game logic rate from engine tick rate so sv_fps can be raised without breaking QVM timers (bleed, bandage, inactivity) or antiwarp. At `sv_gameHz 20`, g_antiwarp is correct at any `sv_fps` — `G_RunClient` fires at 20Hz regardless of `sv_fps`, so the 50ms blank-cmd step always matches the game frame exactly. No stale or unnecessary latency is added.
 
-**How:** Inner `while` loop in `SV_Frame()` accumulates `sv.gameTimeResidual` and fires `GAME_RUN_FRAME(sv.gameTime)` when it reaches `1000/sv_gameHz`.
+**How (sv_gameHz > 0):** Inner `while` loop in `SV_Frame()` accumulates `sv.gameTimeResidual` and fires `GAME_RUN_FRAME(sv.gameTime)` when it reaches `1000/sv_gameHz`. Between firings, `sv.gameTime` lags `sv.time` — this gap (`sv.time - sv.gameTime`) is what the extrapolation patch reads in `SV_BuildCommonSnapshot` to correct stale player entity positions.
+
+**How (sv_gameHz <= 0, disabled):** Effective rate falls back to `sv_fps`. `GAME_RUN_FRAME` fires on every engine tick; `sv.gameTime == sv.time` always, no gap. `sv_extrapolate` still runs: bot velocity extrapolation produces `dt=0` (position unchanged); real-player `ps->origin` read is identical to what `BG_PlayerStateToEntityState` already wrote. `sv_bufferMs` ring buffer queries still run and apply delayed positions when configured. `sv_smoothClients` TR_LINEAR also runs unconditionally on every tick.
+
+**⚠ Antiwarp warning (`sv_gameHz 0`):** With `sv_gameHz <= 0`, game frames advance at `1000/sv_fps` ms per tick. The QVM's hardcoded `serverTime += 50` blank command is then mismatched at any `sv_fps != 20` — at `sv_fps 60` it fires a 50ms injection every 16ms, teleporting lagging players at 3× the intended rate. **Do not use `sv_gameHz 0` with UT QVM unless `sv_fps` is also 20.** See `docs/g-antiwarp-engine-feasibility.md` for details.
 
 ---
 
@@ -62,7 +66,7 @@ Engine-side position correction for high sv_fps snapshots.
 
 **Why:** At sv_fps 60 with sv_gameHz 20, the entity state (`ent->s`) only updates every 3rd engine tick. Without correction, clients see players teleporting every 50ms instead of moving smoothly every 16ms.
 
-**How:** `sv_snapshot.c:SV_BuildCommonSnapshot()` checks `sv.time - sv.gameTime > 0` (between game frames). For real players, copies `ps->origin` → `es->pos.trBase` and `ps->velocity` → `es->pos.trDelta`. Velocity dead-zone check `DotProduct(velocity, velocity) > 100.0` prevents idle player vibration from Pmove ground snapping micro-oscillations. Note: `sv_extrapolate` skips the fixup at game-frame boundaries (no work needed); `sv_smoothClients` runs on every tick so TR_LINEAR is never interrupted.
+**How:** `sv_snapshot.c:SV_BuildCommonSnapshot()` runs on every snapshot tick regardless of `sv_gameHz` setting. `extrapolateMs = sv.time - sv.gameTime` is used by the bot velocity path (`trBase += trDelta * dt`); when `extrapolateMs == 0` (sv_gameHz disabled or at a game-frame boundary tick), `dt=0` so bot positions are unchanged. Real-player path reads `ps->origin` directly on every tick — when `extrapolateMs == 0` this is the same value `BG_PlayerStateToEntityState` already wrote (harmless redundancy). The `sv_bufferMs` ring buffer query (Phase 1) runs every tick regardless of `extrapolateMs`, ensuring consistent delayed positions. Velocity dead-zone check `DotProduct(velocity, velocity) > 100.0` prevents idle player vibration from Pmove ground snapping micro-oscillations.
 
 ---
 
@@ -76,7 +80,7 @@ Engine-side position correction for high sv_fps snapshots.
 
 **Why:** With `TR_INTERPOLATE`, cgame linearly interpolates between the previous and current snapshot positions. When a player reverses direction, the interpolation target is wrong until the next snapshot arrives — visible as a brief drift in the wrong direction. `TR_LINEAR` lets cgame compute position from velocity at any time, potentially smoother for direction changes.
 
-**How:** `sv_snapshot.c:SV_BuildCommonSnapshot()` sets `es->pos.trType = TR_LINEAR` and `es->pos.trTime = sv.time` on **every** engine tick (including game-frame ticks). This is important: the `sv_extrapolate` fixup skips game-frame ticks (`extrapolateMs == 0`) because the entity state is already correct; the `sv_smoothClients` fixup must run on every tick so that TR_LINEAR is never interrupted by a stray TR_INTERPOLATE snapshot on game-frame boundaries. When `sv_smoothClients 1` is enabled, it uses the position resolved by `sv_bufferMs` (Phase 1) as the base, then applies velocity smoothing from `sv_velSmooth` (if enabled) for `trDelta`. The two settings compose: `sv_bufferMs` controls the position source, `sv_smoothClients` controls the trajectory type.
+**How:** `sv_snapshot.c:SV_BuildCommonSnapshot()` sets `es->pos.trType = TR_LINEAR` and `es->pos.trTime = sv.time` on **every** engine tick (including game-frame ticks). Both `sv_smoothClients` and `sv_extrapolate` now run every tick — neither is guarded by `extrapolateMs > 0`. This is important: emitting TR_INTERPOLATE on game-frame boundary ticks would cause 50ms-period stutter at sv_gameHz 20/sv_fps 60 by interrupting the TR_LINEAR trajectory. When `sv_smoothClients 1` is enabled, it uses the position resolved by `sv_bufferMs` (Phase 1) as the base, then applies velocity smoothing from `sv_velSmooth` (if enabled) for `trDelta`. The two settings compose: `sv_bufferMs` controls the position source, `sv_smoothClients` controls the trajectory type.
 
 **Safety:** Idle players (velocity near zero) are NOT switched to TR_LINEAR — they stay TR_INTERPOLATE to prevent extrapolation drift/vibration. The DotProduct > 100.0 dead-zone check applies to both smoothed velocity (ring buffer path) and raw velocity (fallback path). Pmove operates on playerState only and does NOT interact with entityState trajectory type changes.
 

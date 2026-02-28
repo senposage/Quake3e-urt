@@ -35,7 +35,7 @@ Urban Terror 4.3 (UT4.3) competitive server engine enhancement built on **Quake3
 
 Current runtime model:
 - `sv_fps 60` for high-rate input sampling
-- `sv_gameHz 20` for QVM game logic compatibility
+- `sv_gameHz 20` for QVM game logic compatibility (may be raiseable in 4.3.4 — pending testing)
 - `sv_snapshotFps -1` (= sv_fps) for downstream snapshot cadence
 
 UT4.3 QVM binaries (`qagame`, `cgame`, `ui`) are closed-source.
@@ -74,7 +74,7 @@ code/qcommon/
 | Cvar | Default | Description |
 |------|---------|-------------|
 | `sv_fps` | `60` | Engine tick / input sampling rate |
-| `sv_gameHz` | `20` | QVM GAME_RUN_FRAME rate (keep at 20 for UT4.3 constraints) |
+| `sv_gameHz` | `20` | QVM GAME_RUN_FRAME rate (20 matches UT4.3 antiwarp; some constraints may be relaxed in 4.3.4 — pending testing) |
 | `sv_snapshotFps` | `-1` | Snapshot send rate to clients (-1 = match sv_fps) |
 | `sv_pmoveMsec` | `8` | Max Pmove physics step (ms) |
 | `sv_busyWait` | `0` | Spin last N ms before frame |
@@ -102,7 +102,7 @@ Com_Frame → SV_Frame(msec)
 
       emptyFrame = qtrue
       gameTimeResidual += frameMsec
-      while gameTimeResidual >= gameMsec (1000/sv_gameHz):
+      while gameTimeResidual >= gameMsec (1000/sv_gameHz, or 1000/sv_fps when sv_gameHz <= 0):
           gameTimeResidual -= gameMsec
           sv.gameTime += gameMsec
           SV_BotFrame(sv.gameTime)
@@ -114,6 +114,12 @@ Com_Frame → SV_Frame(msec)
 
   SV_CheckTimeouts()
 ```
+
+**sv_gameHz modes:**
+- `sv_gameHz > 0` (e.g. 20): `GAME_RUN_FRAME` fires at sv_gameHz Hz. `sv.gameTime` lags `sv.time`; the gap drives the bot velocity extrapolation in `SV_BuildCommonSnapshot`.
+- `sv_gameHz <= 0` (disabled): effective rate = sv_fps. `GAME_RUN_FRAME` fires every engine tick; `sv.gameTime == sv.time` always. Bot dt=0 (position unchanged); real-player `ps->origin` read is harmless (same value GAME_RUN_FRAME wrote). `sv_bufferMs` ring buffer queries still apply. `sv_smoothClients` TR_LINEAR still runs.
+
+**Startup/restart settlement frames** (`SV_SpawnServer`, `SV_MapRestart_f`): `sv.time` and `sv.gameTime` advance in lockstep (100ms steps, direct calls). This bypasses the `sv_gameHz` inner loop — sv_gameHz decoupling only applies during live gameplay in `SV_Frame`.
 
 ### Multi-Step Pmove (sv_client.c)
 
@@ -127,8 +133,9 @@ Com_Frame → SV_Frame(msec)
 - Player entity state is authored at game-frame cadence; at high snapshot rate this would otherwise duplicate positions.
 - `SV_BuildCommonSnapshot` fixes up player positions between game frames: real players use actual `ps->origin` (updated by Pmove every usercmd); bots use velocity extrapolation (`trBase += trDelta * dt`) since their `ps->origin` only updates at game-frame boundaries.
 - Guarded by player index and trajectory type checks. Velocity dead-zone check prevents idle-player vibration.
-- **`sv_extrapolate` path** only runs between game frames (`sv.time > sv.gameTime`); skipped at game-frame ticks where entity state is already correct.
-- **`sv_smoothClients` path** runs on **every** tick — including game-frame ticks — to ensure TR_LINEAR is never interrupted by a stray TR_INTERPOLATE snapshot (which would cause 50ms-period stutter at sv_gameHz 20).
+- **Both `sv_extrapolate` and `sv_smoothClients` run on every tick** — including game-frame boundary ticks and when `sv_gameHz` is disabled. The old `extrapolateMs > 0` guard on `sv_extrapolate` was removed because it incorrectly blocked Phase 1 (the `sv_bufferMs` ring buffer query) from running at game-frame boundaries and entirely when `sv_gameHz` is disabled.
+- When `extrapolateMs == 0` (game-frame tick or sv_gameHz disabled): bot velocity extrapolation is `dt=0` (position unchanged); real-player `ps->origin` read is harmless (same value `BG_PlayerStateToEntityState` wrote).
+- **`sv_smoothClients` path** sets TR_LINEAR every tick to ensure the trajectory type is never interrupted by a stray TR_INTERPOLATE snapshot on game-frame boundaries.
 
 ### Antilag (sv_antilag.c)
 
@@ -141,9 +148,9 @@ Com_Frame → SV_Frame(msec)
 - `SV_MapRestart_f` aligns `sv.gameTime` with `sv.time` and resets residual state before restart progression.
 - Warmup/restart frame progression uses the synchronized game clock.
 
-### Why `sv_gameHz` Must Stay at 20
+### `sv_gameHz` and QVM Compatibility
 
-UT antiwarp uses hardcoded 50ms behavior in QVM logic; increasing game frame rate above 20Hz creates timing mismatch and can produce invalid movement correction. Keep `sv_gameHz` at 20 for compatibility.
+UT4.2 antiwarp uses a hardcoded `serverTime += 50` ghost command injection in `g_active.c` that assumes 50ms (20Hz) game frames. Raising `sv_gameHz` above 20 was known to fire the injection at the wrong rate. However, some of these QVM-side constraints may have been relaxed in UT4.3.4 — do not treat 20 as an absolute requirement until further in-game testing confirms the behaviour at higher values.
 
 ### Snapshot Dispatch
 
@@ -225,10 +232,22 @@ Reference: `docs/ghidra-cgame-patches.md`.
 
 ### Antiwarp Analysis
 
-g_antiwarp remains safe with `sv_fps` elevated **when** `sv_gameHz` remains 20:
-- game-side checks operate at game-frame cadence
-- 50ms antiwarp assumptions remain aligned
-- triggers occur on real command gaps rather than normal high-rate server ticks
+At `sv_gameHz 20`, g_antiwarp works **correctly** at any `sv_fps` (40, 60, 120+).
+No stale or unnecessary latency is inserted. `sv_fps` controls engine tick and
+snapshot cadence only — it does not affect game-frame rate. `G_RunClient` fires at
+exactly 20Hz regardless of `sv_fps`, so the hardcoded `serverTime += 50` blank
+command always spans exactly one 50ms game frame as intended.
+
+At `sv_gameHz 0` (disabled), g_antiwarp is **broken** at any `sv_fps != 20`.
+When `sv_gameHz <= 0`, the game-frame rate falls back to `sv_fps` and `level.time`
+advances by `1000/sv_fps` ms per tick. At `sv_fps 60` this means a 50ms blank cmd
+fires every 16ms — teleporting lagging players at 3× the intended rate. Do not use
+`sv_gameHz 0` with UT QVM unless `sv_fps` is also 20.
+
+The 50ms hardcode also becomes a problem if `sv_gameHz` itself is raised above 20.
+Whether that is safe in UT4.3.4 is unconfirmed — pending in-game testing.
+
+See `docs/g-antiwarp-engine-feasibility.md` for the full analysis.
 
 ---
 

@@ -1557,7 +1557,19 @@ void SV_Frame( int msec ) {
 
 		// Fire GAME_RUN_FRAME at sv_gameHz rate, independent of sv_fps.
 		// sv_fps = input sampling rate; sv_gameHz = level.time rate.
-		// sv_gameHz 0 = disabled, falls back to sv_fps.
+		//
+		// sv_gameHz > 0 (e.g. 20): GAME_RUN_FRAME fires every (1000/sv_gameHz) ms.
+		//   sv.gameTime advances slower than sv.time. Between firings the gap
+		//   (sv.time - sv.gameTime) grows and the extrapolation patch in
+		//   SV_BuildCommonSnapshot uses it to correct stale player positions.
+		//   sv_extrapolate and sv_smoothClients are both meaningful in this mode.
+		//
+		// sv_gameHz <= 0 (disabled): effective rate = sv_fps. GAME_RUN_FRAME fires
+		//   every engine tick — sv.gameTime == sv.time always, no gap exists.
+		//   sv_extrapolate still runs: real players get a harmless ps->origin read
+		//   (same value BG_PlayerStateToEntityState wrote); bots get dt=0 (unchanged).
+		//   Critically, sv_bufferMs ring buffer queries still run and apply delayed
+		//   positions when configured. sv_smoothClients TR_LINEAR also runs every tick.
 		{
 			int _gameHz = (sv_gameHz && sv_gameHz->integer > 0) ? sv_gameHz->integer : sv_fps->integer;
 			int _gameMsec;

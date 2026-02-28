@@ -88,8 +88,9 @@ static void SV_SmoothRecord( int clientNum ) {
 	slot = &hist->slots[idx];
 
 	if ( svs.clients[clientNum].netchan.remoteAddress.type == NA_BOT ) {
-		// Bot: ps->origin doesn't update between game frames.
-		// Extrapolate from entity state using velocity.
+		// Bot: ps->origin only updates at sv_gameHz rate (game-frame boundaries).
+		// Extrapolate from entity state using velocity. When sv_gameHz is disabled
+		// (sv.time == sv.gameTime), dt == 0 and the unmodified trBase is recorded.
 		sharedEntity_t *gent = SV_GentityNum( clientNum );
 		float dt = (float)( sv.time - sv.gameTime ) * 0.001f;
 		slot->origin[0] = gent->s.pos.trBase[0] + gent->s.pos.trDelta[0] * dt;
@@ -1204,6 +1205,18 @@ static void SV_BuildCommonSnapshot( void )
 		// ticks at sv_gameHz so their velocity is constant between game frames —
 		// linear prediction is accurate. Their ps->origin doesn't update between
 		// game frames so we can't use the playerState approach.
+		//
+		// sv_gameHz > 0 (e.g. 20): GAME_RUN_FRAME fires at sv_gameHz Hz. sv.gameTime
+		//   lags sv.time between game frames, so extrapolateMs = sv.time - sv.gameTime
+		//   is positive. The position fixup below activates and corrects stale ent->s.
+		//   Bot velocity extrapolation uses the positive dt; real players use ps->origin.
+		//
+		// sv_gameHz <= 0 (disabled, falls back to sv_fps): GAME_RUN_FRAME fires every
+		//   engine tick. sv.gameTime == sv.time always, so extrapolateMs == 0.
+		//   Bot velocity extrapolation: dt=0, position unchanged (harmless no-op).
+		//   Real player ps->origin read: same value BG_PlayerStateToEntityState wrote.
+		//   sv_bufferMs ring buffer queries still run and apply delayed positions.
+		//   sv_smoothClients TR_LINEAR also runs unconditionally on every tick.
 		const int gameMsec = 1000 / ( sv_gameHz && sv_gameHz->integer > 0 ? sv_gameHz->integer : sv_fps->integer );
 		float extrapolateMs = (float)( sv.time - sv.gameTime );
 		if ( extrapolateMs > (float)gameMsec )
@@ -1225,13 +1238,17 @@ static void SV_BuildCommonSnapshot( void )
 			svs.snapshotEntities[ index ] = list[ i ]->s;
 
 			// Fix up client entity positions between game frames.
-			// sv_smoothClients runs on every tick (including game-frame ticks) so TR_LINEAR is set
-			// consistently — skipping game-frame ticks would emit TR_INTERPOLATE 1/3 of the time at
-			// sv_gameHz 20 / sv_fps 60, causing visible stutter every 50ms.
-			// sv_extrapolate only needs to run between game frames (extrapolateMs > 0), so we keep
-			// that guard for the extrapolate-only path to avoid redundant work.
+			// Both sv_smoothClients and sv_extrapolate run on every tick — including
+			// game-frame boundary ticks (extrapolateMs == 0) and when sv_gameHz is disabled
+			// (extrapolateMs == 0 on every tick in that mode).
+			// The previous guard `extrapolateMs > 0.0f` on sv_extrapolate was wrong: it
+			// blocked Phase 1 (sv_bufferMs ring buffer query) from running at game-frame
+			// boundaries and entirely when sv_gameHz is disabled — making sv_bufferMs silently
+			// ineffective for sv_extrapolate users in those cases.
+			// At extrapolateMs == 0: bot velocity extrapolation is dt=0 (position unchanged);
+			// real-player ps->origin read is harmless (same value BG_PlayerStateToEntityState wrote).
 			if ( ( sv_smoothClients && sv_smoothClients->integer ) ||
-				( extrapolateMs > 0.0f && sv_extrapolate && sv_extrapolate->integer ) ) {
+				( sv_extrapolate && sv_extrapolate->integer ) ) {
 				entityState_t *es = &svs.snapshotEntities[ index ];
 				if ( es->number < sv_maxclients->integer && es->pos.trType == TR_INTERPOLATE ) {
 
@@ -1302,6 +1319,7 @@ static void SV_BuildCommonSnapshot( void )
 							}
 						} else if ( isBot ) {
 							// Bot without buffer: velocity-based extrapolation.
+							// dt == 0 at game-frame boundaries or when sv_gameHz disabled — harmless no-op.
 							const float dt = extrapolateMs * 0.001f;
 							es->pos.trBase[0] += es->pos.trDelta[0] * dt;
 							es->pos.trBase[1] += es->pos.trDelta[1] * dt;

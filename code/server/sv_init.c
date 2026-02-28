@@ -617,6 +617,8 @@ void SV_SpawnServer( const char *mapname, qboolean killBots ) {
 	sv_pure->modified = qfalse;
 
 	// run a few frames to allow everything to settle
+	// sv.time and sv.gameTime advance in lockstep here (bypasses sv_gameHz inner-loop
+	// logic — sv_gameHz decoupling only applies during live gameplay in SV_Frame).
 	for ( i = 0; i < 3; i++ )
 	{
 		sv.time += 100;
@@ -682,6 +684,8 @@ void SV_SpawnServer( const char *mapname, qboolean killBots ) {
 	}
 
 	// run another frame to allow things to look at all the players
+	// sv.time and sv.gameTime advance in lockstep here (same direct pattern as
+	// the settlement loop above — bypasses sv_gameHz inner-loop logic).
 	sv.time += 100;
 	sv.gameTime += 100;
 	VM_Call( gvm, 1, GAME_RUN_FRAME, sv.gameTime );
@@ -885,7 +889,7 @@ void SV_Init( void )
     sv_fps = Cvar_Get ("sv_fps", "60", CVAR_TEMP | CVAR_PROTECTED );
 
     sv_gameHz = Cvar_Get ("sv_gameHz", "20", CVAR_ARCHIVE | CVAR_SERVERINFO );
-    Cvar_SetDescription(sv_gameHz, "Rate at which level.time advances and GAME_RUN_FRAME fires (independent of sv_fps).\nKeep at 20 to match UT4.3 timer expectations. Never set higher than sv_fps.\n0 = disabled, falls back to sv_fps.\nDefault: 20");
+    Cvar_SetDescription(sv_gameHz, "Rate at which level.time advances and GAME_RUN_FRAME fires (independent of sv_fps).\nDefault 20 matches UT4.3 QVM antiwarp assumptions. Some constraints may be\nrelaxed in UT4.3.4 -- test before raising above 20. Never set higher than sv_fps.\n>0: GAME_RUN_FRAME fires at sv_gameHz Hz; sv.gameTime lags sv.time between frames,\n    enabling sv_extrapolate to correct stale player positions in between.\n 0: disabled (falls back to sv_fps); GAME_RUN_FRAME fires every engine tick,\n    sv.gameTime == sv.time always. sv_extrapolate still runs but has no stale\n    positions to correct; sv_bufferMs ring buffer queries still apply.\nDefault: 20");
 
     sv_snapshotFps = Cvar_Get ("sv_snapshotFps", "-1", CVAR_ARCHIVE | CVAR_SERVERINFO );
     Cvar_SetDescription(sv_snapshotFps, "Max snapshot send rate to clients.\n-1 = match sv_fps (default, live-tracks sv_fps changes).\n 0 = fall back to per-client 'snaps' userinfo (vanilla Q3 behavior).\n>0 = explicit rate, capped to sv_fps.\nDefault: -1");
