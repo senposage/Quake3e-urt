@@ -11,7 +11,7 @@ Content-Transfer-Encoding: 8bit
 
   SV_CheckTimeouts stays outside (once per Com_Frame is sufficient).
 
-  The USE_MV emptyFrame flag is now reset to qtrue at the start of each sv_fps tick and cleared when a GAME_RUN_FRAME actually fires — multiview recording still happens at sv_gameHz rate, just tied to tick boundaries instead of Com_Frame boundaries
+  The USE_MV emptyFrame flag is now reset to qtrue at the start of each sv_fps tick and cleared when a GAME_RUN_FRAME actually fires — multiview recording still happens at game-frame rate, just tied to tick boundaries instead of Com_Frame boundaries
 ---
  code/server/sv_ccmds.c    |  8 ++++--
  code/server/sv_main.c     | 28 +++++++++++----------
@@ -151,8 +151,8 @@ index 3cd18aa..3820a1e 100644
 -		}
 +	{
 +		// Extrapolation offset: number of ms since the last GAME_RUN_FRAME.
-+		// When sv_fps > sv_gameHz, BG_PlayerStateToEntityState only updates ent->s at
-+		// sv_gameHz rate. Without correction, consecutive 60Hz snapshots contain identical
++		// When sv_fps > game-frame, BG_PlayerStateToEntityState only updates ent->s at
++		// game-frame rate. Without correction, consecutive 60Hz snapshots contain identical
 +		// player positions until the next game frame — visible as stutter on other players.
 +		// BG_PlayerStateToEntityState stores velocity in pos.trDelta for TR_INTERPOLATE
 +		// client entities, so we can forward-extrapolate to sv.time cheaply.
