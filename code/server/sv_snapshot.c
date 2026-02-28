@@ -1226,8 +1226,8 @@ static void SV_BuildCommonSnapshot( void )
 			svs.snapshotEntities[ index ] = list[ i ]->s;
 
 			// Fix up client entity positions between game frames.
-			// Guard: sv_extrapolate enabled + between game frames + client slot + alive player.
-			if ( extrapolateMs > 0.0f && sv_extrapolate && sv_extrapolate->integer ) {
+			// Guard: extrapolation or smoothClients enabled + between game frames + client slot + alive player.
+			if ( extrapolateMs > 0.0f && ( ( sv_extrapolate && sv_extrapolate->integer ) || ( sv_smoothClients && sv_smoothClients->integer ) ) ) {
 				entityState_t *es = &svs.snapshotEntities[ index ];
 				if ( es->number < sv_maxclients->integer && es->pos.trType == TR_INTERPOLATE ) {
 
