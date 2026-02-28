@@ -319,9 +319,9 @@ Fix requires patching cgame QVM: `animationTime` should use `snap->serverTime` n
 
 ---
 
-## QVM Constraints — Why sv_gameHz Must Stay at 20
+## QVM Constraints — g_antiwarp and sv_gameHz
 
-The QVM has one hardcoded 20Hz assumption that would break gameplay if `sv_gameHz` were raised:
+The QVM has one hardcoded 20Hz assumption that is relevant when raising `sv_gameHz`:
 
 **`g_active.c` line ~1806 — antiwarp blank command injection:**
 
@@ -331,7 +331,15 @@ ent->client->pers.cmd.serverTime += 50;  // HARDCODED: assumes 1 game frame = 50
 ClientThink_real(ent);
 ```
 
-At `sv_gameHz 40` (25ms frames) this injects a 50ms blank cmd instead of 25ms — teleporting lagging players forward by double the intended distance. This is a QVM issue, not fixable engine-side without QVM changes.
+At `sv_gameHz 40` (25ms frames) this injects a 50ms blank cmd instead of 25ms —
+teleporting lagging players forward by double the intended distance. This is a QVM
+issue, not directly fixable engine-side without QVM changes.
+
+Note: some QVM-side constraints may have been relaxed in UT4.3.4 — do not treat 20
+as a hard requirement until further in-game testing confirms the behaviour.
+
+See **`docs/g-antiwarp-engine-feasibility.md`** for a full breakdown of what can
+and cannot be done engine-side and the recommended path forward.
 
 All other `+ 50` / `FRAMETIME` usages in the QVM are `nextthink` assignments compared against `level.time`. These are self-correcting at any `sv_gameHz` — they mean "fire next game tick" and do exactly that regardless of tick rate.
 

@@ -68,6 +68,7 @@ These files are in `UrbanTerror42_Source/` and are reference only. We cannot mod
 - **`CLAUDE.md`** — Claude Code project instructions
 - **`CVARS.md`** — All custom cvars with defaults, flags, rationale, and interaction table
 - **`docs/ghidra-cgame-patches.md`** — Three QVM binary patches for cgame (frameInterpolation clamp, TR_INTERPOLATE velocity extrapolation, nextSnap null fallback)
+- **`docs/g-antiwarp-engine-feasibility.md`** — Feasibility analysis for moving g_antiwarp into sv_antilag.c; covers what is/isn't engine-fixable and the recommended approach
 - **`docs/debug-session-2026-02-26-cl_snapScaling-stutter.md`** — cl_snapScaling oscillation investigation and removal
 - **`docs/debug-session-2026-02-27-smoothing-jitter.md`** — sv_smoothClients/sv_bufferMs stationary jitter investigation
 
