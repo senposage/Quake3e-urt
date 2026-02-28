@@ -1215,9 +1215,8 @@ static void SV_BuildCommonSnapshot( void )
 			if ( sv_bufferMs && sv_bufferMs->integer != 0 ) {
 				bufMs = sv_bufferMs->integer;
 				if ( bufMs < 0 ) {
-					// Auto mode: 50 - (1000/sv_fps) to match vanilla 50ms total latency
-					bufMs = 50 - ( 1000 / sv_fps->integer );
-					if ( bufMs < 0 ) bufMs = 0;
+					// Auto mode: one snapshot interval — minimum for clean ring-buffer interpolation
+					bufMs = 1000 / sv_fps->integer;
 				}
 				if ( bufMs > 100 ) bufMs = 100;
 			}

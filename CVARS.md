@@ -122,26 +122,24 @@ Maximum rewind window for antilag (ms). Players with ping above this get no anti
 Per-client position ring buffer with configurable delay.
 
 - **0** = disabled. No ring buffer position delay, no extra latency. `trBase` is always the current `ps->origin` (straight pass-through). This applies regardless of `sv_smoothClients` setting — when `sv_bufferMs 0`, there is zero added position latency even in TR_LINEAR mode. `sv_velSmooth` may still average the velocity vector but does not delay the position.
-- **-1** = auto. Computes `50 - (1000/sv_fps)` to match vanilla 50ms total latency:
-  - sv_fps 20: auto = 0ms (already at 50ms, no delay needed)
-  - sv_fps 40: auto = 25ms buffer (25ms + 25ms = 50ms total)
-  - sv_fps 60: auto = 34ms buffer (16ms + 34ms = 50ms total)
-  - sv_fps 80: auto = 38ms buffer (12ms + 38ms = 50ms total)
-  - sv_fps 100: auto = 40ms buffer (10ms + 40ms = 50ms total)
-  - sv_fps 125: auto = 42ms buffer (8ms + 42ms = 50ms total)
+- **-1** = auto. Computes `1000/sv_fps` — one snapshot interval, the minimum for clean ring-buffer interpolation:
+  - sv_fps 20: auto = 50ms
+  - sv_fps 40: auto = 25ms
+  - sv_fps 60: auto = 16ms
+  - sv_fps 80: auto = 12ms
+  - sv_fps 100: auto = 10ms
+  - sv_fps 125: auto = 8ms
 - **1-100** = manual delay in milliseconds.
 
-**Minimum values to avoid under/overshoot:** For the ring buffer to straddle a direction change (interpolate *through* the reversal rather than snap to the nearest entry), `bufMs` must be at least one full snapshot interval — `ceil(1000/sv_fps)`. Below this the lookup succeeds but falls within the most-recent interval, giving negligible position history.
+**Minimum values to avoid under/overshoot:** For the ring buffer to straddle a direction change (interpolate *through* the reversal rather than snap to the nearest entry), `bufMs` must be at least one full snapshot interval — `1000/sv_fps`. This is exactly what auto (-1) provides.
 
-| sv_fps | Snapshot interval | Min bufMs | Auto (-1) bufMs | Total latency at auto |
-|--------|------------------|-----------|-----------------|-----------------------|
-| 20     | 50 ms            | 50 ms     | 0 ms            | 50 ms (vanilla)       |
-| 40     | 25 ms            | 25 ms     | 25 ms           | 50 ms                 |
-| 60     | 17 ms            | 17 ms     | 34 ms           | 50 ms                 |
-| 80     | 13 ms            | 13 ms     | 38 ms           | 50 ms                 |
-| 100    | 10 ms            | 10 ms     | 40 ms           | 50 ms                 |
-
-Note: at sv_fps ≥ 40 the auto value is *larger* than the minimum — it adds an extra stability margin to match the vanilla 50 ms total interpolation window. Using the bare minimum trades that margin for lower latency.
+| sv_fps | Snapshot interval | Min / Auto (-1) bufMs |
+|--------|------------------|-----------------------|
+| 20     | 50 ms            | 50 ms                 |
+| 40     | 25 ms            | 25 ms                 |
+| 60     | 16 ms            | 16 ms                 |
+| 80     | 12 ms            | 12 ms                 |
+| 100    | 10 ms            | 10 ms                 |
 
 **Why:** At high sv_fps, rapid direction changes produce sawtooth artifacts because each snapshot captures a slightly different velocity vector. The ring buffer provides two smoothing strategies:
 
@@ -206,15 +204,15 @@ These are correctness fixes that should never be disabled:
 | sv_smoothClients | sv_bufferMs | sv_velSmooth | Position Source | Trajectory | Velocity | Description |
 |---|---|---|---|---|---|---|
 | 0 | 0 | any | Current | TR_INTERPOLATE | Raw | **Default.** Standard extrapolation between game frames. Lowest latency. |
-| 0 | -1 | any | Delayed (auto) | TR_INTERPOLATE | Raw | Position delayed to match vanilla 50ms total latency. Stable lerp targets. |
+| 0 | -1 | any | Delayed (auto) | TR_INTERPOLATE | Raw | Position delayed by one snapshot interval. Minimum for stable ring-buffer lerp targets. |
 | 0 | 1-100 | any | Delayed (manual) | TR_INTERPOLATE | Raw | Manual position delay in ms. Trades latency for stability. |
 | 1 | 0 | 0 | Current | TR_LINEAR | Raw | Continuous trajectory evaluation. No smoothing. |
 | 1 | 0 | 1-100 | Current | TR_LINEAR | Smoothed | Continuous trajectory with averaged velocity. Reduces direction-change artifacts. |
-| 1 | -1 | 1-100 | Delayed (auto) | TR_LINEAR | Smoothed | **Best of both worlds.** Stable delayed base position + smoothed velocity for extrapolation. |
+| 1 | -1 | 1-100 | Delayed (auto) | TR_LINEAR | Smoothed | **Best of both worlds.** Minimum-latency delayed base position + smoothed velocity for extrapolation. |
 | 1 | 1-100 | 1-100 | Delayed (manual) | TR_LINEAR | Smoothed | Same as above with manual delay control. |
 
 ### Recommended Configurations
 
 - **Competitive (lowest latency):** `sv_smoothClients 0`, `sv_bufferMs 0`, `sv_velSmooth 0` — raw positions, minimal processing
-- **Balanced:** `sv_smoothClients 0`, `sv_bufferMs -1`, `sv_velSmooth 0` — position delay matches vanilla feel
+- **Balanced:** `sv_smoothClients 0`, `sv_bufferMs -1`, `sv_velSmooth 0` — one-interval position delay, clean ring-buffer lerp targets
 - **Smoothest (experimental):** `sv_smoothClients 1`, `sv_bufferMs -1`, `sv_velSmooth 32` — delayed position + smoothed velocity + TR_LINEAR

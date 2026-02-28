@@ -915,11 +915,9 @@ void SV_Init( void )
     sv_bufferMs = Cvar_Get ("sv_bufferMs", "0", CVAR_ARCHIVE );
     Cvar_SetDescription(sv_bufferMs, "Per-client position delay in milliseconds.\n"
         "0 = disabled (use latest position, no extra latency)\n"
-        "-1 = auto (50 - 1000/sv_fps, matches vanilla 50ms total latency)\n"
-        "     sv_fps 40: 25ms, sv_fps 60: 34ms, sv_fps 80: 38ms, sv_fps 100: 40ms\n"
+        "-1 = auto (1000/sv_fps = one snapshot interval, minimum for clean interpolation)\n"
+        "     sv_fps 20: 50ms, sv_fps 40: 25ms, sv_fps 60: 16ms, sv_fps 80: 12ms, sv_fps 100: 10ms\n"
         "1-100 = manual delay — trades latency for position stability\n"
-        "Minimum for clean ring-buffer interpolation = ceil(1000/sv_fps):\n"
-        "  sv_fps 20:50ms  40:25ms  60:17ms  80:13ms  100:10ms\n"
         "Default: 0");
 
     sv_velSmooth = Cvar_Get ("sv_velSmooth", "32", CVAR_ARCHIVE );
