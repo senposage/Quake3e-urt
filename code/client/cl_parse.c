@@ -494,6 +494,13 @@ static void CL_ParseSnapshot( msg_t *msg, qboolean multiview ) {
 			if ( cl.snapshotMsec < 8 ) cl.snapshotMsec = 8;
 			if ( cl.snapshotMsec > 100 ) cl.snapshotMsec = 100;
 		}
+		if ( cl.snapshotMsec > 0 ) {
+			SCR_NetMonitorAddSnapInterval( measured, cl.snapshotMsec );
+			// Log a SNAP LATE event when a snap arrives more than 1.5× the expected interval.
+			// This is the network-side cause of a visible gap in the lagometer top bar.
+			if ( measured > cl.snapshotMsec + cl.snapshotMsec / 2 )
+				SCR_LogSnapLate( measured, cl.snapshotMsec );
+		}
 	}
 	if ( cl.snapshotMsec == 0 ) {
 		cl.snapshotMsec = 50; // default to 20Hz until first measurement
@@ -512,6 +519,26 @@ static void CL_ParseSnapshot( msg_t *msg, qboolean multiview ) {
 	}
 	// save the frame off in the backup array for later delta comparisons
 	cl.snapshots[cl.snap.messageNum & PACKET_MASK] = cl.snap;
+
+	SCR_NetMonitorAddPing( cl.snap.ping );
+
+	// Log a PING JITTER event when the per-snap ping change exceeds half a snapshot
+	// interval. At 60Hz that is 8ms; at 20Hz it is 25ms. Rapid alternating events
+	// (e.g. 32ms->50ms->32ms every snap) indicate that cl.serverTime oscillation is
+	// causing the ping loop to match different outgoing packets on consecutive snaps,
+	// which in turn drives serverTimeDelta oscillation and the cg_drawfps jitter.
+	if ( cl.snap.ping < 999 ) {
+		static int prevPing = -1;
+		if ( prevPing > 0 ) {
+			int delta    = cl.snap.ping - prevPing;
+			int absDelta = delta < 0 ? -delta : delta;
+			int thresh   = cl.snapshotMsec / 2;
+			if ( thresh < 10 ) thresh = 10;
+			if ( absDelta >= thresh )
+				SCR_LogPingJitter( cl.snap.ping, prevPing );
+		}
+		prevPing = cl.snap.ping;
+	}
 
 	if (cl_shownet->integer == 3) {
 		Com_Printf( "   snapshot:%i  delta:%i  ping:%i\n", cl.snap.messageNum,

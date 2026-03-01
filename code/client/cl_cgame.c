@@ -1040,6 +1040,13 @@ or bursted delayed packets.
 */
 
 static void CL_AdjustTimeDelta( void ) {
+	// Sub-millisecond fractional accumulator for the slow drift path.
+	// 1 unit = ¼ ms; each slow-path step adds ±2 units (= ±½ ms);
+	// commit threshold is ±4 units (= ±1 ms).
+	// Declared here so the RESET and FAST branches can clear it when they
+	// make a large correction — stale slow-drift history would be wrong after
+	// a big jump.
+	static int slowFrac = 0;
 	int		newDelta;
 	int		deltaDelta;
 	int		resetTime;
@@ -1072,9 +1079,11 @@ static void CL_AdjustTimeDelta( void ) {
 		cl.serverTimeDelta = newDelta;
 		cl.oldServerTime = cl.snap.serverTime;	// FIXME: is this a problem for cgame?
 		cl.serverTime = cl.snap.serverTime;
+		slowFrac = 0; // stale slow-drift history is irrelevant after a hard reset
 		if ( cl_showTimeDelta->integer ) {
 			Com_Printf( "<RESET> " );
 		}
+		SCR_NetMonitorAddResetAdjust();
 		SCR_LogTimingEvent( "RESET", cl.serverTimeDelta, deltaDelta );
 	} else if ( deltaDelta > fastAdjust ) {
 		// fast adjust, cut the difference in half
@@ -1082,6 +1091,8 @@ static void CL_AdjustTimeDelta( void ) {
 			Com_Printf( "<FAST> " );
 		}
 		cl.serverTimeDelta = ( cl.serverTimeDelta + newDelta ) >> 1;
+		slowFrac = 0; // stale slow-drift history is irrelevant after a fast correction
+		SCR_NetMonitorAddFastAdjust();
 		SCR_LogTimingEvent( "FAST ", cl.serverTimeDelta, deltaDelta );
 	} else {
 		// slow drift adjust, only move 1 or 2 msec
@@ -1090,17 +1101,41 @@ static void CL_AdjustTimeDelta( void ) {
 		// had to be extrapolated, nudge our sense of time back a little
 		// the granularity of +1 / -2 is too high for timescale modified frametimes
 		if ( com_timescale->value == 0 || com_timescale->value == 1 ) {
+			// Use a half-millisecond fractional accumulator (4 units = 1 ms) so
+			// that at the equilibrium extrapolation rate (50% at 60 Hz, 1/3 at
+			// 20 Hz) the net per-snap adjustment is exactly zero and
+			// serverTimeDelta does not oscillate ±1 ms each snap.
+			//
+			// Without this, the discrete ±1 ms integer steps cause cl.serverTime
+			// to oscillate by ±1 ms.  That oscillation stamps outgoing commands
+			// with alternating serverTime values, producing server-side position
+			// jitter visible from other clients, mild client-side lag from
+			// prediction running against an unstable time base, and the ping
+			// loop alternating between consecutive outgoing packets — observable
+			// as a rapid 32↔40 ms ping oscillation in cg_drawfps that builds
+			// and fades over 10–20 s as serverTimeDelta slowly drifts into and
+			// out of the critical flip zone.  ICMP ping to the server is stable
+			// (38–44 ms) confirming the oscillation is entirely client-side.
 			if ( cl.extrapolatedSnapshot ) {
 				cl.extrapolatedSnapshot = qfalse;
-				// Scale pullback with snapshot rate: vanilla -2ms was tuned for 20Hz
-				// (50ms windows). At 60Hz (16ms windows) it is disproportionately
-				// aggressive and creates a visible sawtooth in the netgraph.
-				// Use -1ms at 60Hz+ so the +1/-1 balance stabilises at 50% instead
-				// of the +1/-2 equilibrium that causes the oscillation cycle.
-				cl.serverTimeDelta -= ( cl.snapshotMsec < 30 ) ? 1 : 2;
+				// At 60 Hz (snapshotMsec < 30): step = -2 units = -½ ms per snap.
+				// At 20 Hz (snapshotMsec ≥ 30): step = -4 units = -1 ms per snap.
+				// Half the old -1/-2 ms steps; equilibrium rate and convergence
+				// direction are unchanged, convergence speed is halved (still fast
+				// enough — large excursions are handled by the FAST/RESET paths).
+				slowFrac -= ( cl.snapshotMsec < 30 ) ? 2 : 4;
 			} else {
-				// otherwise, move our sense of time forward to minimize total latency
+				slowFrac += 2; // +½ ms per snap (half the old +1 ms step)
+			}
+			// Commit a whole-ms adjustment once the accumulator reaches ±1 ms.
+			if ( slowFrac >= 4 ) {
 				cl.serverTimeDelta++;
+				slowFrac -= 4;
+				SCR_NetMonitorAddSlowAdjust();
+			} else if ( slowFrac <= -4 ) {
+				cl.serverTimeDelta--;
+				slowFrac += 4;
+				SCR_NetMonitorAddSlowAdjust();
 			}
 		}
 	}
@@ -1285,6 +1320,7 @@ void CL_SetCGameTime( void ) {
 		// artefact it eliminates.
 		if ( cl.serverTime >= cl.snap.serverTime ) {
 			cl.serverTime = cl.snap.serverTime - 1;
+			SCR_NetMonitorAddCapHit();
 		}
 		cl.oldServerTime = cl.serverTime;
 
@@ -1305,6 +1341,8 @@ void CL_SetCGameTime( void ) {
 			}
 		}
 
+		SCR_NetMonitorAddTimeDelta( cl.serverTimeDelta );
+
 		// note if we are almost past the latest frame (without timeNudge),
 		// so we will try and adjust back a bit when the next snapshot arrives.
 		// Scale the detection window with the measured snapshot interval:
@@ -1318,6 +1356,7 @@ void CL_SetCGameTime( void ) {
 			if ( extrapolateThresh > 16 ) extrapolateThresh = 16;
 			if ( cls.realtime + cl.serverTimeDelta - cl.snap.serverTime >= -extrapolateThresh ) {
 				cl.extrapolatedSnapshot = qtrue;
+				SCR_NetMonitorAddExtrap();
 			}
 		}
 	}

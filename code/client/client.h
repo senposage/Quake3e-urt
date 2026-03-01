@@ -626,8 +626,19 @@ void	SCR_DrawSmallString( int x, int y, const char *s, int len );
 // Net monitor
 void	SCR_NetMonitorAddIncoming( int bytes, int drops );
 void	SCR_NetMonitorAddOutgoing( int bytes );
+void	SCR_NetMonitorAddFrametime( int ft );
+void	SCR_NetMonitorAddSnapInterval( int measured, int expected );
+void	SCR_NetMonitorAddCapHit( void );
+void	SCR_NetMonitorAddExtrap( void );
+void	SCR_NetMonitorAddTimeDelta( int dT );
+void	SCR_NetMonitorAddPing( int ping );
+void	SCR_NetMonitorAddFastAdjust( void );
+void	SCR_NetMonitorAddResetAdjust( void );
+void	SCR_NetMonitorAddSlowAdjust( void );
 void	SCR_LogConsoleInput( const char *cmd );
 void	SCR_LogTimingEvent( const char *tag, int serverTimeDelta, int deltaDelta );
+void	SCR_LogSnapLate( int measured, int expected );
+void	SCR_LogPingJitter( int ping, int prevPing );
 void	SCR_CloseNetLog( void );
 
 //

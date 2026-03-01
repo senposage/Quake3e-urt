@@ -47,6 +47,39 @@ static int	netMonDropsWindow;
 static int	netMonDropRate;
 static int	netMonLastUpdate;
 
+// Frame-time and snap-jitter tracking (reset each second)
+static int	netMonFtSum;
+static int	netMonFtCount;
+static int	netMonFtMin;
+static int	netMonFtMax;
+static qboolean	netMonFtValid;
+static int	netMonSnapGapSum;
+static int	netMonSnapGapCount;
+static int	netMonSnapGapMax;
+
+// Cap-hit, extrap, and serverTimeDelta range tracking (reset each second)
+static int	netMonCapHits;
+static int	netMonExtrapCount;
+static int	netMonDtMin;
+static int	netMonDtMax;
+static qboolean	netMonDtValid;
+
+// Ping jitter tracking (reset each second)
+static int	netMonPingSum;
+static int	netMonPingCount;
+static int	netMonPingMin;
+static int	netMonPingMax;
+static qboolean	netMonPingValid;
+
+// FAST/RESET adjustment counts (reset each second; counted regardless of log level)
+static int	netMonFastCount;
+static int	netMonResetCount;
+// Slow-path ms-commit count (reset each second).
+// With the fractional-accumulator fix, this is 0 at 60Hz equilibrium — a non-zero
+// value here means serverTimeDelta is genuinely drifting (expected after late packets)
+// or, if combined with PING JITTER events, that the oscillation issue has recurred.
+static int	netMonSlowCount;
+
 // Session log file (opened lazily when cl_netlog > 0)
 static fileHandle_t	netLogFile;
 
@@ -655,6 +688,74 @@ void SCR_NetMonitorAddOutgoing( int bytes ) {
 	netMonOutBytes += bytes;
 }
 
+void SCR_NetMonitorAddFrametime( int ft ) {
+	netMonFtSum   += ft;
+	netMonFtCount += 1;
+	if ( !netMonFtValid ) {
+		netMonFtMin   = ft;
+		netMonFtMax   = ft;
+		netMonFtValid = qtrue;
+	} else {
+		if ( ft < netMonFtMin ) netMonFtMin = ft;
+		if ( ft > netMonFtMax ) netMonFtMax = ft;
+	}
+}
+
+void SCR_NetMonitorAddSnapInterval( int measured, int expected ) {
+	int gap = measured - expected;
+	if ( gap < 0 ) gap = -gap;
+	netMonSnapGapSum += gap;
+	netMonSnapGapCount++;
+	if ( gap > netMonSnapGapMax )
+		netMonSnapGapMax = gap;
+}
+
+void SCR_NetMonitorAddCapHit( void ) {
+	netMonCapHits++;
+}
+
+void SCR_NetMonitorAddExtrap( void ) {
+	netMonExtrapCount++;
+}
+
+void SCR_NetMonitorAddTimeDelta( int dT ) {
+	if ( !netMonDtValid ) {
+		netMonDtMin   = dT;
+		netMonDtMax   = dT;
+		netMonDtValid = qtrue;
+	} else {
+		if ( dT < netMonDtMin ) netMonDtMin = dT;
+		if ( dT > netMonDtMax ) netMonDtMax = dT;
+	}
+}
+
+void SCR_NetMonitorAddPing( int ping ) {
+	if ( ping <= 0 || ping >= 999 )
+		return; /* skip invalid / unknown pings */
+	netMonPingSum += ping;
+	netMonPingCount++;
+	if ( !netMonPingValid ) {
+		netMonPingMin   = ping;
+		netMonPingMax   = ping;
+		netMonPingValid = qtrue;
+	} else {
+		if ( ping < netMonPingMin ) netMonPingMin = ping;
+		if ( ping > netMonPingMax ) netMonPingMax = ping;
+	}
+}
+
+void SCR_NetMonitorAddFastAdjust( void ) {
+	netMonFastCount++;
+}
+
+void SCR_NetMonitorAddResetAdjust( void ) {
+	netMonResetCount++;
+}
+
+void SCR_NetMonitorAddSlowAdjust( void ) {
+	netMonSlowCount++;
+}
+
 /* ----- session log helpers ----- */
 
 static void SCR_OpenNetLog( void ) {
@@ -716,6 +817,35 @@ void SCR_LogTimingEvent( const char *tag, int serverTimeDelta, int deltaDelta ) 
 	Com_RealTime( &t );
 	Com_sprintf( line, sizeof(line), "[%02d:%02d:%02d] DELTA %s  dT=%dms  dd=%dms\n",
 		t.tm_hour, t.tm_min, t.tm_sec, tag, serverTimeDelta, deltaDelta );
+	SCR_WriteLog( line );
+}
+
+void SCR_LogSnapLate( int measured, int expected ) {
+	qtime_t t;
+	char    line[128];
+
+	if ( !cl_netlog || !cl_netlog->integer )
+		return;
+
+	SCR_OpenNetLog();
+	Com_RealTime( &t );
+	Com_sprintf( line, sizeof(line), "[%02d:%02d:%02d] SNAP LATE  +%dms  (expected %dms  got %dms)\n",
+		t.tm_hour, t.tm_min, t.tm_sec, measured - expected, expected, measured );
+	SCR_WriteLog( line );
+}
+
+void SCR_LogPingJitter( int ping, int prevPing ) {
+	qtime_t t;
+	char    line[128];
+	int     delta = ping - prevPing;
+
+	if ( !cl_netlog || !cl_netlog->integer )
+		return;
+
+	SCR_OpenNetLog();
+	Com_RealTime( &t );
+	Com_sprintf( line, sizeof(line), "[%02d:%02d:%02d] PING JITTER  %dms->%dms  (%+dms)\n",
+		t.tm_hour, t.tm_min, t.tm_sec, prevPing, ping, delta );
 	SCR_WriteLog( line );
 }
 
@@ -794,7 +924,7 @@ static void SCR_NetgraphDump_f( void ) {
 
 /* Widget columns and rows (character cells). */
 #define NM_COLS 21
-#define NM_ROWS  9
+#define NM_ROWS 10
 
 /*
  * NM_DrawRow — draw a NUL-terminated string starting at (*tx, ty) using
@@ -841,6 +971,22 @@ static void SCR_DrawNetMonitor( void ) {
 
 	/* ---- update 1-second rate window ---- */
 	if ( netMonLastUpdate == 0 || cls.realtime - netMonLastUpdate >= 1000 ) {
+		int ftMin      = netMonFtValid   ? netMonFtMin  : 0;
+		int ftAvg      = ( netMonFtCount > 0 ) ? ( netMonFtSum / netMonFtCount ) : 0;
+		int ftMax      = netMonFtValid   ? netMonFtMax  : 0;
+		int snapGapAvg = ( netMonSnapGapCount > 0 ) ? ( netMonSnapGapSum / netMonSnapGapCount ) : 0;
+		int snapGapMax = netMonSnapGapMax;
+		int capHits    = netMonCapHits;
+		int extrapCnt  = netMonExtrapCount;
+		int dtMin      = netMonDtValid   ? netMonDtMin  : cl.serverTimeDelta;
+		int dtMax      = netMonDtValid   ? netMonDtMax  : cl.serverTimeDelta;
+		int pingAvg    = ( netMonPingCount > 0 ) ? ( netMonPingSum / netMonPingCount ) : cl.snap.ping;
+		int pingMin    = netMonPingValid  ? netMonPingMin : cl.snap.ping;
+		int pingMax    = netMonPingValid  ? netMonPingMax : cl.snap.ping;
+		int fastCnt    = netMonFastCount;
+		int resetCnt   = netMonResetCount;
+		int slowCnt    = netMonSlowCount;
+
 		netMonInRate      = netMonInBytes;
 		netMonOutRate     = netMonOutBytes;
 		netMonDropRate    = netMonDropsWindow;
@@ -848,21 +994,44 @@ static void SCR_DrawNetMonitor( void ) {
 		netMonOutBytes    = 0;
 		netMonDropsWindow = 0;
 		netMonLastUpdate  = cls.realtime;
+		netMonFtSum       = 0;
+		netMonFtCount     = 0;
+		netMonFtMin       = 0;
+		netMonFtMax       = 0;
+		netMonFtValid     = qfalse;
+		netMonSnapGapSum  = 0;
+		netMonSnapGapCount = 0;
+		netMonSnapGapMax  = 0;
+		netMonCapHits     = 0;
+		netMonExtrapCount = 0;
+		netMonDtValid     = qfalse;
+		netMonPingSum     = 0;
+		netMonPingCount   = 0;
+		netMonPingValid   = qfalse;
+		netMonFastCount   = 0;
+		netMonResetCount  = 0;
+		netMonSlowCount   = 0;
 
 		/* optional periodic stats line in the log */
 		if ( cl_netlog->integer >= 2 && netLogFile ) {
 			qtime_t t;
-			char    logline[192];
+			char    logline[256];
 			Com_RealTime( &t );
 			snapHz = ( cl.snapshotMsec > 0 ) ? ( 1000 / cl.snapshotMsec ) : 0;
 			Com_sprintf( logline, sizeof(logline),
-				"[%02d:%02d:%02d] STATS  snap=%dHz  ping=%dms  fI=%.3f(INTERP)"
-				"  dT=%dms  drop=%d/s  in=%dB/s  out=%dB/s\n",
+				"[%02d:%02d:%02d] STATS  snap=%dHz  ping=%d(%d..%d)ms  fI=%.3f(INTERP)"
+				"  dT=%d..%dms  drop=%d/s  in=%dB/s  out=%dB/s"
+				"  ft=%d/%d/%dms  snapgap=%d/%dms  caps=%d  extrap=%d"
+				"  fast=%d  reset=%d  slow=%d\n",
 				t.tm_hour, t.tm_min, t.tm_sec,
-				snapHz, cl.snap.ping,
+				snapHz, pingAvg, pingMin, pingMax,
 				cl.frameInterpolation,
-				cl.serverTimeDelta, netMonDropRate,
-				netMonInRate, netMonOutRate );
+				dtMin, dtMax, netMonDropRate,
+				netMonInRate, netMonOutRate,
+				ftMin, ftAvg, ftMax,
+				snapGapAvg, snapGapMax,
+				capHits, extrapCnt,
+				fastCnt, resetCnt, slowCnt );
 			SCR_WriteLog( logline );
 		}
 	}
@@ -948,6 +1117,18 @@ static void SCR_DrawNetMonitor( void ) {
 		cl.snap.messageNum - cl.snap.deltaNum );
 	NM_DrawRow( &tx, &ty, bx + pad, charW, charH, colorWhite, line );
 
+	/* row 10 – time-delta adjustment counts (current second so far).
+	 * slow = slow-path ms-commits; with the ½ms accumulator fix this is 0 at
+	 * 60Hz equilibrium.  A non-zero slow paired with PING JITTER in the log
+	 * means the oscillation issue has recurred.
+	 * fast = FAST-path fires (large snap-to-snap delta > 2×snapshotMsec). */
+	{
+		col = ( netMonFastCount > 0 ) ? colorRed :
+		      ( netMonSlowCount > 0 ) ? colorYellow : colorGreen;
+		Com_sprintf( line, sizeof(line), "Adj: slo=%d fst=%d", netMonSlowCount, netMonFastCount );
+		NM_DrawRow( &tx, &ty, bx + pad, charW, charH, col, line );
+	}
+
 	re.SetColor( NULL );
 }
 
@@ -995,8 +1176,17 @@ void SCR_Init( void ) {
     Cvar_SetDescription( cl_netlog,
         "Net debug session logging.\n"
         "0 = off\n"
-        "1 = log timestamped console commands + FAST/RESET time-delta events\n"
-        "2 = log commands + delta events + periodic per-second stats\n"
+        "1 = log FAST/RESET delta events + SNAP LATE events + PING JITTER events\n"
+        "    PING JITTER fires when per-snap ping change >= max(snapshotMsec/2, 10ms);\n"
+        "    rapid alternating events (e.g. 32ms->40ms / 40ms->32ms every snap) paired\n"
+        "    with slow>0 in STATS means the serverTimeDelta oscillation has recurred.\n"
+        "2 = log level 1 events + periodic per-second stats\n"
+        "  STATS fields: snap Hz, ping=avg(min..max), fI, dT=min..max, drop, in/out rates,\n"
+        "                ft=min/avg/max client frame-time, snapgap=avg/max snap-interval jitter,\n"
+        "                caps=serverTime cap fires, extrap=extrapolated-frame count,\n"
+        "                fast=FAST-adjust count, reset=RESET-adjust count,\n"
+        "                slow=slow-path ms-commits (0 at 60Hz equilibrium = fix working;\n"
+        "                     non-zero = genuine drift or oscillation regression)\n"
         "Log file written to netdebug_<date>_<time>.log in the game folder.\n"
         "Default: 0" );
 
