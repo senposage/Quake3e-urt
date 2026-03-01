@@ -512,6 +512,12 @@ static void *VM_ArgPtr( intptr_t intValue ) {
 }
 
 
+// CVAR_ROM cvars updated every frame so patched QVMs can read the values via
+// the standard trap_Cvar_VariableStringBuffer("cl_frameInterpolation", …)
+// in addition to the CG_TRAP_GETVALUE("cl_frameInterpolation") path.
+static cvar_t *cvar_cl_frameInterpolation = NULL;
+static cvar_t *cvar_cl_snapshotMsec       = NULL;
+
 static qboolean CL_GetValue( char* value, int valueSize, const char* key ) {
 
 	if ( !Q_stricmp( key, "trap_R_AddRefEntityToScene2" ) ) {
@@ -1024,6 +1030,12 @@ CL_CGameRendering
 =====================
 */
 void CL_CGameRendering( stereoFrame_t stereo ) {
+	// cl.serverTime is already capped so the QVM's internal frameInterpolation
+	// stays in [0,1] during normal interpolation.  A patched QVM can retrieve
+	// the engine-computed estimate via either of two paths:
+	//   (a) trap_GetValue("cl_frameInterpolation", buf, sizeof(buf))   -- GETVALUE
+	//   (b) trap_Cvar_VariableStringBuffer("cl_frameInterpolation", buf, sizeof(buf))  -- cvar
+	// atof(buf) gives a float in [0,1] while interpolating or > 1 while extrapolating.
 	VM_Call( cgvm, 3, CG_DRAW_ACTIVE_FRAME, cl.serverTime, stereo, clc.demoplaying );
 #ifdef DEBUG
 	VM_Debug( 0 );
@@ -1294,6 +1306,10 @@ void CL_SetCGameTime( void ) {
 		// (cl.snap).  Result is in [0,1] while interpolating and > 1 while the
 		// engine is extrapolating past the latest received snapshot.
 		// Used by the net monitor widget and exposed via CG_TRAP_GETVALUE.
+		// Also pushed into CVAR_ROM cvars every frame so a patched QVM can read
+		// them via the standard trap_Cvar_VariableStringBuffer path:
+		//   trap_Cvar_VariableStringBuffer("cl_frameInterpolation", buf, sizeof(buf))
+		//   trap_Cvar_VariableStringBuffer("cl_snapshotMsec", buf, sizeof(buf))
 		{
 			const clSnapshot_t *prevSnap = &cl.snapshots[ (cl.snap.messageNum - 1) & PACKET_MASK ];
 			int interval = cl.snap.serverTime - prevSnap->serverTime;
@@ -1302,6 +1318,14 @@ void CL_SetCGameTime( void ) {
 			} else {
 				cl.frameInterpolation = 0.0f;
 			}
+
+			if ( !cvar_cl_frameInterpolation )
+				cvar_cl_frameInterpolation = Cvar_Get( "cl_frameInterpolation", "0", CVAR_ROM );
+			Cvar_SetValue( "cl_frameInterpolation", cl.frameInterpolation );
+
+			if ( !cvar_cl_snapshotMsec )
+				cvar_cl_snapshotMsec = Cvar_Get( "cl_snapshotMsec", "0", CVAR_ROM );
+			Cvar_SetIntegerValue( "cl_snapshotMsec", cl.snapshotMsec );
 		}
 
 		// note if we are almost past the latest frame (without timeNudge),
