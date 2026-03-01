@@ -72,6 +72,7 @@ These files are in `UrbanTerror42_Source/` and are reference only. We cannot mod
 - **`docs/g-antiwarp-engine-feasibility.md`** — Feasibility analysis for moving g_antiwarp into sv_antilag.c; covers what is/isn't engine-fixable and the recommended approach
 - **`docs/debug-session-2026-02-26-cl_snapScaling-stutter.md`** — cl_snapScaling oscillation investigation and removal
 - **`docs/debug-session-2026-02-27-smoothing-jitter.md`** — sv_smoothClients/sv_bufferMs stationary jitter investigation
+- **`docs/debug-session-2026-03-01-frameinterpolation-lagometer.md`** — fI INTERP/EXTRAP flicker observed in cg_lagometer top bar; correlated via cl_netgraph widget; fixed by serverTime cap
 
 ---
 
