@@ -648,6 +648,14 @@ qboolean SV_Antilag_InterceptTrace(
     if ( passEntityNum < 0 || passEntityNum >= sv_maxclients->integer )
         return qfalse;
 
+    // Skip movement traces — only intercept weapon/damage traces.
+    // Pmove uses MASK_PLAYERSOLID (includes CONTENTS_PLAYERCLIP) for collision;
+    // weapon traces use MASK_SHOT (no CONTENTS_PLAYERCLIP).
+    // Rewinding movement traces causes players to collide against historical
+    // positions instead of current ones, allowing them to phase through each other.
+    if ( contentmask & CONTENTS_PLAYERCLIP )
+        return qfalse;
+
     {
         client_t *shooter = &svs.clients[passEntityNum];
         if ( shooter->state != CS_ACTIVE )

@@ -1196,7 +1196,7 @@ void SCR_Init( void ) {
         "Log file written to netdebug_<date>_<time>.log in the game folder.\n"
         "Default: 0" );
 
-    cl_adaptiveTiming = Cvar_Get( "cl_adaptiveTiming", "0", 0 );
+    cl_adaptiveTiming = Cvar_Get( "cl_adaptiveTiming", "1", 0 );
     Cvar_SetDescription( cl_adaptiveTiming,
         "Enable the adaptive timing system that scales timing thresholds to the\n"
         "measured server snapshot interval (improves accuracy at 60Hz+ sv_fps).\n"
