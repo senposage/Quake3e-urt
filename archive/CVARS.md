@@ -62,11 +62,11 @@ Maximum physics step size (ms). 8ms = 125fps equivalent Pmove. Set to 0 to disab
 Engine-side position correction for high sv_fps snapshots.
 
 - **0** = disabled. Vanilla behavior: `BG_PlayerStateToEntityState` only runs at sv_gameHz (20Hz), so 3 consecutive 60Hz snapshots have identical player positions → visible stutter.
-- **1** = enabled. Real players: reads actual `ps->origin` from the game module (updated every usercmd by Pmove). Bots: velocity-based extrapolation (`trBase += trDelta * dt`), which is accurate because bot AI only changes direction at game frame boundaries.
+- **1** = enabled. Real players: reads actual `ps->origin` from the game module (updated every usercmd by Pmove). Bots: velocity-based extrapolation (`trBase += ps->velocity * dt`), which is accurate because bot AI only changes direction at game frame boundaries.
 
 **Why:** At sv_fps 60 with sv_gameHz 20, the entity state (`ent->s`) only updates every 3rd engine tick. Without correction, clients see players teleporting every 50ms instead of moving smoothly every 16ms.
 
-**How:** `sv_snapshot.c:SV_BuildCommonSnapshot()` runs on every snapshot tick regardless of `sv_gameHz` setting. `extrapolateMs = sv.time - sv.gameTime` is used by the bot velocity path (`trBase += trDelta * dt`); when `extrapolateMs == 0` (sv_gameHz disabled or at a game-frame boundary tick), `dt=0` so bot positions are unchanged. Real-player path reads `ps->origin` directly on every tick — when `extrapolateMs == 0` this is the same value `BG_PlayerStateToEntityState` already wrote (harmless redundancy). The `sv_bufferMs` ring buffer query (Phase 1) runs every tick regardless of `extrapolateMs`, ensuring consistent delayed positions. Velocity dead-zone check `DotProduct(velocity, velocity) > 100.0` prevents idle player vibration from Pmove ground snapping micro-oscillations.
+**How:** `sv_snapshot.c:SV_BuildCommonSnapshot()` runs on every snapshot tick regardless of `sv_gameHz` setting. `extrapolateMs = sv.time - sv.gameTime` is used by the bot velocity path (`trBase += ps->velocity * dt`); when `extrapolateMs == 0` (sv_gameHz disabled or at a game-frame boundary tick), `dt=0` so bot positions are unchanged. Real-player path reads `ps->origin` directly on every tick — when `extrapolateMs == 0` this is the same value `BG_PlayerStateToEntityState` already wrote (harmless redundancy). The `sv_bufferMs` ring buffer query (Phase 1) runs every tick regardless of `extrapolateMs`, ensuring consistent delayed positions. Velocity dead-zone check `DotProduct(velocity, velocity) > 100.0` prevents idle player vibration from Pmove ground snapping micro-oscillations.
 
 ---
 

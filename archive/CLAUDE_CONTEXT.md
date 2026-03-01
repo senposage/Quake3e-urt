@@ -279,12 +279,12 @@ VectorCopy( ps->origin, es->pos.trBase );
 VectorCopy( ps->velocity, es->pos.trDelta );
 ```
 
-**Bots** — `ps->origin` only updates at game-frame boundaries (bot AI ticks at sv_gameHz). Between frames we use velocity extrapolation:
+**Bots** — `ps->origin` only updates at game-frame boundaries (bot AI ticks at sv_gameHz). Between frames we use velocity extrapolation using `ps->velocity` (set by Pmove, not touched by `BG_PlayerStateToEntityState`):
 ```c
 const float dt = extrapolateMs * 0.001f;
-es->pos.trBase[0] += es->pos.trDelta[0] * dt;
-es->pos.trBase[1] += es->pos.trDelta[1] * dt;
-es->pos.trBase[2] += es->pos.trDelta[2] * dt;
+es->pos.trBase[0] += velocity[0] * dt;  // velocity = ps->velocity from SV_GameClientNum
+es->pos.trBase[1] += velocity[1] * dt;
+es->pos.trBase[2] += velocity[2] * dt;
 ```
 
 **Investigated and rejected: TR_LINEAR_STOP injection**
@@ -361,7 +361,7 @@ If rcon `map` still fails after the above fix, investigate:
 
 ### Visual smoothness — position extrapolation (IMPLEMENTED, NEEDS TESTING)
 Engine-side position extrapolation in `SV_BuildCommonSnapshot` (sv_snapshot.c) should eliminate the 3-snapshot stutter pattern. Needs in-game testing with multiple human players at `sv_fps 60 / sv_gameHz 20`. If residual stutter remains, check:
-- Whether velocity in `trDelta` is zeroed for crouching or specific movement states in UT4.3 QVM
+- Whether `ps->velocity` ever gives significantly different results from `trDelta` (fixed: now always use `ps->velocity` which bypasses any QVM entity-state packing deviation)
 - Whether `sv.time - sv.gameTime` ever exceeds `1000/sv_gameHz` ms (should be bounded by the inner loop logic)
 
 ### sv_ccmds.c — GAME_RUN_FRAME time clock (FIXED)
@@ -388,7 +388,7 @@ Investigated using `trap_Cvar_Set` intercept to fix the unclamped `frameInterpol
 | `sv_main.c` | sv_fps/sv_gameHz frame loop decoupling; timeResidual hard clamp; SV_BotFrame moved to sv_gameHz inner loop; antilag sub-tick recording |
 | `sv_init.c` | Register sv_gameHz, sv_snapshotFps, sv_busyWait, sv_pmoveMsec; antilag cvar registration; CVG_SERVER group tracking |
 | `sv_client.c` | sv_pmoveMsec multi-step loop with commandTime stall detection; bot exclusion from clamping |
-| `sv_snapshot.c` | `snaps` client cvar bypassed — sv_snapshotFps is authoritative; real players use ps->origin for position fixup between game frames; bots use velocity extrapolation (trDelta * dt) |
+| `sv_snapshot.c` | `snaps` client cvar bypassed — sv_snapshotFps is authoritative; real players use ps->origin for position fixup between game frames; bots use velocity extrapolation (ps->velocity * dt — NOT trDelta, which may be zero/incorrect in UT QVM) |
 | `sv_ccmds.c` | `SV_MapRestart_f`: sync `sv.gameTime = sv.time` + `sv.gameTimeResidual = 0` on restart; warmup frames pass `sv.gameTime` to `GAME_RUN_FRAME` (was incorrectly using `sv.time`) |
 | `sv_antilag.c` | Full engine-side antilag implementation |
 | `sv_antilag.h` | Antilag interface |
