@@ -434,7 +434,7 @@ extern	cvar_t	*cl_timeNudge;
 extern	cvar_t	*cl_showTimeDelta;
 extern	cvar_t	*cl_netgraph;
 extern	cvar_t	*cl_netlog;
-extern	cvar_t	*cl_snapshotEMA;
+extern	cvar_t	*cl_adaptiveTiming;
 
 extern	cvar_t	*com_timedemo;
 extern	cvar_t	*cl_aviFrameRate;

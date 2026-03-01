@@ -486,7 +486,7 @@ static void CL_ParseSnapshot( msg_t *msg, qboolean multiview ) {
 		// snapshotMsec is not yet initialised (first snapshot before EMA warms up).
 		int maxMeasured = cl.snapshotMsec > 0 ? cl.snapshotMsec * 4 : 200;
 		if ( measured >= 1 && measured <= maxMeasured ) {
-			if ( cl.snapshotMsec == 0 || !cl_snapshotEMA->integer ) {
+			if ( cl.snapshotMsec == 0 || !cl_adaptiveTiming->integer ) {
 				cl.snapshotMsec = measured; // first measurement or EMA disabled
 			} else {
 				cl.snapshotMsec = ( cl.snapshotMsec * 3 + measured ) >> 2; // exponential moving average

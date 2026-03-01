@@ -1063,14 +1063,14 @@ static void CL_AdjustTimeDelta( void ) {
 	// system reacts at the same number-of-snapshots equivalent across all rates.
 	// At 20Hz (snapshotMsec=50): resetTime=500, fastAdjust=100 — same as vanilla.
 	// At 60Hz (snapshotMsec=16): resetTime=500 (floor), fastAdjust=32.
-	resetTime  = cl.snapshotMsec * 10;
-	fastAdjust = cl.snapshotMsec * 2;
-	if ( resetTime < 500 ) resetTime = 500;   // floor: don't hard-reset on small drifts
-	// No floor on fastAdjust: 2×snapshotMsec is proportionally correct at all rates
-	// (matches vanilla Q3's 100ms = 2×50ms at 20Hz). The old 50ms floor meant that
-	// at 60Hz+ any disturbance under 50ms spent 32+ slow-drift steps recovering
-	// instead of using the faster half-delta correction — visible as a multi-second
-	// sawtooth oscillation in the netgraph for any moderate load spike.
+	if ( cl_adaptiveTiming->integer ) {
+		resetTime  = cl.snapshotMsec * 10;
+		fastAdjust = cl.snapshotMsec * 2;
+		if ( resetTime < 500 ) resetTime = 500;
+	} else {
+		resetTime  = 500;
+		fastAdjust = 100;
+	}
 
 	cl.newSnapshots = qfalse;
 
@@ -1108,41 +1108,38 @@ static void CL_AdjustTimeDelta( void ) {
 		// had to be extrapolated, nudge our sense of time back a little
 		// the granularity of +1 / -2 is too high for timescale modified frametimes
 		if ( com_timescale->value == 0 || com_timescale->value == 1 ) {
-			// Use a half-millisecond fractional accumulator (4 units = 1 ms) so
-			// that at the equilibrium extrapolation rate (50% at 60 Hz, 1/3 at
-			// 20 Hz) the net per-snap adjustment is exactly zero and
-			// serverTimeDelta does not oscillate ±1 ms each snap.
-			//
-			// Without this, the discrete ±1 ms integer steps cause cl.serverTime
-			// to oscillate by ±1 ms.  That oscillation stamps outgoing commands
-			// with alternating serverTime values, producing server-side position
-			// jitter visible from other clients, mild client-side lag from
-			// prediction running against an unstable time base, and the ping
-			// loop alternating between consecutive outgoing packets — observable
-			// as a rapid 32↔40 ms ping oscillation in cg_drawfps that builds
-			// and fades over 10–20 s as serverTimeDelta slowly drifts into and
-			// out of the critical flip zone.  ICMP ping to the server is stable
-			// (38–44 ms) confirming the oscillation is entirely client-side.
-			if ( cl.extrapolatedSnapshot ) {
-				cl.extrapolatedSnapshot = qfalse;
-				// At 60 Hz (snapshotMsec < 30): step = -2 units = -½ ms per snap.
-				// At 20 Hz (snapshotMsec ≥ 30): step = -4 units = -1 ms per snap.
-				// Half the old -1/-2 ms steps; equilibrium rate and convergence
-				// direction are unchanged, convergence speed is halved (still fast
-				// enough — large excursions are handled by the FAST/RESET paths).
-				slowFrac -= ( cl.snapshotMsec < 30 ) ? 2 : 4;
+			if ( cl_adaptiveTiming->integer ) {
+				// Use a half-millisecond fractional accumulator (4 units = 1 ms) so
+				// that at the equilibrium extrapolation rate (50% at 60 Hz, 1/3 at
+				// 20 Hz) the net per-snap adjustment is exactly zero and
+				// serverTimeDelta does not oscillate ±1 ms each snap.
+				if ( cl.extrapolatedSnapshot ) {
+					cl.extrapolatedSnapshot = qfalse;
+					slowFrac -= ( cl.snapshotMsec < 30 ) ? 2 : 4;
+				} else {
+					slowFrac += 2; // +½ ms per snap (half the old +1 ms step)
+				}
+				// Commit a whole-ms adjustment once the accumulator reaches ±1 ms.
+				if ( slowFrac >= 4 ) {
+					cl.serverTimeDelta++;
+					slowFrac -= 4;
+					SCR_NetMonitorAddSlowAdjust( +1 );
+				} else if ( slowFrac <= -4 ) {
+					cl.serverTimeDelta--;
+					slowFrac += 4;
+					SCR_NetMonitorAddSlowAdjust( -1 );
+				}
 			} else {
-				slowFrac += 2; // +½ ms per snap (half the old +1 ms step)
-			}
-			// Commit a whole-ms adjustment once the accumulator reaches ±1 ms.
-			if ( slowFrac >= 4 ) {
-				cl.serverTimeDelta++;
-				slowFrac -= 4;
-				SCR_NetMonitorAddSlowAdjust( +1 );
-			} else if ( slowFrac <= -4 ) {
-				cl.serverTimeDelta--;
-				slowFrac += 4;
-				SCR_NetMonitorAddSlowAdjust( -1 );
+				// vanilla: integer ±1/-2 ms steps
+				if ( cl.extrapolatedSnapshot ) {
+					cl.extrapolatedSnapshot = qfalse;
+					cl.serverTimeDelta -= 2;
+					SCR_NetMonitorAddSlowAdjust( -2 );
+				} else {
+					cl.serverTimeDelta++;
+					SCR_NetMonitorAddSlowAdjust( +1 );
+				}
+				slowFrac = 0;
 			}
 		}
 	}
@@ -1312,22 +1309,13 @@ void CL_SetCGameTime( void ) {
 		if ( cl.serverTime - cl.oldServerTime < 0 ) {
 			cl.serverTime = cl.oldServerTime;
 		}
-		// Cap serverTime one millisecond below the latest received snapshot.
-		// The QVM advances its snapshot window the moment cg.time reaches
-		// cg.nextSnap->serverTime (== cl.snap.serverTime).  With a cap at
-		// exactly cl.snap.serverTime, the cap itself triggers the transition:
-		// the QVM finds no snapshot beyond cl.snap yet, sets cg.nextSnap=NULL,
-		// and enters EXTRAP mode — producing the intermittent INTERP/EXTRAP
-		// flicker seen in cg_lagometer when network jitter or an sv_fps change
-		// briefly pushes serverTimeDelta above its equilibrium.  Capping one
-		// millisecond short keeps cg.time strictly less than cg.nextSnap->serverTime,
-		// so the QVM never triggers that transition prematurely.
-		// The -1ms penalty: fI at the cap is (snapshotMsec-1)/snapshotMsec
-		// (~0.94 at 60 Hz, ~0.98 at 20 Hz) — imperceptible vs. the visual
-		// artefact it eliminates.
-		if ( cl.serverTime >= cl.snap.serverTime ) {
-			cl.serverTime = cl.snap.serverTime - 1;
-			SCR_NetMonitorAddCapHit();
+		// Cap serverTime one millisecond below the latest received snapshot
+		// (adaptive timing only — vanilla has no such cap).
+		if ( cl_adaptiveTiming->integer ) {
+			if ( cl.serverTime >= cl.snap.serverTime ) {
+				cl.serverTime = cl.snap.serverTime - 1;
+				SCR_NetMonitorAddCapHit();
+			}
 		}
 		cl.oldServerTime = cl.serverTime;
 
@@ -1352,25 +1340,21 @@ void CL_SetCGameTime( void ) {
 
 		// note if we are almost past the latest frame (without timeNudge),
 		// so we will try and adjust back a bit when the next snapshot arrives.
-		// Scale the detection window with the measured snapshot interval:
-		// the vanilla hardcode of 5ms equals snapshotMsec/3 at ~60Hz but is
-		// too tight at lower rates (e.g. 20Hz needs ~16ms), causing excessive
-		// drift-back oscillation that shows as a sawtooth in the netgraph for
-		// several seconds regardless of sv_fps.
-		//
-		// Evaluated in ¼ms units (diff×4 + slowFrac) so the half-ms
-		// accumulator's state is visible to the condition.  At the equilibrium
-		// threshold this causes the condition to flip each snap (1:1
-		// extrap/non-extrap), keeping slowFrac oscillating 0→-2→0→-2 and
-		// never reaching ±4 — so serverTimeDelta stays constant and the
-		// ±1ms oscillation that caused the 32↔48ms ping jitter is eliminated.
-		{
+		if ( cl_adaptiveTiming->integer ) {
+			// Scale the detection window with the measured snapshot interval.
+			// Evaluated in ¼ms units (diff×4 + slowFrac) so the half-ms
+			// accumulator's state is visible to the condition.
 			int extrapolateThresh = cl.snapshotMsec / 3;
 			if ( extrapolateThresh <  3 ) extrapolateThresh =  3;
 			if ( extrapolateThresh > 16 ) extrapolateThresh = 16;
 			if ( ( cls.realtime + cl.serverTimeDelta - cl.snap.serverTime ) * 4 + slowFrac >= -( extrapolateThresh * 4 ) ) {
 				cl.extrapolatedSnapshot = qtrue;
 				SCR_NetMonitorAddExtrap();
+			}
+		} else {
+			// vanilla: hardcoded 5ms threshold
+			if ( cls.realtime + cl.serverTimeDelta - cl.snap.serverTime >= -5 ) {
+				cl.extrapolatedSnapshot = qtrue;
 			}
 		}
 	}
@@ -1399,7 +1383,7 @@ void CL_SetCGameTime( void ) {
 			clc.timeDemoStart = Sys_Milliseconds();
 		}
 		clc.timeDemoFrames++;
-		cl.serverTime = clc.timeDemoBaseTime + clc.timeDemoFrames * cl.snapshotMsec;
+		cl.serverTime = clc.timeDemoBaseTime + clc.timeDemoFrames * ( cl_adaptiveTiming->integer ? cl.snapshotMsec : 50 );
 	}
 
 	//while ( cl.serverTime >= cl.snap.serverTime ) {

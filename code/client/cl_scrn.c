@@ -37,7 +37,7 @@ cvar_t		*cl_netgraph_x;
 cvar_t		*cl_netgraph_y;
 cvar_t		*cl_netgraph_scale;
 cvar_t		*cl_netlog;
-cvar_t		*cl_snapshotEMA;
+cvar_t		*cl_adaptiveTiming;
 
 // Net monitor rate tracking (updated per second)
 static int	netMonInBytes;
@@ -1196,11 +1196,14 @@ void SCR_Init( void ) {
         "Log file written to netdebug_<date>_<time>.log in the game folder.\n"
         "Default: 0" );
 
-    cl_snapshotEMA = Cvar_Get( "cl_snapshotEMA", "0", 0 );
-    Cvar_SetDescription( cl_snapshotEMA,
-        "Use an exponential moving average to smooth the measured snapshot interval.\n"
-        "0 = off (use raw measured interval each snap)\n"
-        "1 = on  (alpha=0.25 EMA over last ~4 snaps)\n"
+    cl_adaptiveTiming = Cvar_Get( "cl_adaptiveTiming", "0", 0 );
+    Cvar_SetDescription( cl_adaptiveTiming,
+        "Enable the adaptive timing system that scales timing thresholds to the\n"
+        "measured server snapshot interval (improves accuracy at 60Hz+ sv_fps).\n"
+        "0 = off: vanilla Q3e behaviour — hardcoded resetTime=500, fastAdjust=100,\n"
+        "         pullback=-2/+1ms, extrapolateThresh=5ms, download throttle=50ms.\n"
+        "1 = on:  all snapshotMsec-scaled thresholds, fractional slowFrac accumulator,\n"
+        "         serverTime cap, adaptive extrapolateThresh, adaptive throttle.\n"
         "Default: 0" );
 
     Cmd_AddCommand( "netgraph_dump", SCR_NetgraphDump_f );
