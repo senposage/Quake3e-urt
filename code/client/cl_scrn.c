@@ -746,7 +746,10 @@ static void SCR_NetgraphDump_f( void ) {
 	/* --- client timing & network stats --- */
 	Com_sprintf( line, sizeof(line), "Snapshot Rate : %d Hz  (%d ms interval EMA)\n",  snapHz, cl.snapshotMsec );               SCR_WriteLog( line );
 	Com_sprintf( line, sizeof(line), "Ping          : %d ms\n",                         cl.snap.ping );                          SCR_WriteLog( line );
-	Com_sprintf( line, sizeof(line), "Interp Mode   : %s\n",                            (cl.serverTime >= cl.snap.serverTime) ? "EXTRAPOLATING" : "INTERPOLATING" ); SCR_WriteLog( line );
+	Com_sprintf( line, sizeof(line), "Interp Mode   : fI=%.3f  %s\n",
+		cl.frameInterpolation,
+		( cl.frameInterpolation > 1.0f ) ? "EXTRAPOLATING" : "INTERPOLATING" );
+	SCR_WriteLog( line );
 	Com_sprintf( line, sizeof(line), "Server Time   : %d  (delta %d ms)\n",             cl.snap.serverTime, cl.serverTimeDelta );SCR_WriteLog( line );
 	Com_sprintf( line, sizeof(line), "Snap Seq      : #%d  (delta from #%d, gap %d)\n", cl.snap.messageNum, cl.snap.deltaNum, cl.snap.messageNum - cl.snap.deltaNum ); SCR_WriteLog( line );
 	Com_sprintf( line, sizeof(line), "Drop Rate     : %d pkt/s\n",                      netMonDropRate );                        SCR_WriteLog( line );
@@ -818,7 +821,6 @@ static void SCR_DrawNetMonitor( void ) {
 	float        scale, charW, charH, pad;
 	float        bw, bh, bx, by, tx, ty;
 	int          snapHz;
-	qboolean     isExtrapolating;
 
 	if ( cls.state != CA_ACTIVE )
 		return;
@@ -840,11 +842,12 @@ static void SCR_DrawNetMonitor( void ) {
 			Com_RealTime( &t );
 			snapHz = ( cl.snapshotMsec > 0 ) ? ( 1000 / cl.snapshotMsec ) : 0;
 			Com_sprintf( logline, sizeof(logline),
-				"[%02d:%02d:%02d] STATS  snap=%dHz  ping=%dms  mode=%s"
+				"[%02d:%02d:%02d] STATS  snap=%dHz  ping=%dms  fI=%.3f(%s)"
 				"  dT=%dms  drop=%d/s  in=%dB/s  out=%dB/s\n",
 				t.tm_hour, t.tm_min, t.tm_sec,
 				snapHz, cl.snap.ping,
-				(cl.serverTime >= cl.snap.serverTime) ? "EXTRAP" : "INTERP",
+				cl.frameInterpolation,
+				( cl.frameInterpolation > 1.0f ) ? "EXTRAP" : "INTERP",
 				cl.serverTimeDelta, netMonDropRate,
 				netMonInRate, netMonOutRate );
 			SCR_WriteLog( logline );
@@ -877,8 +880,7 @@ static void SCR_DrawNetMonitor( void ) {
 	tx = bx + pad;
 	ty = by + pad;
 
-	snapHz          = ( cl.snapshotMsec > 0 ) ? ( 1000 / cl.snapshotMsec ) : 0;
-	isExtrapolating = ( cl.serverTime >= cl.snap.serverTime );
+	snapHz = ( cl.snapshotMsec > 0 ) ? ( 1000 / cl.snapshotMsec ) : 0;
 
 	/* row 1 – title */
 	NM_DrawRow( &tx, &ty, bx + pad, charW, charH, colorWhite,
@@ -894,9 +896,11 @@ static void SCR_DrawNetMonitor( void ) {
 	Com_sprintf( line, sizeof(line), "Ping: %dms", cl.snap.ping );
 	NM_DrawRow( &tx, &ty, bx + pad, charW, charH, col, line );
 
-	/* row 4 – interp / extrap mode */
-	col = isExtrapolating ? colorYellow : colorGreen;
-	Com_sprintf( line, sizeof(line), "Mode: %s", isExtrapolating ? "EXTRAP" : "INTERP" );
+	/* row 4 – estimated QVM frameInterpolation: [0,1] = interpolating, >1 = extrapolating */
+	col = ( cl.frameInterpolation > 1.0f ) ? colorYellow : colorGreen;
+	Com_sprintf( line, sizeof(line), "fI:   %.3f %s",
+		cl.frameInterpolation,
+		( cl.frameInterpolation > 1.0f ) ? "EXTRAP" : "INTERP" );
 	NM_DrawRow( &tx, &ty, bx + pad, charW, charH, col, line );
 
 	/* row 5 – server time delta */
