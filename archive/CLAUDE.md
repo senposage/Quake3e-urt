@@ -2,6 +2,25 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+---
+
+## Ground Rules for AI Agents
+
+These rules apply to every session, regardless of task scope.
+
+1. **Never close a session on your own initiative.** Completing a task does not mean
+   the session is over. Always ask the user — "Is there anything else you want to
+   work on?" — before treating the session as done.
+
+2. **Ask before wrapping up.** Even when a natural stopping point is reached (docs
+   written, fix committed, review clean), explicitly confirm with the user that they
+   have no further work before ending.
+
+3. **One task completing does not end the session.** The user may have follow-up
+   work, related fixes, or entirely new requests queued. Wait for them.
+
+---
+
 ## Build Commands
 
 ### Windows (MSVC)
@@ -259,3 +278,4 @@ See `docs/g-antiwarp-engine-feasibility.md` for the full analysis.
 - `docs/ghidra-cgame-patches.md` — QVM patch handoff.
 - `docs/debug-session-2026-02-26-cl_snapScaling-stutter.md` — cl_snapScaling investigation.
 - `docs/debug-session-2026-02-27-smoothing-jitter.md` — smoothing jitter investigation.
+- `docs/debug-session-2026-03-01-frameinterpolation-lagometer.md` — fI INTERP/EXTRAP oscillation seen in cg_lagometer top bar; diagnosed via cl_netgraph widget; fixed by serverTime cap.
