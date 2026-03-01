@@ -1075,12 +1075,14 @@ static void CL_AdjustTimeDelta( void ) {
 		if ( cl_showTimeDelta->integer ) {
 			Com_Printf( "<RESET> " );
 		}
+		SCR_LogTimingEvent( "RESET", cl.serverTimeDelta, deltaDelta );
 	} else if ( deltaDelta > fastAdjust ) {
 		// fast adjust, cut the difference in half
 		if ( cl_showTimeDelta->integer ) {
 			Com_Printf( "<FAST> " );
 		}
 		cl.serverTimeDelta = ( cl.serverTimeDelta + newDelta ) >> 1;
+		SCR_LogTimingEvent( "FAST ", cl.serverTimeDelta, deltaDelta );
 	} else {
 		// slow drift adjust, only move 1 or 2 msec
 
@@ -1268,25 +1270,36 @@ void CL_SetCGameTime( void ) {
 		if ( cl.serverTime - cl.oldServerTime < 0 ) {
 			cl.serverTime = cl.oldServerTime;
 		}
-		// cap serverTime to one snapshot interval ahead of the latest snap;
-		// without this, a realtime spike (e.g. alt-tab return) lets serverTime
-		// overshoot, causing cgame frameInterpolation > 1 and a visible snap-back
-		// once serverTimeDelta is next corrected — occurs at any sv_fps setting.
-		if ( cl.serverTime - (cl.snap.serverTime + cl.snapshotMsec) > 0 ) {
-			cl.serverTime = cl.snap.serverTime + cl.snapshotMsec;
+		// Cap serverTime one millisecond below the latest received snapshot.
+		// The QVM advances its snapshot window the moment cg.time reaches
+		// cg.nextSnap->serverTime (== cl.snap.serverTime).  With a cap at
+		// exactly cl.snap.serverTime, the cap itself triggers the transition:
+		// the QVM finds no snapshot beyond cl.snap yet, sets cg.nextSnap=NULL,
+		// and enters EXTRAP mode — producing the intermittent INTERP/EXTRAP
+		// flicker seen in cg_lagometer when network jitter or an sv_fps change
+		// briefly pushes serverTimeDelta above its equilibrium.  Capping one
+		// millisecond short keeps cg.time strictly less than cg.nextSnap->serverTime,
+		// so the QVM never triggers that transition prematurely.
+		// The -1ms penalty: fI at the cap is (snapshotMsec-1)/snapshotMsec
+		// (~0.94 at 60 Hz, ~0.98 at 20 Hz) — imperceptible vs. the visual
+		// artefact it eliminates.
+		if ( cl.serverTime >= cl.snap.serverTime ) {
+			cl.serverTime = cl.snap.serverTime - 1;
 		}
 		cl.oldServerTime = cl.serverTime;
 
 		// Compute estimated QVM frameInterpolation: mirrors the calculation the
 		// cgame QVM performs internally between its cg.snap (prev) and cg.nextSnap
-		// (cl.snap).  Result is in [0,1] while interpolating and > 1 while the
-		// engine is extrapolating past the latest received snapshot.
+		// (cl.snap).  cl.serverTime is capped at cl.snap.serverTime - 1, so this
+		// value is always in [0, ~0.94] at 60 Hz / [0, ~0.98] at 20 Hz.
 		// Used by the net monitor widget.
 		{
 			const clSnapshot_t *prevSnap = &cl.snapshots[ (cl.snap.messageNum - 1) & PACKET_MASK ];
 			int interval = cl.snap.serverTime - prevSnap->serverTime;
 			if ( prevSnap->valid && interval > 0 ) {
 				cl.frameInterpolation = (float)( cl.serverTime - prevSnap->serverTime ) / (float)interval;
+				if ( cl.frameInterpolation < 0.0f ) cl.frameInterpolation = 0.0f;
+				if ( cl.frameInterpolation > 1.0f ) cl.frameInterpolation = 1.0f;
 			} else {
 				cl.frameInterpolation = 0.0f;
 			}

@@ -635,7 +635,7 @@ CVars
   cl_netgraph      0 = off, 1 = show widget
   cl_netgraph_x/y  position in virtual 640x480 coords (default top-right)
   cl_netgraph_scale  text/box scale multiplier (default 1.0)
-  cl_netlog        0 = off, 1 = log console commands, 2 = also log periodic stats
+  cl_netlog        0 = off, 1 = log console cmds + FAST/RESET delta events, 2 = also log periodic stats
 
 Command
   netgraph_dump    write a full stats snapshot + all CS_SERVERINFO cvars to
@@ -704,6 +704,21 @@ void SCR_LogConsoleInput( const char *cmd ) {
 	SCR_WriteLog( line );
 }
 
+/* public – called by timing subsystem to record significant delta events */
+void SCR_LogTimingEvent( const char *tag, int serverTimeDelta, int deltaDelta ) {
+	qtime_t t;
+	char    line[128];
+
+	if ( !cl_netlog || !cl_netlog->integer )
+		return;
+
+	SCR_OpenNetLog();
+	Com_RealTime( &t );
+	Com_sprintf( line, sizeof(line), "[%02d:%02d:%02d] DELTA %s  dT=%dms  dd=%dms\n",
+		t.tm_hour, t.tm_min, t.tm_sec, tag, serverTimeDelta, deltaDelta );
+	SCR_WriteLog( line );
+}
+
 /* public – close log on engine shutdown / explicit request */
 void SCR_CloseNetLog( void ) {
 	if ( netLogFile ) {
@@ -746,9 +761,8 @@ static void SCR_NetgraphDump_f( void ) {
 	/* --- client timing & network stats --- */
 	Com_sprintf( line, sizeof(line), "Snapshot Rate : %d Hz  (%d ms interval EMA)\n",  snapHz, cl.snapshotMsec );               SCR_WriteLog( line );
 	Com_sprintf( line, sizeof(line), "Ping          : %d ms\n",                         cl.snap.ping );                          SCR_WriteLog( line );
-	Com_sprintf( line, sizeof(line), "Interp Mode   : fI=%.3f  %s\n",
-		cl.frameInterpolation,
-		( cl.frameInterpolation > 1.0f ) ? "EXTRAPOLATING" : "INTERPOLATING" );
+	Com_sprintf( line, sizeof(line), "Interp Mode   : fI=%.3f  INTERPOLATING\n",
+		cl.frameInterpolation );
 	SCR_WriteLog( line );
 	Com_sprintf( line, sizeof(line), "Server Time   : %d  (delta %d ms)\n",             cl.snap.serverTime, cl.serverTimeDelta );SCR_WriteLog( line );
 	Com_sprintf( line, sizeof(line), "Snap Seq      : #%d  (delta from #%d, gap %d)\n", cl.snap.messageNum, cl.snap.deltaNum, cl.snap.messageNum - cl.snap.deltaNum ); SCR_WriteLog( line );
@@ -842,12 +856,11 @@ static void SCR_DrawNetMonitor( void ) {
 			Com_RealTime( &t );
 			snapHz = ( cl.snapshotMsec > 0 ) ? ( 1000 / cl.snapshotMsec ) : 0;
 			Com_sprintf( logline, sizeof(logline),
-				"[%02d:%02d:%02d] STATS  snap=%dHz  ping=%dms  fI=%.3f(%s)"
+				"[%02d:%02d:%02d] STATS  snap=%dHz  ping=%dms  fI=%.3f(INTERP)"
 				"  dT=%dms  drop=%d/s  in=%dB/s  out=%dB/s\n",
 				t.tm_hour, t.tm_min, t.tm_sec,
 				snapHz, cl.snap.ping,
 				cl.frameInterpolation,
-				( cl.frameInterpolation > 1.0f ) ? "EXTRAP" : "INTERP",
 				cl.serverTimeDelta, netMonDropRate,
 				netMonInRate, netMonOutRate );
 			SCR_WriteLog( logline );
@@ -896,12 +909,15 @@ static void SCR_DrawNetMonitor( void ) {
 	Com_sprintf( line, sizeof(line), "Ping: %dms", cl.snap.ping );
 	NM_DrawRow( &tx, &ty, bx + pad, charW, charH, col, line );
 
-	/* row 4 – estimated QVM frameInterpolation: [0,1] = interpolating, >1 = extrapolating */
-	col = ( cl.frameInterpolation > 1.0f ) ? colorYellow : colorGreen;
-	Com_sprintf( line, sizeof(line), "fI:   %.3f %s",
-		cl.frameInterpolation,
-		( cl.frameInterpolation > 1.0f ) ? "EXTRAP" : "INTERP" );
-	NM_DrawRow( &tx, &ty, bx + pad, charW, charH, col, line );
+	/* row 4 – smoothed fI: EMA (alpha=0.2) reduces per-frame flicker at high
+	 * snap rates where the raw value cycles 0→1 faster than the eye can read */
+	{
+		static float smoothFI = 0.0f;
+		smoothFI = smoothFI * 0.8f + cl.frameInterpolation * 0.2f;
+		col = colorGreen;
+		Com_sprintf( line, sizeof(line), "fI:   %.2f INTERP", smoothFI );
+		NM_DrawRow( &tx, &ty, bx + pad, charW, charH, col, line );
+	}
 
 	/* row 5 – server time delta */
 	Com_sprintf( line, sizeof(line), "dT:   %+dms", cl.serverTimeDelta );
@@ -979,8 +995,8 @@ void SCR_Init( void ) {
     Cvar_SetDescription( cl_netlog,
         "Net debug session logging.\n"
         "0 = off\n"
-        "1 = log timestamped console commands\n"
-        "2 = log commands + periodic per-second stats\n"
+        "1 = log timestamped console commands + FAST/RESET time-delta events\n"
+        "2 = log commands + delta events + periodic per-second stats\n"
         "Log file written to netdebug_<date>_<time>.log in the game folder.\n"
         "Default: 0" );
 

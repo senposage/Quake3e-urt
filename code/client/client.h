@@ -123,7 +123,7 @@ typedef struct {
 	qboolean	newSnapshots;		// set on parse of any valid packet
 
 	int			snapshotMsec;		// measured interval between snapshots (exponential moving average)
-	float		frameInterpolation;	// estimated QVM fI: (serverTime - prevSnap) / (snap - prevSnap), [0,1] = interpolating, >1 = extrapolating
+	float		frameInterpolation;	// estimated QVM fI: (serverTime - prevSnap) / (snap - prevSnap), clamped to [0,1] by serverTime cap
 
 	gameState_t	gameState;			// configstrings
 	char		mapname[MAX_QPATH];	// extracted from CS_SERVERINFO
@@ -627,6 +627,7 @@ void	SCR_DrawSmallString( int x, int y, const char *s, int len );
 void	SCR_NetMonitorAddIncoming( int bytes, int drops );
 void	SCR_NetMonitorAddOutgoing( int bytes );
 void	SCR_LogConsoleInput( const char *cmd );
+void	SCR_LogTimingEvent( const char *tag, int serverTimeDelta, int deltaDelta );
 void	SCR_CloseNetLog( void );
 
 //
