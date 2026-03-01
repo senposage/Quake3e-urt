@@ -1257,9 +1257,12 @@ static void SV_BuildCommonSnapshot( void )
 					vec3_t origin, velocity;
 
 					// --- Phase 1: Resolve position source ---
-					// sv_bufferMs applies to both TR_INTERPOLATE and TR_LINEAR modes.
-					// Bots and real players both use the ring buffer when available.
-					if ( bufMs > 0 ) {
+					// sv_bufferMs applies to real players only. Bots are excluded:
+					// their ring-buffer entries are extrapolated from trBase+trDelta and
+					// reset at every game-frame boundary, creating discontinuities that
+					// cause visible warping when a delayed lookup straddles that boundary.
+					// Bots fall through to the velocity-extrapolation path below instead.
+					if ( bufMs > 0 && !isBot ) {
 						vec3_t delayedOrigin, delayedVelocity;
 						if ( SV_SmoothGetPosition( es->number, sv.time - bufMs, delayedOrigin, delayedVelocity ) ) {
 							VectorCopy( delayedOrigin, origin );
@@ -1325,11 +1328,15 @@ static void SV_BuildCommonSnapshot( void )
 							es->pos.trBase[1] += es->pos.trDelta[1] * dt;
 							es->pos.trBase[2] += es->pos.trDelta[2] * dt;
 						} else {
-							// Real player without buffer: use current position with dead-zone check.
-							if ( DotProduct( velocity, velocity ) > 100.0f ) {
-								VectorCopy( origin, es->pos.trBase );
-								VectorCopy( velocity, es->pos.trDelta );
-							}
+							// Real player without buffer: always use ps->origin.
+							// No dead-zone needed — TR_INTERPOLATE never switches
+							// trajectory type, so idle micro-oscillations are
+							// imperceptible after cgame lerp. The old dead-zone
+							// caused a position pop at direction changes: velocity
+							// briefly drops below 10 ups and the entity kept the
+							// stale QVM position (up to 50ms old at sv_gameHz 20).
+							VectorCopy( origin, es->pos.trBase );
+							VectorCopy( velocity, es->pos.trDelta );
 						}
 					}
 				}
