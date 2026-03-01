@@ -534,18 +534,6 @@ static qboolean CL_GetValue( char* value, int valueSize, const char* key ) {
 		return qtrue;
 	}
 
-	// Subtick diagnostics: expose snapshot interval and estimated QVM
-	// frameInterpolation so cgame modules can read them at runtime.
-	if ( !Q_stricmp( key, "cl_snapshotMsec" ) ) {
-		Com_sprintf( value, valueSize, "%i", cl.snapshotMsec );
-		return qtrue;
-	}
-
-	if ( !Q_stricmp( key, "cl_frameInterpolation" ) ) {
-		Com_sprintf( value, valueSize, "%f", cl.frameInterpolation );
-		return qtrue;
-	}
-
 	return qfalse;
 }
 
@@ -1293,7 +1281,7 @@ void CL_SetCGameTime( void ) {
 		// cgame QVM performs internally between its cg.snap (prev) and cg.nextSnap
 		// (cl.snap).  Result is in [0,1] while interpolating and > 1 while the
 		// engine is extrapolating past the latest received snapshot.
-		// Used by the net monitor widget and exposed via CG_TRAP_GETVALUE.
+		// Used by the net monitor widget.
 		{
 			const clSnapshot_t *prevSnap = &cl.snapshots[ (cl.snap.messageNum - 1) & PACKET_MASK ];
 			int interval = cl.snap.serverTime - prevSnap->serverTime;
