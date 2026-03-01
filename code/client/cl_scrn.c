@@ -37,6 +37,7 @@ cvar_t		*cl_netgraph_x;
 cvar_t		*cl_netgraph_y;
 cvar_t		*cl_netgraph_scale;
 cvar_t		*cl_netlog;
+cvar_t		*cl_snapshotEMA;
 
 // Net monitor rate tracking (updated per second)
 static int	netMonInBytes;
@@ -1193,6 +1194,13 @@ void SCR_Init( void ) {
         "                slow=slow-path ms-commits (0 at 60Hz equilibrium = fix working;\n"
         "                     non-zero = genuine drift or oscillation regression)\n"
         "Log file written to netdebug_<date>_<time>.log in the game folder.\n"
+        "Default: 0" );
+
+    cl_snapshotEMA = Cvar_Get( "cl_snapshotEMA", "0", 0 );
+    Cvar_SetDescription( cl_snapshotEMA,
+        "Use an exponential moving average to smooth the measured snapshot interval.\n"
+        "0 = off (use raw measured interval each snap)\n"
+        "1 = on  (alpha=0.25 EMA over last ~4 snaps)\n"
         "Default: 0" );
 
     Cmd_AddCommand( "netgraph_dump", SCR_NetgraphDump_f );

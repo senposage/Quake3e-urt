@@ -29,7 +29,7 @@ not on every isolated boundary crossing.  See below for root-cause details.
 
 | Idea | Decision |
 |------|----------|
-| Expose `snapshotMsec` EMA + jitter tolerance as cvars | **Rejected — feature creep.** The EMA is working correctly. Turning it into a cvar adds code complexity without advancing diagnosis. Existing `cl_netlog 2` STATS already expose everything needed. |
+| ~~Expose `snapshotMsec` EMA as a cvar~~ | **Done** — `cl_snapshotEMA` added, default `0` (off). EMA is now opt-in for comparison testing. |
 
 ---
 
