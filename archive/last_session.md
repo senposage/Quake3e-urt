@@ -25,6 +25,14 @@ not on every isolated boundary crossing.  See below for root-cause details.
 
 ---
 
+## Rejected / Deferred Ideas
+
+| Idea | Decision |
+|------|----------|
+| Expose `snapshotMsec` EMA + jitter tolerance as cvars | **Rejected — feature creep.** The EMA is working correctly. Turning it into a cvar adds code complexity without advancing diagnosis. Existing `cl_netlog 2` STATS already expose everything needed. |
+
+---
+
 ## This Session — Key Findings
 
 ### Test environment (always)
