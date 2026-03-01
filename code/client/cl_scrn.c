@@ -47,6 +47,12 @@ static int	netMonDropsWindow;
 static int	netMonDropRate;
 static int	netMonLastUpdate;
 
+// Frame-time and snap-jitter tracking (reset each second)
+static int	netMonFtSum;
+static int	netMonFtCount;
+static int	netMonFtMax;
+static int	netMonSnapGapMax;
+
 // Session log file (opened lazily when cl_netlog > 0)
 static fileHandle_t	netLogFile;
 
@@ -655,6 +661,20 @@ void SCR_NetMonitorAddOutgoing( int bytes ) {
 	netMonOutBytes += bytes;
 }
 
+void SCR_NetMonitorAddFrametime( int ft ) {
+	netMonFtSum   += ft;
+	netMonFtCount += 1;
+	if ( ft > netMonFtMax )
+		netMonFtMax = ft;
+}
+
+void SCR_NetMonitorAddSnapInterval( int measured, int expected ) {
+	int gap = measured - expected;
+	if ( gap < 0 ) gap = -gap;
+	if ( gap > netMonSnapGapMax )
+		netMonSnapGapMax = gap;
+}
+
 /* ----- session log helpers ----- */
 
 static void SCR_OpenNetLog( void ) {
@@ -841,6 +861,10 @@ static void SCR_DrawNetMonitor( void ) {
 
 	/* ---- update 1-second rate window ---- */
 	if ( netMonLastUpdate == 0 || cls.realtime - netMonLastUpdate >= 1000 ) {
+		int ftAvg = ( netMonFtCount > 0 ) ? ( netMonFtSum / netMonFtCount ) : 0;
+		int ftMax = netMonFtMax;
+		int snapGapMax = netMonSnapGapMax;
+
 		netMonInRate      = netMonInBytes;
 		netMonOutRate     = netMonOutBytes;
 		netMonDropRate    = netMonDropsWindow;
@@ -848,21 +872,27 @@ static void SCR_DrawNetMonitor( void ) {
 		netMonOutBytes    = 0;
 		netMonDropsWindow = 0;
 		netMonLastUpdate  = cls.realtime;
+		netMonFtSum       = 0;
+		netMonFtCount     = 0;
+		netMonFtMax       = 0;
+		netMonSnapGapMax  = 0;
 
 		/* optional periodic stats line in the log */
 		if ( cl_netlog->integer >= 2 && netLogFile ) {
 			qtime_t t;
-			char    logline[192];
+			char    logline[256];
 			Com_RealTime( &t );
 			snapHz = ( cl.snapshotMsec > 0 ) ? ( 1000 / cl.snapshotMsec ) : 0;
 			Com_sprintf( logline, sizeof(logline),
 				"[%02d:%02d:%02d] STATS  snap=%dHz  ping=%dms  fI=%.3f(INTERP)"
-				"  dT=%dms  drop=%d/s  in=%dB/s  out=%dB/s\n",
+				"  dT=%dms  drop=%d/s  in=%dB/s  out=%dB/s"
+				"  ft=%d/%dms  snapgap=%dms\n",
 				t.tm_hour, t.tm_min, t.tm_sec,
 				snapHz, cl.snap.ping,
 				cl.frameInterpolation,
 				cl.serverTimeDelta, netMonDropRate,
-				netMonInRate, netMonOutRate );
+				netMonInRate, netMonOutRate,
+				ftAvg, ftMax, snapGapMax );
 			SCR_WriteLog( logline );
 		}
 	}
@@ -997,6 +1027,8 @@ void SCR_Init( void ) {
         "0 = off\n"
         "1 = log timestamped console commands + FAST/RESET time-delta events\n"
         "2 = log commands + delta events + periodic per-second stats\n"
+        "  STATS fields: snap Hz, ping, fI, dT, drop, in/out rates,\n"
+        "                ft=avg/max client frame-time, snapgap=max snap-interval jitter\n"
         "Log file written to netdebug_<date>_<time>.log in the game folder.\n"
         "Default: 0" );
 

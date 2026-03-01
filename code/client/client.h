@@ -626,6 +626,8 @@ void	SCR_DrawSmallString( int x, int y, const char *s, int len );
 // Net monitor
 void	SCR_NetMonitorAddIncoming( int bytes, int drops );
 void	SCR_NetMonitorAddOutgoing( int bytes );
+void	SCR_NetMonitorAddFrametime( int ft );
+void	SCR_NetMonitorAddSnapInterval( int measured, int expected );
 void	SCR_LogConsoleInput( const char *cmd );
 void	SCR_LogTimingEvent( const char *tag, int serverTimeDelta, int deltaDelta );
 void	SCR_CloseNetLog( void );

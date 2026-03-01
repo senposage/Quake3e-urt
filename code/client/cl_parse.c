@@ -494,6 +494,8 @@ static void CL_ParseSnapshot( msg_t *msg, qboolean multiview ) {
 			if ( cl.snapshotMsec < 8 ) cl.snapshotMsec = 8;
 			if ( cl.snapshotMsec > 100 ) cl.snapshotMsec = 100;
 		}
+		if ( cl.snapshotMsec > 0 )
+			SCR_NetMonitorAddSnapInterval( measured, cl.snapshotMsec );
 	}
 	if ( cl.snapshotMsec == 0 ) {
 		cl.snapshotMsec = 50; // default to 20Hz until first measurement

@@ -3338,6 +3338,8 @@ void CL_Frame( int msec, int realMsec ) {
 	cls.frametime = msec;
 	cls.realtime += msec;
 
+	SCR_NetMonitorAddFrametime( msec );
+
 	if ( cl_timegraph->integer ) {
 		SCR_DebugGraph( msec * 0.25f );
 	}
