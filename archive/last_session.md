@@ -39,33 +39,47 @@ Key observations:
 
 ---
 
-## New Diagnostic Fields Added This Session
+## Diagnostic Fields in the Log
 
-`cl_netlog 2` STATS lines now include two new fields at the end:
+### Per-second STATS line (`cl_netlog 2`)
 
 ```
-[HH:MM:SS] STATS  snap=62Hz  ping=40ms  fI=0.625(INTERP)  dT=-21189ms
-           drop=0/s  in=4677B/s  out=4163B/s  ft=16/23ms  snapgap=2ms
+[HH:MM:SS] STATS  snap=62Hz  ping=40ms  fI=0.625(INTERP)  dT=-21189..-21188ms
+           drop=0/s  in=4677B/s  out=4163B/s  ft=16/23ms  snapgap=2ms  caps=1  extrap=3
 ```
 
 | Field | Meaning | What a bad value tells us |
 |-------|---------|--------------------------|
-| `ft=avg/max` | Client frame time: average / peak this second (ms) | `max` spike > 2× `avg` → OS jitter pushed `cl.serverTime` past a snap boundary → causes top-line chop |
-| `snapgap=Xms` | Peak deviation of measured snap interval from `snapshotMsec` (ms) | Large value → snaps arriving late or bunched → chop is network-side |
+| `dT=min..max` | serverTimeDelta range over the second | Wide range → brief dT spike invisible in old point-in-time sample |
+| `ft=avg/max` | Client frame time average / peak (ms) | `max` spike → OS jitter pushed `cl.serverTime` past a snap boundary |
+| `snapgap=Xms` | Peak snap arrival interval deviation | Large → snaps arrived late or bunched → network-side cause |
+| `caps=N` | Times the `-1ms` serverTime cap fired | Nonzero + `ftmax` spike = client frame caused the boundary hit |
+| `extrap=N` | Frames where `extrapolatedSnapshot` set | Expected nonzero (normal drift control); zero = very healthy |
 
-**Files changed:** `cl_scrn.c`, `cl_parse.c`, `cl_main.c`, `client.h`
+### Event lines (`cl_netlog 1`)
+
+```
+[01:13:55] SNAP LATE  +12ms  (expected 16ms  got 28ms)   ← network-side: snap half-interval late
+[01:14:32] DELTA FAST  dT=-21192ms  dd=8ms               ← existing
+[01:14:32] DELTA RESET  dT=-21200ms  dd=500ms             ← existing
+```
+
+`SNAP LATE` fires whenever a snap arrives more than half a snapshot-interval late. This is a direct timestamp for the network-side cause of top-line chop, without needing level-2 logging.
+
+**Files changed this session:** `cl_scrn.c`, `cl_cgame.c`, `cl_parse.c`, `client.h`
 
 ---
 
 ## What to Look for Next Time the Chop Occurs
 
-Enable `cl_netlog 2` before play.  When chop is seen, look at the STATS lines bracketing it:
+Enable `cl_netlog 2` before play.  When chop is seen, look at the log around that time:
 
-- **`ftmax` spike (e.g. `ft=16/45ms`)** → client frame hiccup is the cause.
-  Next step: investigate OS scheduler / vsync / frame-limiter.
-- **`snapgap` spike (e.g. `snapgap=18ms` at 62 Hz)** → a snap arrived a full interval late.
-  Next step: check network path jitter or server tick consistency.
-- **Neither spikes** → something else; add per-frame serverTimeDelta logging.
+| What you see | Cause | Next step |
+|---|---|---|
+| `SNAP LATE` event | Snap arrived late — network jitter | Check network path / server tick consistency |
+| `caps=N` (N>0) + `ft` max spike | Client frame too long — hit snap boundary | Investigate OS scheduler / vsync / frame limiter |
+| `caps=N` (N>0), no `ft` spike | dT drift alone hit the boundary | Check `dT` range — wider than ±1ms? |
+| None of the above | Something else | Next step: add per-frame serverTimeDelta logging |
 
 ---
 
@@ -74,8 +88,8 @@ Enable `cl_netlog 2` before play.  When chop is seen, look at the STATS lines br
 | Tool | How to activate | What it shows |
 |------|----------------|---------------|
 | `cl_netgraph 1` | in-game cvar | Live overlay: snap Hz, ping, smoothed fI, dT, drop, in/out, seq |
-| `cl_netlog 1` | in-game cvar | Continuous log: console cmds + FAST/RESET delta events |
-| `cl_netlog 2` | in-game cvar | Level 1 + per-second stats incl. `ft` and `snapgap` |
+| `cl_netlog 1` | in-game cvar | Continuous log: cmds + FAST/RESET delta events + **SNAP LATE events** |
+| `cl_netlog 2` | in-game cvar | Level 1 + per-second STATS with `dT range`, `ft`, `snapgap`, `caps`, `extrap` |
 | `netgraph_dump` | console command | Point-in-time: full timing state + all server cvars |
 
 Log location: **game folder** → `netdebug_YYYYMMDD_HHMMSS.log`

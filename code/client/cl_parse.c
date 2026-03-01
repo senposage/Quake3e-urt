@@ -494,8 +494,13 @@ static void CL_ParseSnapshot( msg_t *msg, qboolean multiview ) {
 			if ( cl.snapshotMsec < 8 ) cl.snapshotMsec = 8;
 			if ( cl.snapshotMsec > 100 ) cl.snapshotMsec = 100;
 		}
-		if ( cl.snapshotMsec > 0 )
+		if ( cl.snapshotMsec > 0 ) {
 			SCR_NetMonitorAddSnapInterval( measured, cl.snapshotMsec );
+			// Log a SNAP LATE event when a snap arrives more than 1.5× the expected interval.
+			// This is the network-side cause of a visible gap in the lagometer top bar.
+			if ( measured > cl.snapshotMsec + cl.snapshotMsec / 2 )
+				SCR_LogSnapLate( measured, cl.snapshotMsec );
+		}
 	}
 	if ( cl.snapshotMsec == 0 ) {
 		cl.snapshotMsec = 50; // default to 20Hz until first measurement

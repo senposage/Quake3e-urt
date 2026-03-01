@@ -53,6 +53,13 @@ static int	netMonFtCount;
 static int	netMonFtMax;
 static int	netMonSnapGapMax;
 
+// Cap-hit, extrap, and serverTimeDelta range tracking (reset each second)
+static int	netMonCapHits;
+static int	netMonExtrapCount;
+static int	netMonDtMin;
+static int	netMonDtMax;
+static qboolean	netMonDtValid;
+
 // Session log file (opened lazily when cl_netlog > 0)
 static fileHandle_t	netLogFile;
 
@@ -675,6 +682,25 @@ void SCR_NetMonitorAddSnapInterval( int measured, int expected ) {
 		netMonSnapGapMax = gap;
 }
 
+void SCR_NetMonitorAddCapHit( void ) {
+	netMonCapHits++;
+}
+
+void SCR_NetMonitorAddExtrap( void ) {
+	netMonExtrapCount++;
+}
+
+void SCR_NetMonitorAddTimeDelta( int dT ) {
+	if ( !netMonDtValid ) {
+		netMonDtMin   = dT;
+		netMonDtMax   = dT;
+		netMonDtValid = qtrue;
+	} else {
+		if ( dT < netMonDtMin ) netMonDtMin = dT;
+		if ( dT > netMonDtMax ) netMonDtMax = dT;
+	}
+}
+
 /* ----- session log helpers ----- */
 
 static void SCR_OpenNetLog( void ) {
@@ -736,6 +762,20 @@ void SCR_LogTimingEvent( const char *tag, int serverTimeDelta, int deltaDelta ) 
 	Com_RealTime( &t );
 	Com_sprintf( line, sizeof(line), "[%02d:%02d:%02d] DELTA %s  dT=%dms  dd=%dms\n",
 		t.tm_hour, t.tm_min, t.tm_sec, tag, serverTimeDelta, deltaDelta );
+	SCR_WriteLog( line );
+}
+
+void SCR_LogSnapLate( int measured, int expected ) {
+	qtime_t t;
+	char    line[128];
+
+	if ( !cl_netlog || !cl_netlog->integer )
+		return;
+
+	SCR_OpenNetLog();
+	Com_RealTime( &t );
+	Com_sprintf( line, sizeof(line), "[%02d:%02d:%02d] SNAP LATE  +%dms  (expected %dms  got %dms)\n",
+		t.tm_hour, t.tm_min, t.tm_sec, measured - expected, expected, measured );
 	SCR_WriteLog( line );
 }
 
@@ -861,9 +901,13 @@ static void SCR_DrawNetMonitor( void ) {
 
 	/* ---- update 1-second rate window ---- */
 	if ( netMonLastUpdate == 0 || cls.realtime - netMonLastUpdate >= 1000 ) {
-		int ftAvg = ( netMonFtCount > 0 ) ? ( netMonFtSum / netMonFtCount ) : 0;
-		int ftMax = netMonFtMax;
+		int ftAvg      = ( netMonFtCount > 0 ) ? ( netMonFtSum / netMonFtCount ) : 0;
+		int ftMax      = netMonFtMax;
 		int snapGapMax = netMonSnapGapMax;
+		int capHits    = netMonCapHits;
+		int extrapCnt  = netMonExtrapCount;
+		int dtMin      = netMonDtValid ? netMonDtMin : cl.serverTimeDelta;
+		int dtMax      = netMonDtValid ? netMonDtMax : cl.serverTimeDelta;
 
 		netMonInRate      = netMonInBytes;
 		netMonOutRate     = netMonOutBytes;
@@ -876,6 +920,9 @@ static void SCR_DrawNetMonitor( void ) {
 		netMonFtCount     = 0;
 		netMonFtMax       = 0;
 		netMonSnapGapMax  = 0;
+		netMonCapHits     = 0;
+		netMonExtrapCount = 0;
+		netMonDtValid     = qfalse;
 
 		/* optional periodic stats line in the log */
 		if ( cl_netlog->integer >= 2 && netLogFile ) {
@@ -885,14 +932,15 @@ static void SCR_DrawNetMonitor( void ) {
 			snapHz = ( cl.snapshotMsec > 0 ) ? ( 1000 / cl.snapshotMsec ) : 0;
 			Com_sprintf( logline, sizeof(logline),
 				"[%02d:%02d:%02d] STATS  snap=%dHz  ping=%dms  fI=%.3f(INTERP)"
-				"  dT=%dms  drop=%d/s  in=%dB/s  out=%dB/s"
-				"  ft=%d/%dms  snapgap=%dms\n",
+				"  dT=%d..%dms  drop=%d/s  in=%dB/s  out=%dB/s"
+				"  ft=%d/%dms  snapgap=%dms  caps=%d  extrap=%d\n",
 				t.tm_hour, t.tm_min, t.tm_sec,
 				snapHz, cl.snap.ping,
 				cl.frameInterpolation,
-				cl.serverTimeDelta, netMonDropRate,
+				dtMin, dtMax, netMonDropRate,
 				netMonInRate, netMonOutRate,
-				ftAvg, ftMax, snapGapMax );
+				ftAvg, ftMax, snapGapMax,
+				capHits, extrapCnt );
 			SCR_WriteLog( logline );
 		}
 	}
@@ -1025,10 +1073,11 @@ void SCR_Init( void ) {
     Cvar_SetDescription( cl_netlog,
         "Net debug session logging.\n"
         "0 = off\n"
-        "1 = log timestamped console commands + FAST/RESET time-delta events\n"
-        "2 = log commands + delta events + periodic per-second stats\n"
-        "  STATS fields: snap Hz, ping, fI, dT, drop, in/out rates,\n"
-        "                ft=avg/max client frame-time, snapgap=max snap-interval jitter\n"
+        "1 = log timestamped console commands + FAST/RESET delta events + SNAP LATE events\n"
+        "2 = log level 1 events + periodic per-second stats\n"
+        "  STATS fields: snap Hz, ping, fI, dT=min..max, drop, in/out rates,\n"
+        "                ft=avg/max client frame-time, snapgap=max snap-interval jitter,\n"
+        "                caps=serverTime cap fires, extrap=extrapolated-frame count\n"
         "Log file written to netdebug_<date>_<time>.log in the game folder.\n"
         "Default: 0" );
 

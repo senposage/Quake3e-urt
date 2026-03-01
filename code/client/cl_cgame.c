@@ -1285,6 +1285,7 @@ void CL_SetCGameTime( void ) {
 		// artefact it eliminates.
 		if ( cl.serverTime >= cl.snap.serverTime ) {
 			cl.serverTime = cl.snap.serverTime - 1;
+			SCR_NetMonitorAddCapHit();
 		}
 		cl.oldServerTime = cl.serverTime;
 
@@ -1305,6 +1306,8 @@ void CL_SetCGameTime( void ) {
 			}
 		}
 
+		SCR_NetMonitorAddTimeDelta( cl.serverTimeDelta );
+
 		// note if we are almost past the latest frame (without timeNudge),
 		// so we will try and adjust back a bit when the next snapshot arrives.
 		// Scale the detection window with the measured snapshot interval:
@@ -1318,6 +1321,7 @@ void CL_SetCGameTime( void ) {
 			if ( extrapolateThresh > 16 ) extrapolateThresh = 16;
 			if ( cls.realtime + cl.serverTimeDelta - cl.snap.serverTime >= -extrapolateThresh ) {
 				cl.extrapolatedSnapshot = qtrue;
+				SCR_NetMonitorAddExtrap();
 			}
 		}
 	}
