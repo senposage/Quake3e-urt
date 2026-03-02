@@ -1123,14 +1123,31 @@ static void CL_AdjustTimeDelta( void ) {
 				slowFrac += 2; // +½ ms per snap (half the old +1 ms step)
 			}
 			// Commit a whole-ms adjustment once the accumulator reaches ±1 ms.
+			// Mode 2 (proportional): when deltaDelta > snapshotMsec, scale
+			// the commit to 25% of remaining error for faster convergence on
+			// mid-range disturbances (5–50ms).  Trades jitter resistance for
+			// recovery speed — best on stable wired connections.
+			// At equilibrium slowFrac never reaches ±4, so this never activates.
 			if ( slowFrac >= 4 ) {
-				cl.serverTimeDelta++;
+				int step = 1;
+				if ( cl_adaptiveTiming->integer >= 2 && deltaDelta > cl.snapshotMsec ) {
+					step = deltaDelta / 4;
+					if ( step < 1 ) step = 1;
+					if ( step > deltaDelta / 2 ) step = deltaDelta / 2;
+				}
+				cl.serverTimeDelta += step;
 				slowFrac -= 4;
-				SCR_NetMonitorAddSlowAdjust( +1 );
+				SCR_NetMonitorAddSlowAdjust( +step );
 			} else if ( slowFrac <= -4 ) {
-				cl.serverTimeDelta--;
+				int step = 1;
+				if ( cl_adaptiveTiming->integer >= 2 && deltaDelta > cl.snapshotMsec ) {
+					step = deltaDelta / 4;
+					if ( step < 1 ) step = 1;
+					if ( step > deltaDelta / 2 ) step = deltaDelta / 2;
+				}
+				cl.serverTimeDelta -= step;
 				slowFrac += 4;
-				SCR_NetMonitorAddSlowAdjust( -1 );
+				SCR_NetMonitorAddSlowAdjust( -step );
 			}
 		}
 	}

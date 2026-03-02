@@ -1100,7 +1100,7 @@ static void SCR_NetMonUpdate( void ) {
 		/* ---- laggot announce: scan 30s ring buffer for worst values ---- */
 		if ( cl_netgraph->integer && cl_laggotannounce->integer && cls.realtime - laggotLastAnnounce >= 30000 ) {
 			int  sHz = ( cl.snapshotMsec > 0 ) ? ( 1000 / cl.snapshotMsec ) : 60;
-			int  extrapThresh = sHz * 2 / 3;
+			int  extrapThresh = sHz * 3 / 4;
 			int  worstDrop = 0, worstFast = 0, worstSnapGapAvg = 0, worstSnapGapMax = 0;
 			int  worstExtrap = 0, worstFtAvg = 0, worstChoke = 0;
 			int  i, count;
@@ -1234,14 +1234,16 @@ static void SCR_DrawNetMonitor( void ) {
 	NM_DrawRow( &tx, &ty, bx + pad, charW, charH, colorWhite, line );
 
 	/* row 6 – drops + extrapolations + caps (merged).
-	 * E ~50% of snap rate is the normal equilibrium of the fractional time
-	 * sync accumulator — only flag red when it's significantly worse. */
+	 * The slow-drift accumulator's equilibrium extrap rate is ~50% at high
+	 * snap rates (snapshotMsec < 30) and ~33% at low rates.  Thresholds
+	 * must sit above equilibrium so normal operation stays green. */
 	{
 		int snapHz = ( cl.snapshotMsec > 0 ) ? ( 1000 / cl.snapshotMsec ) : 60;
-		int extrapNormal = snapHz * 2 / 3; // ~67% of snap rate = trouble threshold
+		int extrapYellow = snapHz * 3 / 5; // 60% — above 50% equilibrium
+		int extrapRed    = snapHz * 3 / 4; // 75% — genuine trouble
 		col = ( netMonDropRate > 0 ) ? colorRed :
-		      ( netMonDispExtrapCnt > extrapNormal ) ? colorRed :
-		      ( netMonDispExtrapCnt > snapHz / 2 ) ? colorYellow : colorGreen;
+		      ( netMonDispExtrapCnt > extrapRed ) ? colorRed :
+		      ( netMonDispExtrapCnt > extrapYellow ) ? colorYellow : colorGreen;
 	}
 	Com_sprintf( line, sizeof(line), "Drop:%d Ext:%d Clp:%d",
 		netMonDropRate, netMonDispExtrapCnt, netMonDispCapHits );
@@ -1340,7 +1342,7 @@ void SCR_Init( void ) {
         "  DeltaT: <+/-ms>      Server time delta\n"
         "  Drop:<n> Ext:<n> Clp:<n>\n"
         "    Drop = dropped snapshots (Red if > 0)\n"
-        "    Ext  = extrapolated frames (Red > 67%%, Yellow > 50%%)\n"
+        "    Ext  = extrapolated frames (Red > 75%%, Yellow > 60%%)\n"
         "    Clp  = serverTime clamped (cosmetic, no alarm)\n"
         "  I:<KB/s> O:<KB/s>    Bandwidth in/out\n"
         "  SnapJitt:<avg>/<max>ms\n"
@@ -1382,15 +1384,19 @@ void SCR_Init( void ) {
 
     cl_adaptiveTiming = Cvar_Get( "cl_adaptiveTiming", "1", 0 );
     Cvar_SetDescription( cl_adaptiveTiming,
-        "Enable the adaptive timing system that scales timing thresholds to the\n"
-        "measured server snapshot interval (improves accuracy at 60Hz+ sv_fps).\n"
-        "0 = off: vanilla Q3e behaviour — hardcoded resetTime=500, fastAdjust=100,\n"
-        "         extrapolateThresh=5ms, download throttle=50ms.\n"
-        "         The fractional slowFrac accumulator is still active (no ±1ms\n"
-        "         oscillation) but thresholds are not scaled to snapshotMsec.\n"
-        "1 = on:  all snapshotMsec-scaled thresholds, serverTime cap,\n"
+        "Adaptive timing system for high-rate servers (60Hz+ sv_fps).\n"
+        "0 = off: vanilla Q3e behaviour — hardcoded thresholds.\n"
+        "         slowFrac accumulator still active (no ±1ms oscillation)\n"
+        "         but thresholds are not scaled to snapshotMsec.\n"
+        "1 = on:  snapshotMsec-scaled thresholds, serverTime cap,\n"
         "         adaptive extrapolateThresh, adaptive throttle.\n"
-        "Default: 0" );
+        "         Slow drift commits 1ms at a time (jitter-resistant).\n"
+        "2 = proportional: same as 1, but slow drift commits scale\n"
+        "         to 25%% of the error when deltaDelta > snapshotMsec.\n"
+        "         Faster recovery from mid-range disturbances (5-50ms)\n"
+        "         but amplifies random walk under sustained jitter.\n"
+        "         Best on stable wired connections.\n"
+        "Default: 1" );
 
     cl_laggotannounce = Cvar_Get( "cl_laggotannounce", "1", 0 );
     Cvar_SetDescription( cl_laggotannounce,
@@ -1402,7 +1408,7 @@ void SCR_Init( void ) {
         "  Drop > 0       Snapshot packet loss\n"
         "  FastRst > 0    Server time hitch\n"
         "  SnapJitt max > snap interval  Irregular delivery\n"
-        "  Ext > 67%% snapHz  Mostly extrapolating positions\n"
+        "  Ext > 75%% snapHz  Mostly extrapolating positions\n"
         "  LowFPS < half snap rate  Client too slow\n"
         "  Choke > 0      Server rate-limited this client\n"
         "\n"
