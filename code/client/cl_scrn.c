@@ -994,8 +994,8 @@ static void NM_DrawRow( float *tx, float *ty, float bx_pad,
 SCR_NetMonUpdate
 
 Runs every frame at CA_ACTIVE regardless of cl_netgraph.
-Aggregates 1-second stats, records into 30-second ring buffer,
-and fires laggot announce when issues are detected.
+Aggregates 1-second stats. Ring buffer recording and laggot
+announce are gated behind cl_netgraph 1.
 ==============
 */
 static void SCR_NetMonUpdate( void ) {
@@ -1061,8 +1061,8 @@ static void SCR_NetMonUpdate( void ) {
 		netMonFiSum          = 0.0f;
 		netMonFiCount        = 0;
 
-		/* record into 30-second ring buffer for laggot announce */
-		{
+		/* record into 30-second ring buffer for laggot announce (only when cl_netgraph is on) */
+		if ( cl_netgraph->integer ) {
 			laggotSample_t *s = &laggotHistory[ laggotHistoryIdx % LAGGOT_HISTORY ];
 			s->dropRate   = netMonDropRate;
 			s->fastCnt    = fastCnt;
@@ -1098,7 +1098,7 @@ static void SCR_NetMonUpdate( void ) {
 		}
 
 		/* ---- laggot announce: scan 30s ring buffer for worst values ---- */
-		if ( cl_laggotannounce->integer && cls.realtime - laggotLastAnnounce >= 30000 ) {
+		if ( cl_netgraph->integer && cl_laggotannounce->integer && cls.realtime - laggotLastAnnounce >= 30000 ) {
 			int  sHz = ( cl.snapshotMsec > 0 ) ? ( 1000 / cl.snapshotMsec ) : 60;
 			int  extrapThresh = sHz * 2 / 3;
 			int  worstDrop = 0, worstFast = 0, worstSnapGapAvg = 0, worstSnapGapMax = 0;
@@ -1275,9 +1275,9 @@ static void SCR_DrawNetMonitor( void ) {
 	 * combined with PING JITTER log events (alternating pattern) it signals oscillation.
 	 * fast = FAST-path fires (large snap-to-snap delta > 2×snapshotMsec). */
 	{
-		/* Scale slow threshold with snap rate: ~5% of snapHz is normal noise.
-		 * 20Hz→1, 40Hz→2, 62Hz→3, 90Hz→4, 125Hz→6 */
-		int slowThresh = snapHz / 20;
+		/* Scale slow threshold with snap rate: ~10% of snapHz is normal noise.
+		 * 20Hz→2, 40Hz→4, 62Hz→6, 90Hz→9, 125Hz→12 */
+		int slowThresh = snapHz / 10;
 		if ( slowThresh < 1 ) slowThresh = 1;
 		col = ( netMonFastCount > 0 ) ? colorRed :
 		      ( netMonSlowRate > slowThresh ) ? colorYellow : colorGreen;
@@ -1348,7 +1348,7 @@ void SCR_Init( void ) {
         "    Red if max > snap ms, Yellow if avg > half\n"
         "  Seq: #<n> d:<n>      Sequence and delta base\n"
         "  Adj: slo=<n> fst=<n>\n"
-        "    slo = drift corrections/s (Yellow > 3)\n"
+        "    slo = drift corrections/s (Yellow > ~10%% snapHz)\n"
         "    fst = fast resets (Red if > 0)" );
 
     cl_netgraph_x = Cvar_Get( "cl_netgraph_x", "460", 0 );
