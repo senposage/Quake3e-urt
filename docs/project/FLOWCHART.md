@@ -47,13 +47,17 @@
   |  |  |   sv.gameTimeResidual -= gameMsec                |  | |
   |  |  |   sv.gameTime += gameMsec                        |  | |
   |  |  |                                                  |  | |
-  |  |  |   [ENGINE ANTIWARP — sv_antiwarp 1 or 2]          |  | |
-  |  |  |   for each active non-bot client:                |  | |
-  |  |  |     if gap > tolerance:                          |  | |
-  |  |  |       serverTime += gameMsec                     |  | |
-  |  |  |       mode 2: decay inputs based on gap phase    |  | |
-  |  |  |         extrapolate → decay → friction           |  | |
-  |  |  |       VM_Call(GAME_CLIENT_THINK, i)              |  | |
+  |  |  |   [ENGINE ANTIWARP — sv_antiwarp 1 or 2]         |  | |
+  |  |  |   for each active non-bot client:               |  | |
+  |  |  |     awGap = sv.gameTime - awLastThinkTime       |  | |
+  |  |  |     if awGap > sv_antiwarpTol (auto=gameMsec):  |  | |
+  |  |  |       lastUsercmd.serverTime += gameMsec        |  | |
+  |  |  |       mode 2 phases:                            |  | |
+  |  |  |         gap <= tol+extra: keep inputs (extrap)  |  | |
+  |  |  |         gap <= tol+extra+decay: fade to zero    |  | |
+  |  |  |         gap > that: zero inputs (friction)      |  | |
+  |  |  |       VM_Call(GAME_CLIENT_THINK, i)             |  | |
+  |  |  |       awLastThinkTime = sv.gameTime             |  | |
   |  |  |                                                  |  | |
   |  |  |   SV_BotFrame( sv.gameTime )                     |  | |
   |  |  |   VM_Call( gvm, GAME_RUN_FRAME, sv.gameTime )    |  | |
@@ -74,33 +78,66 @@
   +=============================================================+
 ```
 
-## 2. Dual Clock System
+## 2. Clock System
 
 ```
-  sv_fps = 60 (input/snapshot rate)        sv_gameHz = 20 (QVM game rate)
-  +---------------------------------+      +-------------------------------+
-  |  sv.time                        |      |  sv.gameTime                  |
-  |  Advances every 16.6ms          |      |  Advances every 50ms          |
-  |  Drives:                        |      |  Drives:                      |
-  |    - Usercmd processing         |      |    - GAME_RUN_FRAME           |
-  |    - Antilag recording          |      |    - Bot AI (SV_BotFrame)     |
-  |    - Snapshot building          |      |    - level.time in QVM        |
-  |    - Smooth ring buffer         |      |    - Antiwarp logic           |
-  +---------------------------------+      +-------------------------------+
-          |                                         |
-          |     3 sv_fps ticks per gameHz tick       |
-          |  (at 60/20 ratio)                        |
-          |                                         |
-          v                                         v
+  === sv_gameHz 0 (default, recommended for UT 4.3.4) ===
+
+  sv_fps = 60 — single unified clock
+  +--------------------------------------------------+
+  |  sv.time == sv.gameTime  (always equal)           |
+  |  Both advance every 16.6ms (= 1000/sv_fps)       |
+  |                                                   |
+  |  Drives everything:                               |
+  |    - Usercmd processing                           |
+  |    - GAME_RUN_FRAME (every tick)                  |
+  |    - Bot AI (SV_BotFrame)                         |
+  |    - Antilag recording                            |
+  |    - Antiwarp injection (sv_antiwarp)             |
+  |    - Snapshot building + dispatch                 |
+  +--------------------------------------------------+
+
+  tick: |--16ms--|--16ms--|--16ms--|--16ms--|--16ms--|-->
+  game: |--16ms--|--16ms--|--16ms--|--16ms--|--16ms--|-->
+         ^ game frame fires every tick — positions always fresh
+         ^ sv_extrapolate/sv_bufferMs are no-ops
+         ^ sv_antiwarp uses gameMsec = 16ms steps
+
+  sv_fps can be raised freely (60, 80, 125, etc.) when:
+    - sv_antiwarp is on (1 or 2) — engine antiwarp is frame-rate aware, OR
+    - g_antiwarp is off — no QVM antiwarp constraint at all
+  QVM g_antiwarp is broken at sv_gameHz 0 (hardcoded 50ms steps) —
+  use sv_antiwarp 2 instead.
+
+  === sv_gameHz 20 (legacy — UT 4.0-4.2 or QVM g_antiwarp) ===
+
+  sv_fps = 60 (engine tick)          sv_gameHz = 20 (QVM game rate)
+  +-----------------------------+    +-------------------------------+
+  |  sv.time                    |    |  sv.gameTime                  |
+  |  Advances every 16.6ms     |    |  Advances every 50ms          |
+  |  Drives:                   |    |  Drives:                      |
+  |    - Usercmd processing    |    |    - GAME_RUN_FRAME           |
+  |    - Antilag recording     |    |    - Bot AI (SV_BotFrame)     |
+  |    - Snapshot building     |    |    - level.time in QVM        |
+  +-----------------------------+    +-------------------------------+
+
   tick: |--16ms--|--16ms--|--16ms--|--16ms--|--16ms--|--16ms--|-->
   game:                   |------50ms------|------50ms------|-->
+                           ^ 3 ticks between game frames
+                           ^ sv_extrapolate essential (fixes stale positions)
+                           ^ sv_bufferMs useful (smooths 20Hz gaps)
 
-  Why two clocks?
-  - All UT versions hardcode 50ms game frames (antiwarp injects +50ms cmds)
-  - Raising sv_gameHz above 20 breaks antiwarp on ANY version
-  - UT 4.0-4.2: game code broadly intolerant of non-20Hz — sv_gameHz 20 required
-  - UT 4.3+: rest of game tolerates higher rates — sv_gameHz 0 safe when g_antiwarp off
-  - sv_fps can be 60+ for smooth input/snapshots without breaking QVM
+  sv_fps can be raised freely here too — sv_gameHz 20 locks the GAME
+  frame rate, not the engine tick rate. sv_fps only affects input
+  sampling, antilag, and snapshot cadence. QVM g_antiwarp fires at
+  20Hz regardless of sv_fps, so the 50ms injection is always correct.
+
+  Why sv_gameHz 20 (legacy only):
+  - QVM g_antiwarp hardcodes serverTime += 50 (assumes 50ms game frames)
+  - UT 4.0-4.2: game code broadly intolerant of non-20Hz rates
+  - Use sv_antiwarp 1 or 2 instead to eliminate the sv_gameHz 20 constraint
+
+  See docs/project/SV_GAMEHZ.md for the full legacy reference.
 ```
 
 ## 3. Multi-Step Pmove (sv_client.c)
@@ -157,9 +194,10 @@
   For each client entity (player slot):
   |
   +-- Is it a BOT? --YES--> Use raw entity state from BG_PlayerStateToEntityState
-  |                         (only updates at sv_gameHz rate)
   |                         No prediction, no smoothing.
-  |                         cgame lerps between game-frame snapshots.
+  |                         At sv_gameHz 0: updates every tick (fine).
+  |                         At sv_gameHz 20: updates at 20Hz only —
+  |                           cgame lerps between game-frame snapshots.
   |
   +-- Is it a REAL PLAYER?
       |
@@ -169,9 +207,10 @@
         origin = ps->origin      (true post-Pmove position)
         velocity = ps->velocity  (current velocity)
       |
-      |  (This is the key fix: BG_PlayerStateToEntityState only runs
-      |   at sv_gameHz=20Hz, but ps->origin updates every usercmd.
-      |   Reading ps directly gives true 60Hz positions.)
+      |  At sv_gameHz 0: same value BG_PlayerStateToEntityState wrote
+      |    (harmless redundancy — positions already fresh every tick).
+      |  At sv_gameHz 20: this is the key fix — BG_PlayerStateToEntityState
+      |    only runs at 20Hz, but ps->origin updates every usercmd.
       |
       v
       +-- sv_bufferMs > 0?  (position delay mode)
@@ -476,11 +515,16 @@
        |                                                     |
        v                                                     v
   Build usercmd                                        GAME_RUN_FRAME
-  (cl_maxpackets rate)                                 (sv_gameHz rate)
-       |                                                     |
+  (cl_maxpackets rate)                                 (every sv_fps tick at
+       |                                                sv_gameHz 0)
        v                                                     |
   =============>  usercmd packet  =============>             |
                                                              v
+                                               sv_antiwarp: inject blank cmds
+                                               for lagging clients (mode 2:
+                                               extrapolate → decay → friction)
+                                                     |
+                                                     v
                                                SV_ClientThink()
                                                Multi-step Pmove
                                                (sv_pmoveMsec chunks)
@@ -496,8 +540,8 @@
                                                      v
                                                SV_BuildCommonSnapshot()
                                                - Read ps->origin (real pos)
-                                               - Apply smooth buffer
-                                               - Apply velocity prediction
+                                               - sv_smoothClients: TR_LINEAR
+                                               - sv_velSmooth: avg velocity
                                                - Bot: raw entity state
                                                      |
                                                      v
