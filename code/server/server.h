@@ -245,6 +245,8 @@ typedef struct client_s {
 
 	qboolean		justConnected;
 
+	int				awLastThinkTime;	// sv.gameTime of last real GAME_CLIENT_THINK (engine antiwarp)
+
 	char			tld[3]; // "XX\0"
 	const char		*country;
 
@@ -350,6 +352,9 @@ extern	cvar_t	*sv_extrapolate;
 extern	cvar_t	*sv_smoothClients;
 extern	cvar_t	*sv_bufferMs;
 extern	cvar_t	*sv_velSmooth;
+extern	cvar_t	*sv_antiwarp;
+extern	cvar_t	*sv_antiwarpTol;
+extern	cvar_t	*sv_antiwarpDecay;
 extern	cvar_t	*sv_timeout;
 extern	cvar_t	*sv_zombietime;
 extern	cvar_t	*sv_rconPassword;

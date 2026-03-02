@@ -36,6 +36,9 @@ cvar_t	*sv_extrapolate;			// engine-side position correction for high sv_fps sna
 cvar_t	*sv_smoothClients;			// TR_LINEAR trajectory trick for smoother client rendering
 cvar_t	*sv_bufferMs;				// per-client position ring buffer delay (ms)
 cvar_t	*sv_velSmooth;				// velocity smoothing window (ms) for TR_LINEAR mode
+cvar_t	*sv_antiwarp;				// engine-side antiwarp (replaces QVM g_antiwarp)
+cvar_t	*sv_antiwarpTol;			// antiwarp tolerance in ms (0=auto)
+cvar_t	*sv_antiwarpDecay;			// decay duration for mode 2 (ms)
 cvar_t	*sv_timeout;			// seconds without any message
 cvar_t	*sv_zombietime;			// seconds to sink messages after disconnect
 cvar_t	*sv_rconPassword;		// password for remote server commands
@@ -1348,6 +1351,21 @@ void SV_TrackCvarChanges( void )
 		Com_DPrintf( "sv_gameHz changed to %d — gameTimeResidual clamped\n", sv_gameHz->integer );
 	}
 
+	// When sv_antiwarp is enabled, force QVM g_antiwarp off to prevent double injection.
+	if ( sv_antiwarp->modified ) {
+		if ( sv_antiwarp->integer ) {
+			Cvar_Set( "g_antiwarp", "0" );
+			Com_Printf( "sv_antiwarp enabled — forcing g_antiwarp 0\n" );
+		}
+		sv_antiwarp->modified = qfalse;
+	}
+	if ( sv_antiwarpTol->modified ) {
+		sv_antiwarpTol->modified = qfalse;
+	}
+	if ( sv_antiwarpDecay->modified ) {
+		sv_antiwarpDecay->modified = qfalse;
+	}
+
 	// Flush the position ring buffer whenever any timing-affecting cvar changes.
 	// Old entries were recorded at a different tick rate or delay target and will
 	// produce wrong interpolated positions at the new settings.
@@ -1624,6 +1642,82 @@ void SV_Frame( int msec ) {
 			while ( sv.gameTimeResidual >= _gameMsec ) {
 				sv.gameTimeResidual -= _gameMsec;
 				sv.gameTime += _gameMsec;
+
+				// --- Engine-side antiwarp: inject blank commands for lagging clients ---
+				// Runs before GAME_RUN_FRAME so the QVM sees fresh ClientThink calls.
+				// Uses gameMsec (actual frame duration) instead of hardcoded 50ms,
+				// making it work at any sv_fps / sv_gameHz combination.
+				//
+				// Mode 1: constant — keep last inputs indefinitely (QVM-style).
+				// Mode 2: decay — extrapolate trajectory for tolerance window,
+				//   then linearly decay inputs to zero over sv_antiwarpDecay ms,
+				//   then coast to stop via Pmove friction.
+				if ( sv_antiwarp && sv_antiwarp->integer ) {
+					int awMode = sv_antiwarp->integer;
+					int awTol = ( sv_antiwarpTol && sv_antiwarpTol->integer > 0 )
+						? sv_antiwarpTol->integer : _gameMsec;
+					int awDecayMs = ( sv_antiwarpDecay && sv_antiwarpDecay->integer > 0 )
+						? sv_antiwarpDecay->integer : 0;
+					int awIdx;
+					client_t *awCl;
+
+					for ( awIdx = 0, awCl = svs.clients; awIdx < sv_maxclients->integer; awIdx++, awCl++ ) {
+						int awGap;
+
+						if ( awCl->state != CS_ACTIVE )
+							continue;
+						if ( awCl->netchan.remoteAddress.type == NA_BOT )
+							continue;
+						if ( awCl->awLastThinkTime == 0 )
+							continue; // never received a real command yet
+
+						awGap = sv.gameTime - awCl->awLastThinkTime;
+						if ( awGap > awTol ) {
+							// Advance serverTime by gameMsec for the blank command.
+							awCl->lastUsercmd.serverTime += _gameMsec;
+
+							// Mode 2: decay movement inputs based on gap duration.
+							// Phase 1 (gap <= 2*tolerance): full movement — extrapolate trajectory.
+							//   Handles brief jitter transparently.
+							// Phase 2 (2*tol < gap <= 2*tol + decayMs): linear decay to zero.
+							//   Player smoothly decelerates.
+							// Phase 3 (gap > 2*tol + decayMs): inputs zeroed, Pmove friction
+							//   coasts the player to a natural stop.
+							if ( awMode >= 2 ) {
+								int extraMs = awTol;  // extrapolation phase = one tolerance window
+								int decayStart = awTol + extraMs; // decay begins after 2x tolerance
+								int elapsed = awGap - decayStart;
+
+								if ( elapsed > 0 ) {
+									if ( awDecayMs > 0 && elapsed < awDecayMs ) {
+										// Linear decay: scale = 1.0 → 0.0 over decayMs
+										int scale = 127 - ( 127 * elapsed / awDecayMs );
+										if ( scale < 0 ) scale = 0;
+										awCl->lastUsercmd.forwardmove = (signed char)( (int)awCl->lastUsercmd.forwardmove * scale / 127 );
+										awCl->lastUsercmd.rightmove   = (signed char)( (int)awCl->lastUsercmd.rightmove   * scale / 127 );
+										awCl->lastUsercmd.upmove      = (signed char)( (int)awCl->lastUsercmd.upmove      * scale / 127 );
+									} else {
+										// Past decay window (or decayMs=0): zero inputs, friction only
+										awCl->lastUsercmd.forwardmove = 0;
+										awCl->lastUsercmd.rightmove   = 0;
+										awCl->lastUsercmd.upmove      = 0;
+									}
+								}
+								// else: still in extrapolation phase, keep original inputs
+							}
+
+							VM_Call( gvm, 1, GAME_CLIENT_THINK, awIdx );
+
+							// Update tracking — QVM's ClientThink sets lastCmdTime = level.time
+							// (still the old value before GAME_RUN_FRAME updates it).
+							awCl->awLastThinkTime = sv.gameTime;
+
+							if ( awCl->state != CS_ACTIVE )
+								continue; // client was kicked during think
+						}
+					}
+				}
+
 				// Bot AI ticks in lockstep with GAME_RUN_FRAME at sv_gameHz rate.
 				SV_BotFrame( sv.gameTime );
 				VM_Call( gvm, 1, GAME_RUN_FRAME, sv.gameTime );

@@ -2206,6 +2206,10 @@ Also called by bot code
 void SV_ClientThink (client_t *cl, usercmd_t *cmd) {
 	cl->lastUsercmd = *cmd;
 
+	// Track when this client last received a real command (engine antiwarp).
+	// Mirrors the QVM's lastCmdTime = level.time in ClientThink.
+	cl->awLastThinkTime = sv.gameTime;
+
 	if ( cl->state != CS_ACTIVE ) {
 		return;		// may have been kicked during the last usercmd
 	}

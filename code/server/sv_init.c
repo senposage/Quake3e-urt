@@ -890,7 +890,7 @@ void SV_Init( void )
     sv_fps = Cvar_Get ("sv_fps", "60", CVAR_TEMP | CVAR_PROTECTED | CVAR_SERVERINFO );
 
     sv_gameHz = Cvar_Get ("sv_gameHz", "0", CVAR_ARCHIVE | CVAR_SERVERINFO );
-    Cvar_SetDescription(sv_gameHz, "Rate at which level.time advances and GAME_RUN_FRAME fires (independent of sv_fps).\nNever set higher than sv_fps.\n>0: GAME_RUN_FRAME fires at sv_gameHz Hz; sv.gameTime lags sv.time between frames.\n    Bot positions only update at this rate — velocity extrapolation fills the gaps\n    but creates sawtooth artifacts at direction changes (inherent limitation).\n    20 matches UT4.3 antiwarp assumptions (may not be needed for 4.3.4).\n 0: disabled (falls back to sv_fps); GAME_RUN_FRAME fires every engine tick,\n    sv.gameTime == sv.time always, no extrapolation needed.\nDefault: 0");
+    Cvar_SetDescription(sv_gameHz, "Rate at which level.time advances and GAME_RUN_FRAME fires (independent of sv_fps).\nNever set higher than sv_fps.\n>0: GAME_RUN_FRAME fires at sv_gameHz Hz; sv.gameTime lags sv.time between frames.\n    Bot positions only update at this rate — velocity extrapolation fills the gaps\n    but creates sawtooth artifacts at direction changes (inherent limitation).\n    REQUIRED for UT 4.0-4.2: set to 20 (game code intolerant of non-20Hz rates).\n    Set to 20 with g_antiwarp on ANY version (hardcoded 50ms blank command injection).\n    UT 4.3+ tolerates sv_fps > 20 outside of antiwarp — sv_gameHz 0 is safe\n    when g_antiwarp is off.\n 0: disabled (falls back to sv_fps); GAME_RUN_FRAME fires every engine tick,\n    sv.gameTime == sv.time always, no extrapolation needed.\nDefault: 0");
 
     sv_snapshotFps = Cvar_Get ("sv_snapshotFps", "-1", CVAR_ARCHIVE | CVAR_SERVERINFO );
     Cvar_SetDescription(sv_snapshotFps, "Max snapshot send rate to clients.\n-1 = match sv_fps (default, live-tracks sv_fps changes).\n 0 = fall back to per-client 'snaps' userinfo (vanilla Q3 behavior).\n>0 = explicit rate, capped to sv_fps.\nDefault: -1");
@@ -933,6 +933,36 @@ void SV_Init( void )
         "Reduces sawtooth artifacts from rapid direction changes.\n"
         "0 = disabled (use raw velocity)\n"
         "Default: 32");
+
+    sv_antiwarp = Cvar_Get ("sv_antiwarp", "0", CVAR_ARCHIVE );
+    Cvar_SetDescription(sv_antiwarp, "Engine-side antiwarp replaces QVM g_antiwarp.\n"
+        "Injects blank commands for lagging clients before each GAME_RUN_FRAME.\n"
+        "Unlike QVM antiwarp (hardcoded 50ms step), uses actual game frame duration,\n"
+        "so it works at any sv_fps / sv_gameHz combination.\n"
+        "When enabled, forces g_antiwarp 0 to prevent double injection.\n"
+        "0 = disabled (use QVM g_antiwarp if needed)\n"
+        "1 = constant (keep last inputs indefinitely, QVM-style behavior)\n"
+        "2 = decay (extrapolate trajectory, then decay inputs to zero over\n"
+        "    sv_antiwarpDecay ms, then coast to stop via Pmove friction)\n"
+        "Default: 0");
+
+    sv_antiwarpTol = Cvar_Get ("sv_antiwarpTol", "0", CVAR_ARCHIVE );
+    Cvar_SetDescription(sv_antiwarpTol, "Engine antiwarp tolerance in milliseconds.\n"
+        "How long a client can go without sending a command before blank injection.\n"
+        "0 = auto (uses game frame duration: 1000/sv_gameHz or 1000/sv_fps)\n"
+        ">0 = explicit threshold in ms\n"
+        "Requires sv_antiwarp >= 1.\n"
+        "Default: 0 (auto)");
+
+    sv_antiwarpDecay = Cvar_Get ("sv_antiwarpDecay", "150", CVAR_ARCHIVE );
+    Cvar_SetDescription(sv_antiwarpDecay, "Movement decay duration for sv_antiwarp 2 (ms).\n"
+        "After the tolerance window (sv_antiwarpTol), movement inputs are linearly\n"
+        "decayed to zero over this duration. Once at zero, Pmove friction decelerates\n"
+        "the player to a natural stop.\n"
+        "Higher = longer coast before stopping. Lower = quicker stop.\n"
+        "0 = skip decay, go straight to friction (inputs zeroed immediately).\n"
+        "Requires sv_antiwarp 2.\n"
+        "Default: 150");
 
     //Cvar_CheckRange( sv_fps, "20", "125", CV_INTEGER );
 	sv_timeout = Cvar_Get( "sv_timeout", "200", CVAR_TEMP );
@@ -1020,6 +1050,9 @@ void SV_Init( void )
 	Cvar_SetGroup( sv_smoothClients, CVG_SERVER );
 	Cvar_SetGroup( sv_bufferMs, CVG_SERVER );
 	Cvar_SetGroup( sv_velSmooth, CVG_SERVER );
+	Cvar_SetGroup( sv_antiwarp, CVG_SERVER );
+	Cvar_SetGroup( sv_antiwarpTol, CVG_SERVER );
+	Cvar_SetGroup( sv_antiwarpDecay, CVG_SERVER );
 
 	// force initial check
 	SV_TrackCvarChanges();
