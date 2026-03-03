@@ -4,7 +4,25 @@ These patches port all ftwgl/urt and subtick features from this fork to upstream
 [ec-/Quake3e](https://github.com/ec-/Quake3e). They are generated against
 upstream `main` and must be applied **in order**.
 
-## Applying
+## Applying via GitHub Actions (UrbanPotato/Quake3e-urt)
+
+A [`apply-patches-to-urt.yml`](../.github/workflows/apply-patches-to-urt.yml)
+workflow is provided that automates applying these patches to
+`UrbanPotato/Quake3e-urt` and opening a pull request.
+
+**One-time setup:**
+1. Create a GitHub personal access token (PAT) with `repo` scope and write
+   access to `UrbanPotato/Quake3e-urt`.
+2. Add it as a repository secret named `GH_PAT` in `senposage/Quake3e-subtick`
+   (_Settings → Secrets and variables → Actions → New repository secret_).
+
+**Trigger:**
+Go to _Actions → Apply patches to UrbanPotato/Quake3e-urt → Run workflow_ and
+click **Run workflow**. An optional branch name can be provided (default:
+`subtick-patches`). The workflow will apply all patches and open a PR in
+`UrbanPotato/Quake3e-urt`.
+
+## Applying Manually
 
 ```bash
 # Fork and clone upstream quake3e
