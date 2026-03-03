@@ -554,8 +554,7 @@ SV_Antilag_InterceptTrace:
 | Function | Purpose |
 |---|---|
 | `SV_Antilag_ComputeConfig()` | Compute shadowHz and historySlots from cvars |
-| `SV_Antilag_GetClientFireTime(shooterNum)` | svs.time - ping, clamped |
-| `SV_Antilag_GetMostRecentPosition(clientNum, out)` | Most recent shadow history entry |
+| `SV_Antilag_GetClientFireTime(shooterNum)` | sv.time - ping/2, clamped |
 | `SV_Antilag_GetPositionAtTime(clientNum, t, out)` | Interpolated position at time t |
 | `SV_Antilag_RewindAll(shooterNum, targetTime)` | Save + rewind all non-shooter clients |
 | `SV_Antilag_RestoreAll(shooterNum)` | Unconditional restore from sv_shadowSaved[] |
