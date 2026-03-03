@@ -1758,7 +1758,7 @@ static void CL_Connect_f( void ) {
 	}
 
 	if ( argc == 2 ) {
-		server = Cmd_Argv(1);
+		server = (char *)Cmd_Argv(1);
 	} else {
 		if( !strcmp( Cmd_Argv(1), "-4" ) )
 			family = NA_IP;
@@ -1770,7 +1770,7 @@ static void CL_Connect_f( void ) {
 #else
 			Com_Printf( S_COLOR_YELLOW "warning: only -4 as address type understood.\n" );
 #endif
-		server = Cmd_Argv(2);
+		server = (char *)Cmd_Argv(2);
 	}
 
 	Q_strncpyz( buffer, server, sizeof( buffer ) );
@@ -1883,7 +1883,7 @@ static void CL_CompleteRcon( const char *args, int argNum )
 		const char *p = Com_SkipTokens( args, 1, " " );
 
 		if ( p > args )
-			Field_CompleteCommand( p, qtrue, qtrue );
+			Field_CompleteCommand( (char *)p, qtrue, qtrue );
 	}
 }
 
@@ -2172,7 +2172,7 @@ static void CL_CompleteCallvote( const char *args, int argNum )
 		const char *p = Com_SkipTokens( args, 1, " " );
 
 		if ( p > args )
-			Field_CompleteCommand( p, qtrue, qtrue );
+			Field_CompleteCommand( (char *)p, qtrue, qtrue );
 	}
 }
 
@@ -5117,7 +5117,7 @@ static void CL_Ping_f( void ) {
 	}
 
 	if ( argc == 2 )
-		server = Cmd_Argv(1);
+		server = (char *)Cmd_Argv(1);
 	else
 	{
 		if( !strcmp( Cmd_Argv(1), "-4" ) )
@@ -5132,7 +5132,7 @@ static void CL_Ping_f( void ) {
 			Com_Printf( "warning: only -4 as address type understood.\n" );
 #endif
 
-		server = Cmd_Argv(2);
+		server = (char *)Cmd_Argv(2);
 	}
 
 	Com_Memset( &to, 0, sizeof( to ) );
@@ -5293,7 +5293,7 @@ static void CL_ServerStatus_f( void ) {
 		Com_Memset( &to, 0, sizeof( to ) );
 
 		if ( argc == 2 )
-			server = Cmd_Argv(1);
+			server = (char *)Cmd_Argv(1);
 		else
 		{
 			if ( !strcmp( Cmd_Argv(1), "-4" ) )
@@ -5308,7 +5308,7 @@ static void CL_ServerStatus_f( void ) {
 				Com_Printf( "warning: only -4 as address type understood.\n" );
 #endif
 
-			server = Cmd_Argv(2);
+			server = (char *)Cmd_Argv(2);
 		}
 
 		toptr = &to;
