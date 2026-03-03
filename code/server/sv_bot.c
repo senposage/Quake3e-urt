@@ -49,13 +49,13 @@ int SV_BotAllocateClient( void ) {
 	client_t	*cl;
 
 	// find a client slot
-	for ( i = 0, cl = svs.clients; i < sv_maxclients->integer; i++, cl++ ) {
+	for ( i = 0, cl = svs.clients; i < sv.maxclients; i++, cl++ ) {
 		if ( cl->state == CS_FREE ) {
 			break;
 		}
 	}
 
-	if ( i == sv_maxclients->integer ) {
+	if ( i == sv.maxclients ) {
 		return -1;
 	}
 
@@ -63,18 +63,7 @@ int SV_BotAllocateClient( void ) {
 	cl->gentity->s.number = i;
 	cl->state = CS_ACTIVE;
 	cl->lastPacketTime = svs.time;
-	{
-		int snapHz = sv_fps->integer;
-		if ( sv_snapshotFps ) {
-			if ( sv_snapshotFps->integer == -1 )
-				snapHz = sv_fps->integer;
-			else if ( sv_snapshotFps->integer > 0 )
-				snapHz = sv_snapshotFps->integer;
-		}
-		if ( snapHz > sv_fps->integer ) snapHz = sv_fps->integer;
-		if ( snapHz < 1 ) snapHz = 1;
-		cl->snapshotMsec = 1000 / snapHz;
-	}
+	cl->snapshotMsec = 1000 / sv_fps->integer;
 	cl->netchan.remoteAddress.type = NA_BOT;
 	cl->rate = 0;
 
@@ -93,7 +82,7 @@ SV_BotFreeClient
 void SV_BotFreeClient( int clientNum ) {
 	client_t	*cl;
 
-	if ( (unsigned) clientNum >= sv_maxclients->integer ) {
+	if ( (unsigned) clientNum >= sv.maxclients ) {
 		Com_Error( ERR_DROP, "SV_BotFreeClient: bad clientNum: %i", clientNum );
 	}
 
@@ -166,19 +155,19 @@ static __attribute__ ((format (printf, 2, 3))) void QDECL BotImport_Print(int ty
 			break;
 		}
 		case PRT_WARNING: {
-			Com_Printf(S_COLOR_YELLOW "Warning: %s", str);
+			Com_Printf(S_COLOR_WARNING "Warning: %s", str);
 			break;
 		}
 		case PRT_ERROR: {
-			Com_Printf(S_COLOR_RED "Error: %s", str);
+			Com_Printf(S_COLOR_ERROR "Error: %s", str);
 			break;
 		}
 		case PRT_FATAL: {
-			Com_Printf(S_COLOR_RED "Fatal: %s", str);
+			Com_Printf(S_COLOR_ERROR "Fatal: %s", str);
 			break;
 		}
 		case PRT_EXIT: {
-			Com_Error(ERR_DROP, S_COLOR_RED "Exit: %s", str);
+			Com_Error(ERR_DROP, S_COLOR_ERROR "Exit: %s", str);
 			break;
 		}
 		default: {
@@ -451,7 +440,7 @@ SV_BotClientCommand
 ==================
 */
 static void BotClientCommand( int client, const char *command ) {
-	if ( (unsigned) client < sv_maxclients->integer ) {
+	if ( (unsigned) client < sv.maxclients ) {
 		SV_ExecuteClientCommand( &svs.clients[client], command );
 	}
 }
@@ -479,7 +468,7 @@ int SV_BotLibSetup( void ) {
 	}
 
 	if ( !botlib_export ) {
-		Com_Printf( S_COLOR_RED "Error: SV_BotLibSetup without SV_BotInitBotLib\n" );
+		Com_Printf( S_COLOR_ERROR "Error: SV_BotLibSetup without SV_BotInitBotLib\n" );
 		return -1;
 	}
 
@@ -603,7 +592,7 @@ SV_BotGetConsoleMessage
 */
 int SV_BotGetConsoleMessage( int client, char *buf, int size )
 {
-	if ( (unsigned) client < sv_maxclients->integer ) {
+	if ( (unsigned) client < sv.maxclients ) {
 		client_t* cl;
 		int index;
 
@@ -658,7 +647,7 @@ SV_BotGetSnapshotEntity
 ==================
 */
 int SV_BotGetSnapshotEntity( int client, int sequence ) {
-	if ( (unsigned) client < sv_maxclients->integer ) {
+	if ( (unsigned) client < sv.maxclients ) {
 		const client_t* cl = &svs.clients[client];
 		const clientSnapshot_t* frame = &cl->frames[cl->netchan.outgoingSequence & PACKET_MASK];
 		if ( (unsigned) sequence >= frame->num_entities ) {

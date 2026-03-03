@@ -396,14 +396,8 @@ typedef enum {
 	BOTLIB_PC_READ_TOKEN,
 	BOTLIB_PC_SOURCE_FILE_AND_LINE,
 
-#ifdef USE_AUTH
-    G_NET_STRINGTOADR = 600,
-	G_NET_SENDPACKET,
-	G_SYS_STARTPROCESS,
-	G_AUTH_DROP_CLIENT,
-#endif
-
 	// engine extensions
+	G_CVAR_SETDESCRIPTION,
 	G_TRAP_GETVALUE = COM_TRAP_GETVALUE
 
 } gameImport_t;
@@ -443,12 +437,6 @@ typedef enum {
 	// and parameters.  Return qfalse if the game doesn't recognize it as a command.
 
 	BOTAI_START_FRAME,				// ( int time );
-
-#ifdef USE_AUTH
-    GAME_AUTHSERVER_HEARTBEAT,
-	GAME_AUTHSERVER_SHUTDOWN,
-	GAME_AUTHSERVER_PACKET,
-#endif
 
 	GAME_EXPORT_LAST
 } gameExport_t;
