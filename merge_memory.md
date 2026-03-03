@@ -184,17 +184,136 @@ code/renderervk/shaders/spirv/.shader_data.c.swp  (VIM SWAP FILE - DELETE THIS)
 - Target `Quake3e-upstreammerge` as base
 - Title: "Fix 93 corrupted files from upstream sync"
 
-### Steps:
-1. For each corrupted file, restore the content from `master` branch (d22f38b)
-   - `git show d22f38b:<path> > <path>` for each file
-2. Delete the vim swap file: `code/renderervk/shaders/spirv/.shader_data.c.swp`
-3. Build and verify on Linux
-4. Commit and push
+### Exact Fix Commands (run on a branch from Quake3e-upstreammerge):
+```bash
+# Step 0: Make sure you have master available
+git fetch origin master --depth=1
+
+# Step 1: Restore the 6 critical engine/renderer source files
+git show origin/master:code/client/snd_dmahd.c > code/client/snd_dmahd.c
+git show origin/master:code/client/snd_dmahd.h > code/client/snd_dmahd.h
+git show origin/master:code/qcommon/cm_load_bsp1.c > code/qcommon/cm_load_bsp1.c
+git show origin/master:code/qcommon/cm_load_bsp2.c > code/qcommon/cm_load_bsp2.c
+git show origin/master:code/qcommon/cm_load_bsp2.h > code/qcommon/cm_load_bsp2.h
+git show origin/master:code/renderervk/tr_font.c > code/renderervk/tr_font.c
+
+# Step 2: Restore 74 SDL2 Windows headers
+for f in $(git ls-tree --name-only origin/master code/libsdl/windows/include/SDL2/); do
+  git show "origin/master:$f" > "$f"
+done
+
+# Step 3: Restore 12 MSVC 2019 project files
+for f in $(git ls-tree --name-only origin/master code/win32/msvc2019/); do
+  git show "origin/master:$f" > "$f"
+done
+
+# Step 4: Restore 2 binary files
+git show origin/master:code/win32/rounded.png > code/win32/rounded.png
+git show origin/master:code/win32/win_resource.aps > code/win32/win_resource.aps
+
+# Step 5: Delete vim swap file (should NOT be in repo)
+git rm code/renderervk/shaders/spirv/.shader_data.c.swp
+
+# Step 6: Verify - find any remaining corrupted files
+git ls-tree -r HEAD --name-only | while read f; do
+  size=$(git cat-file -s "HEAD:$f" 2>/dev/null)
+  if [ "$size" = "14" ]; then
+    content=$(git show "HEAD:$f" 2>/dev/null)
+    if [ "$content" = "404: Not Found" ]; then
+      echo "STILL CORRUPTED: $f"
+    fi
+  fi
+done
+
+# Step 7: Build test (Linux)
+make clean && make
+```
 
 ### Suggested PR breakdown (to stay within agent time limits):
-- **PR A**: Fix 6 critical engine source files (snd_dmahd, cm_load_bsp, tr_font)
-- **PR B**: Fix 74 SDL2 Windows headers  
-- **PR C**: Fix 12 MSVC 2019 project files + 2 binary files + delete .swp
+- **PR A**: Fix ALL 93 corrupted files in one shot (preferred if agent has time)
+- OR split into:
+  - **PR A**: Fix 6 critical engine source files (snd_dmahd, cm_load_bsp, tr_font)
+  - **PR B**: Fix 74 SDL2 Windows headers  
+  - **PR C**: Fix 12 MSVC 2019 project files + 2 binary files + delete .swp
+
+### How to verify the fix worked:
+```bash
+# Check no more 404 files remain
+find . -name "*.c" -o -name "*.h" | xargs grep -l "^404: Not Found$" 2>/dev/null
+# Should return empty
+
+# Build test
+make clean && make 2>&1 | tail -5
+# Should end with LD build/release-linux-x86_64/ftwgl-XXXXX.x64
+```
+
+---
+
+## UPSTREAM REPO REFERENCE
+
+### ec-/Quake3e structure (at tag latest / 46add7d)
+- Does NOT have: `code/client/snd_dmahd.*`
+- Does NOT have: `code/qcommon/cm_load_bsp1.c`, `cm_load_bsp2.*`
+- Does NOT have: `code/renderervk/tr_font.c`
+- Does NOT have: `code/libsdl/windows/` directory at all
+- Does NOT have: `code/win32/msvc2019/` directory at all
+- Does NOT have: `code/win32/rounded.png`
+- Has `code/qcommon/cm_load.c` (single file, fork split it into bsp1/bsp2)
+- Has `code/renderer/tr_font.c` (not in renderervk)
+- Has MSVC2017 project files in `code/win32/msvc2017/`
+
+### Fork-specific features (verified from code, NOT from /patches/ which are outdated)
+The fork adds these features on top of upstream:
+- Subtick networking (server frame loop, cvars, pmove, extrapolation, map restart)
+- Shadow antilag system (`code/server/sv_antilag.h`, `sv_antilag.c`)
+- Antiwarp system
+- DMAHD sound (`code/client/snd_dmahd.c/.h`)
+- BSP2 map format support (`cm_load_bsp1.c`, `cm_load_bsp2.c/.h`)
+- FTWGL client name
+- Auth system (USE_AUTH)
+- URT demo support (USE_URT_DEMO)
+- Server-side demo recording (USE_SERVER_DEMO)
+- Custom MSVC 2019 project files
+- Bundled SDL2 Windows headers
+- Custom Vulkan renderer tr_font.c
+
+---
+
+## SESSION HISTORY (PR #39 - this session)
+
+### What was done:
+1. Explored repo structure, understood it's a fork of ec-/Quake3e
+2. Built the project successfully on master branch (Linux x86_64)
+3. Fetched `Quake3e-upstreammerge` branch (b05d00c)
+4. Compared current branch (master) vs Quake3e-upstreammerge: 444 files different
+5. Found 2 suspicious binary files (14 bytes = corrupted)
+6. Ran full scan: found ALL 93 corrupted files containing "404: Not Found"
+7. Investigated upstream ec-/Quake3e: confirmed these files DON'T EXIST upstream
+8. Confirmed all 93 files have correct content on master branch
+9. Documented everything in this file
+
+### What was NOT done (for next PR):
+- Did not modify any code on Quake3e-upstreammerge
+- Did not fix any corrupted files (user said "don't do it locally, I'll open a new PR")
+- Did not verify fork patches are correctly applied (beyond confirming build works)
+- Did not do Windows build testing
+
+### Key learnings:
+- The sandbox blocks raw GitHub downloads (DNS monitoring proxy)
+- Must use `git show origin/master:<path>` to get file content, not curl
+- GitHub MCP `get_file_contents` works for upstream repo structure browsing
+- The /patches/ directory is OUT OF DATE and should NOT be trusted
+
+---
+
+## AFTER FIXING CORRUPTED FILES - FUTURE WORK
+
+Once the 93 corrupted files are fixed, these tasks remain:
+1. **Verify Linux build** on Quake3e-upstreammerge branch
+2. **Verify Windows build** (needs MSVC or MinGW cross-compile)
+3. **Diff Quake3e-upstreammerge vs master** to confirm only intentional upstream changes remain
+4. **Test fork features** still work (subtick, antilag, antiwarp, DMAHD, BSP2)
+5. **Eventually merge Quake3e-upstreammerge into master** when everything is verified
 
 ---
 
