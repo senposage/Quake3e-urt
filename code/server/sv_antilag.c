@@ -260,30 +260,26 @@ SV_Antilag_GetClientFireTime
 
 Returns the time to rewind targets to for a given shooter.
 
-Uses cl->lastUsercmd.serverTime — the actual command timestamp from
-the client's usercmd when they pressed fire.  On the client side this
-is computed as:
-    cl.serverTime = cls.realtime + cl.serverTimeDelta - CL_TimeNudge()
-so it already incorporates the client's latency measurement and any
-cl_timeNudge / cl_autoNudge adjustments.
+Uses sv.time - cl->ping / 2 — the server's current time minus the
+estimated one-way latency.  cl->ping is the full RTT, so ping/2
+approximates how far behind sv.time the client is seeing the world.
 
-In the QVM this value becomes AttackTime (g_active.c:1420).
-The QVM's own FIFO antilag further subtracts ut_timenudge:
-    finaltime = AttackTime - ut_timenudge
-but since our shadow rewind overrides the FIFO positions entirely,
-ut_timenudge is correctly irrelevant here — we rewind to where the
-client actually saw the world, not where the FIFO system estimated.
+Previous approach (PR #35) used cl->lastUsercmd.serverTime, which
+includes the client's local interpolation delay (cl_timeNudge,
+cl_autoNudge, snapshot buffering) on top of the network delay.  This
+produced ~70 ms rewind for a 45 ms ping player (correct ≈ 22 ms),
+making hit registration feel delayed and spongy compared to the QVM's
+own FIFO antilag.
 
-Previous code used svs.time - cl->ping (full RTT), which over-rewound
-by approximately half the RTT.  For a 40 ms ping player this meant
-a 40 ms rewind when the correct value is ~20 ms, causing bullets to
-register against positions further in the past than the client saw.
+The original code used svs.time - cl->ping (full RTT, wrong time
+domain).  The new formula is the same idea but correctly uses sv.time
+and divides by 2 for one-way latency.
 
 CRITICAL: all time comparisons use sv.time, NOT svs.time.
-Snapshots send sv.time to clients, so lastUsercmd.serverTime is in the
-sv.time domain.  svs.time is a different clock (persists across map
-changes) and using it here would create a constant offset that forces
-every shot to clamp to max rewind.
+Snapshots send sv.time to clients, and shadow history records at
+sv.time.  svs.time is a different clock (persists across map changes)
+and using it here would create a constant offset that forces every
+shot to clamp to max rewind.
 */
 static int SV_Antilag_GetClientFireTime( int shooterNum ) {
     client_t *cl;
@@ -295,16 +291,23 @@ static int SV_Antilag_GetClientFireTime( int shooterNum ) {
 
     cl = &svs.clients[shooterNum];
 
-    // Use the client's actual command time — this is exactly what the
-    // QVM sees as AttackTime and represents the client's perception of
-    // server time when they pressed fire.
+    // Use half the measured round-trip time as a one-way latency estimate.
     //
-    // lastUsercmd.serverTime is in the sv.time domain because the client
-    // calibrates its server time estimate from snapshots, and snapshots
-    // use sv.time (not svs.time).  All clamp comparisons below must also
-    // use sv.time to stay in the same domain as the shadow history
-    // timestamps (which record at sv.time).
-    fireTime = cl->lastUsercmd.serverTime;
+    // The shadow history records entity positions at sv.time.  The client
+    // sees those positions after approximately one-way latency (the time
+    // for the snapshot to travel from server to client).  cl->ping is the
+    // full RTT, so ping/2 is the best approximation of one-way delay.
+    //
+    // Why NOT cl->lastUsercmd.serverTime:
+    //   lastUsercmd.serverTime includes the client's local interpolation
+    //   buffering (cl_timeNudge, cl_autoNudge, snapshot smoothing) on top
+    //   of the network delay.  This produces excessive rewind — e.g. 70 ms
+    //   for a 45 ms ping player instead of the correct ~22 ms — making
+    //   hits feel delayed and spongy.  The QVM's FIFO antilag uses it
+    //   correctly (its trail is in the level.time domain where those
+    //   offsets cancel out), but the shadow system records at sv.time
+    //   where the extra delay doubles up.
+    fireTime = sv.time - cl->ping / 2;
 
     // Clamp: never rewind more than sv_antilagMaxMs
     maxRewind = sv_antilagMaxMs ? sv_antilagMaxMs->integer : SV_ANTILAG_MAX_REWIND_MS;
