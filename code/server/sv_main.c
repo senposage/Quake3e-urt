@@ -1607,15 +1607,15 @@ void SV_Frame( int msec ) {
 		svs.time += frameMsec;
 		sv.time += frameMsec;
 
-		// --- Engine-side shadow antilag sub-ticks ---
+		// --- Engine-side shadow antilag recording ---
+		// Record entity positions once per engine tick into the shadow history
+		// ring buffer. Positions only change after GAME_RUN_FRAME / ClientThink,
+		// so recording multiple times per tick with the same svs.time would fill
+		// the ring buffer with duplicate-timestamp entries, wasting slots and
+		// reducing the effective history window (e.g. scale=3 would give only
+		// 1/3 the expected coverage).
 		if ( sv_antilagEnable && sv_antilagEnable->integer ) {
-			int _scale = sv_physicsScale ? sv_physicsScale->integer : 1;
-			int _s;
-			if ( _scale < 1 ) _scale = 1;
-			if ( _scale > 8 ) _scale = 8;
-			for ( _s = 0; _s < _scale; _s++ ) {
-				SV_Antilag_RecordPositions();
-			}
+			SV_Antilag_RecordPositions();
 		}
 
 		// Fire GAME_RUN_FRAME at sv_gameHz rate, independent of sv_fps.
