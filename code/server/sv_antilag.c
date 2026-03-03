@@ -505,18 +505,21 @@ void SV_Antilag_RecordPositions( void ) {
         }
     }
 
-    // Record all active clients (including bots) into shadow history.
-    // Bots have zero lag as shooters (InterceptTrace skips bot shooters),
-    // but they must be recorded so human players shooting AT bots can
-    // rewind bot positions for proper lag compensation.
+    // Record active human clients into shadow history.
+    // Bots are excluded: the QVM's FIFO antilag already handles bot
+    // targets (FIFO skips bots — zero lag — so their position is already
+    // correct).  Recording bots would cause a double-rewind conflict:
+    // FIFO shifts the bot to position A, then shadow overwrites with
+    // position B from a different time formula, and the trace runs
+    // against a position neither system intended.
     //
-    // Timestamps use sv.time (not svs.time) because the client's
-    // lastUsercmd.serverTime is calibrated from snapshots which use
-    // sv.time.  Using the same time domain ensures the shadow lookup
-    // in GetClientFireTime finds the correct history entries.
+    // Timestamps use sv.time (not svs.time) because fire time is
+    // computed from sv.time and shadow history lookups must be in
+    // the same time domain.
     for ( i = 0; i < sv_maxclients->integer; i++ ) {
         client_t *cl = &svs.clients[i];
         if ( cl->state != CS_ACTIVE ) continue;
+        if ( cl->netchan.remoteAddress.type == NA_BOT ) continue;
         SV_Antilag_RecordClient( i, sv.time );
     }
 }

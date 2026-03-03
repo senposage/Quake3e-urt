@@ -1094,6 +1094,18 @@ void SV_FinalMessage( const char *message ) {
 	int			i, j;
 	client_t	*cl;
 
+	// Drain any pending netchan fragments before sending the disconnect.
+	// At high sv_fps, clients may have unsent fragments from their last
+	// snapshot.  SV_Netchan_Transmit queues new messages behind unsent
+	// fragments, so the disconnect snapshot would be queued but never
+	// transmitted (we never return to the main loop after shutdown).
+	for ( i = 0, cl = svs.clients; i < sv_maxclients->integer; i++, cl++ ) {
+		if ( cl->state >= CS_CONNECTED ) {
+			while ( SV_Netchan_TransmitNextFragment( cl ) >= 0 )
+				;
+		}
+	}
+
 	// send it twice, ignoring rate
 	for ( j = 0 ; j < 2 ; j++ ) {
 		for (i=0, cl = svs.clients ; i < sv_maxclients->integer ; i++, cl++) {
@@ -1107,6 +1119,14 @@ void SV_FinalMessage( const char *message ) {
 				cl->lastSnapshotTime = svs.time - 9999; // generate a snapshot immediately
 				cl->state = CS_ZOMBIE; // skip delta generation
 				SV_SendClientSnapshot( cl );
+			}
+		}
+		// Drain fragments between rounds so round 2 isn't queued
+		// behind round 1's unsent fragments.
+		for ( i = 0, cl = svs.clients; i < sv_maxclients->integer; i++, cl++ ) {
+			if ( cl->state >= CS_ZOMBIE ) {
+				while ( SV_Netchan_TransmitNextFragment( cl ) >= 0 )
+					;
 			}
 		}
 	}

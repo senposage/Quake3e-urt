@@ -1319,10 +1319,19 @@ void CL_SetCGameTime( void ) {
 		}
 		// Cap serverTime one millisecond below the latest received snapshot
 		// (adaptive timing only — vanilla has no such cap).
+		// Release the cap when the uncapped time drifts several snapshot
+		// intervals past the last snapshot — the server has likely stopped
+		// sending (quit/crash/timeout).  Without this, the frozen cap
+		// prevents the cgame from processing pending server commands
+		// like "disconnect" and the client hangs indefinitely.
 		if ( cl_adaptiveTiming->integer ) {
 			if ( cl.serverTime >= cl.snap.serverTime ) {
-				cl.serverTime = cl.snap.serverTime - 1;
-				SCR_NetMonitorAddCapHit();
+				int drift = cl.serverTime - cl.snap.serverTime;
+				int capLimit = 1000;
+				if ( drift < capLimit ) {
+					cl.serverTime = cl.snap.serverTime - 1;
+					SCR_NetMonitorAddCapHit();
+				}
 			}
 		}
 		cl.oldServerTime = cl.serverTime;

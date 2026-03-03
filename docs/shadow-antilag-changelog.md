@@ -63,32 +63,22 @@ fireTime = cl->lastUsercmd.serverTime;
 - Already incorporates `cl_timeNudge` / `cl_autoNudge` from the client
 - Makes `ut_timenudge` correctly irrelevant (shadow rewind overrides FIFO)
 
-### Fix 2: Bots excluded from shadow history recording
+### ~~Fix 2: Bots excluded from shadow history recording~~ (REVERTED)
 
-**Bug:** The recording loop filtered out bots (`NA_BOT`), so human players
-shooting **at** bots got zero lag compensation — bot positions were never
-in the shadow history ring buffer.
+**Original change:** Removed the `NA_BOT` filter so bots were recorded
+into shadow history, reasoning that humans shooting at bots needed lag
+compensation.
 
-```c
-// BEFORE (original) — in SV_Antilag_RecordPositions
-for ( i = 0; i < sv_maxclients->integer; i++ ) {
-    client_t *cl = &svs.clients[i];
-    if ( cl->state != CS_ACTIVE ) continue;
-    if ( cl->netchan.remoteAddress.type == NA_BOT ) continue;  // ← WRONG
-    SV_Antilag_RecordClient( i, svs.time );
-}
+**Reverted:** Bots are correctly excluded from shadow recording. The
+QVM's FIFO antilag already handles bot targets (FIFO skips bots — they
+have zero lag — so their position is already correct at trace time).
+Recording bots into shadow history causes a double-rewind conflict:
+FIFO shifts the bot to position A, then shadow overwrites with position B
+computed from a different time formula (`sv.time - ping/2` vs FIFO's
+`level.time` domain). The trace runs against a position neither system
+intended.
 
-// AFTER (PR #35) — bots are recorded
-for ( i = 0; i < sv_maxclients->integer; i++ ) {
-    client_t *cl = &svs.clients[i];
-    if ( cl->state != CS_ACTIVE ) continue;
-    // No NA_BOT filter — bots must be recorded so humans can rewind them
-    SV_Antilag_RecordClient( i, svs.time );
-}
-```
-
-Note: bots are still **skipped as shooters** in `InterceptTrace` (they
-have no lag to compensate). The fix only affects recording targets.
+Bots are still **skipped as shooters** in `InterceptTrace` (zero lag).
 
 ### Fix 3: sv_fps change detection race
 
@@ -378,7 +368,7 @@ match the actual cvar names registered by `SV_Antilag_Init()`.
 |------|--------------|--------------|--------------|--------------|
 | **Fire time formula** | `svs.time - cl->ping` | `cl->lastUsercmd.serverTime` | *(unchanged)* | **`sv.time - cl->ping / 2`** |
 | **Fire time clamps** | vs `svs.time` | vs `svs.time` | vs **`sv.time`** | *(unchanged)* |
-| **Recording timestamp** | `svs.time` (bots excluded) | `svs.time` (bots included) | **`sv.time`** (bots included) | *(unchanged)* |
+| **Recording timestamp** | `svs.time` (bots excluded) | `svs.time` (bots ~~included~~ reverted) | **`sv.time`** (bots excluded) | *(unchanged)* |
 | **sv_fps detection** | `sv_fps->modified` (race) | Integer value tracking | *(unchanged)* | *(unchanged)* |
 | **History flush** | Only if slot count changed | Always on timing change | *(unchanged)* | *(unchanged)* |
 | **Recording loop** | `physicsScale×` per tick | 1× per tick | *(unchanged)* | *(unchanged)* |
@@ -399,8 +389,9 @@ When reviewing these changes, verify:
 - [ ] `sv.time` is used consistently in all shadow antilag paths that
       compare against fire time or shadow history timestamps
 - [ ] `svs.time` is **only** used in `NoteSnapshot` rate tracking (wall-clock)
-- [ ] Bots are recorded into shadow history (no `NA_BOT` filter in
-      `RecordPositions`) but skipped as shooters (in `InterceptTrace`)
+- [ ] Bots are **excluded** from shadow history recording (`NA_BOT`
+      filter in `RecordPositions`) — FIFO handles bot targets. Bots are
+      also skipped as shooters (in `InterceptTrace`)
 - [ ] `ComputeConfig` slot count uses `sv_fps` Hz (not `fps × scale`)
       with `+1` to avoid off-by-one
 - [ ] History is always flushed on any timing config change (not just
