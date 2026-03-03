@@ -512,19 +512,19 @@ void SV_Antilag_RecordPositions( void ) {
         qboolean fpsChanged = ( currentFps != sv_antilag_lastFpsValue );
 
         if ( sv_physicsScale->modified || sv_antilagMaxMs->modified || fpsChanged ) {
-            int oldSlots = sv_shadowHistorySlots;
             SV_Antilag_ComputeConfig();
             sv_physicsScale->modified = qfalse;
             sv_antilagMaxMs->modified = qfalse;
             sv_antilag_lastFpsValue = currentFps;
 
-            // If slot count changed, flush all ring buffers — old entries were
-            // written with a different modulo and produce wrong indices when read.
-            if ( sv_shadowHistorySlots != oldSlots ) {
-                Com_Memset( sv_shadowHistory, 0, sizeof( sv_shadowHistory ) );
-            }
+            // Always flush all ring buffers on any timing change.
+            // Stale entries recorded at the old tick rate have wrong timestamp
+            // spacing and produce incorrect interpolation even if the slot count
+            // happens to remain the same (e.g. sv_fps 60→40→60 round-trip).
+            // Without this flush, the corruption persists until server reboot.
+            Com_Memset( sv_shadowHistory, 0, sizeof( sv_shadowHistory ) );
 
-            Com_Printf( "SV_Antilag: reconfigured — shadow Hz=%d, historySlots=%d\n",
+            Com_Printf( "SV_Antilag: reconfigured — shadow Hz=%d, historySlots=%d (history flushed)\n",
                 1000 / sv_shadowTickMs, sv_shadowHistorySlots );
         }
     }
