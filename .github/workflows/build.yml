@@ -26,21 +26,13 @@ permissions:
 
 jobs:
   linux:
-    name: ${{ matrix.btype }} Linux ${{ matrix.arch }}
+    name: Linux ${{ matrix.arch }}
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
         arch: [x86, x86_64]
-        cc: [gcc]
-        btype: [Release, Debug]
         include:
-          - btype: Release
-            rule: install
-
-          - btype: Debug
-            rule: debug
-
           - arch: x86
             use_sdl: USE_SDL=0
 
@@ -65,14 +57,12 @@ jobs:
         submodules: recursive
 
     - name: Build
-      if: ${{ matrix.btype == 'Debug' || github.event_name == 'workflow_dispatch' || github.event_name == 'release' }}
       run: |
-        make ${{ matrix.rule }} -j$(nproc) ARCH=${{ matrix.arch }} COMPILE_ARCH=${{ matrix.arch }} CC=${{ matrix.cc }} DESTDIR=bin ${{ matrix.use_sdl }} USE_RENDERER_DLOPEN=0 RENDERER_DEFAULT=vulkan CNAME=quake3e-vulkan BUILD_SERVER=0
+        make install -j$(nproc) ARCH=${{ matrix.arch }} COMPILE_ARCH=${{ matrix.arch }} CC=gcc DESTDIR=bin ${{ matrix.use_sdl }} USE_RENDERER_DLOPEN=0 RENDERER_DEFAULT=vulkan CNAME=quake3e-vulkan BUILD_SERVER=0
         make clean ARCH=${{ matrix.arch }}
-        make ${{ matrix.rule }} -j$(nproc) ARCH=${{ matrix.arch }} COMPILE_ARCH=${{ matrix.arch }} CC=${{ matrix.cc }} DESTDIR=bin ${{ matrix.use_sdl }} USE_RENDERER_DLOPEN=0 RENDERER_DEFAULT=opengl
+        make install -j$(nproc) ARCH=${{ matrix.arch }} COMPILE_ARCH=${{ matrix.arch }} CC=gcc DESTDIR=bin ${{ matrix.use_sdl }} USE_RENDERER_DLOPEN=0 RENDERER_DEFAULT=opengl
 
     - uses: actions/upload-artifact@v4
-      if: matrix.cc == 'gcc' && matrix.btype == 'Debug'
       with:
         name: linux-${{ matrix.arch }}
         path: bin
@@ -80,19 +70,12 @@ jobs:
         retention-days: 5
 
   windows-mingw:
-    name: ${{ matrix.btype }} Windows-MinGW ${{ matrix.arch }}
+    name: Windows-MinGW ${{ matrix.arch }}
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
         arch: [x86, x86_64]
-        btype: [Release, Debug]
-        include:
-          - btype: Release
-            rule: install
-
-          - btype: Debug
-            rule: debug
 
     steps:
 
@@ -106,14 +89,12 @@ jobs:
         submodules: recursive
 
     - name: Build
-      if: ${{ matrix.btype == 'Debug' || github.event_name == 'workflow_dispatch' || github.event_name == 'release' }}
       run: |
-        make ${{ matrix.rule }} -j$(nproc) ARCH=${{ matrix.arch }} DESTDIR=bin PLATFORM=mingw32 USE_SDL=0 USE_RENDERER_DLOPEN=0 RENDERER_DEFAULT=vulkan CNAME=quake3e-vulkan BUILD_SERVER=0
+        make install -j$(nproc) ARCH=${{ matrix.arch }} DESTDIR=bin PLATFORM=mingw32 USE_SDL=0 USE_RENDERER_DLOPEN=0 RENDERER_DEFAULT=vulkan CNAME=quake3e-vulkan BUILD_SERVER=0
         make clean ARCH=${{ matrix.arch }} PLATFORM=mingw32
-        make ${{ matrix.rule }} -j$(nproc) ARCH=${{ matrix.arch }} DESTDIR=bin PLATFORM=mingw32 USE_SDL=0 USE_RENDERER_DLOPEN=0 RENDERER_DEFAULT=opengl
+        make install -j$(nproc) ARCH=${{ matrix.arch }} DESTDIR=bin PLATFORM=mingw32 USE_SDL=0 USE_RENDERER_DLOPEN=0 RENDERER_DEFAULT=opengl
 
     - uses: actions/upload-artifact@v4
-      if: ${{ matrix.btype == 'Debug' }}
       with:
         name: windows-mingw-${{ matrix.arch }}
         path: bin
