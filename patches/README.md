@@ -1,35 +1,45 @@
 # Patches — Quake3e-subtick + FTWGL Fork
 
-These patches port all ftwgl/urt and subtick features from this fork to upstream
-[ec-/Quake3e](https://github.com/ec-/Quake3e). They are generated against
-upstream `main` and must be applied **in order**.
+These patches port all ftwgl/urt and subtick features from this fork to
+[UrbanPotato/Quake3e-urt](https://github.com/UrbanPotato/Quake3e-urt).
+They are generated against the `main` branch of that repo and must be
+applied **in order**.
 
-## Applying
+> **Verified:** All five patches apply cleanly to
+> `UrbanPotato/Quake3e-urt` at commit `46add7d0` (HEAD as of 2026-02-28).
+
+## Creating a PR against UrbanPotato/Quake3e-urt
 
 ```bash
-# Fork and clone upstream quake3e
-git clone https://github.com/<you>/Quake3e.git
-cd Quake3e
+# 1. Fork https://github.com/UrbanPotato/Quake3e-urt on GitHub, then clone your fork
+git clone https://github.com/<you>/Quake3e-urt.git
+cd Quake3e-urt
 
-# Apply all patches in order
-git am patches/0001-ftwgl-base-server-infrastructure.patch
-git am patches/0002-subtick-engine-side-antilag.patch
-git am patches/0003-ftwgl-client-changes.patch
-git am patches/0004-ftwgl-network-and-common.patch
-git am patches/0005-ftwgl-build-system.patch
+# 2. Create a feature branch
+git checkout -b subtick-patches
+
+# 3. Copy the patch files from this repo into the clone, then apply in order
+git am 0001-ftwgl-base-server-infrastructure.patch
+git am 0002-subtick-engine-side-antilag.patch
+git am 0003-ftwgl-client-changes.patch
+git am 0004-ftwgl-network-and-common.patch
+git am 0005-ftwgl-build-system.patch
+
+# 4. Push and open a PR against UrbanPotato/Quake3e-urt:main
+git push -u origin subtick-patches
 ```
 
 Or apply all at once:
 
 ```bash
-git am patches/*.patch
+git am 00*.patch
 ```
 
 If a patch has conflicts due to upstream changes:
 
 ```bash
 git am --abort                    # cancel
-git am --3way patches/XXXX.patch  # retry with 3-way merge
+git am --3way XXXX.patch          # retry with 3-way merge
 ```
 
 ## Patch Contents
