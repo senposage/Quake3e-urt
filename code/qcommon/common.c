@@ -2850,13 +2850,13 @@ int Com_EventLoop( void ) {
 			while ( NET_GetLoopPacket( NS_CLIENT, &evFrom, &buf ) ) {
 				CL_PacketEvent( &evFrom, &buf );
 			}
-#endif
 			while ( NET_GetLoopPacket( NS_SERVER, &evFrom, &buf ) ) {
 				// if the server just shut down, flush the events
 				if ( com_sv_running->integer ) {
 					Com_RunAndTimeServerPacket( &evFrom, &buf );
 				}
 			}
+#endif
 
 			return ev.evTime;
 		}
@@ -4201,7 +4201,7 @@ void Com_Frame( qboolean noDelay ) {
 	}
 #endif
 
-	NET_FlushPacketQueue();
+	NET_FlushPacketQueue( 0 );
 
 	//
 	// report timing information
