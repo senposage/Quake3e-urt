@@ -258,14 +258,26 @@ static qboolean SV_Antilag_GetPositionAtTime(
 /*
 SV_Antilag_GetClientFireTime
 
-Extracts the client's fire time from the QVM entity state.
-The QVM (UT4.2) stores this as AttackTime in the client struct,
-which corresponds to ucmd->serverTime captured before the sanity clamp.
+Returns the time to rewind targets to for a given shooter.
 
-On the engine side we access it through the playerState ping offset —
-the QVM writes ps.commandTime which is updated per-ucmd.
-We use svs.time - client->ping as the conservative estimate if
-we can't read the exact ucmd serverTime directly.
+Uses cl->lastUsercmd.serverTime — the actual command timestamp from
+the client's usercmd when they pressed fire.  On the client side this
+is computed as:
+    cl.serverTime = cls.realtime + cl.serverTimeDelta - CL_TimeNudge()
+so it already incorporates the client's latency measurement and any
+cl_timeNudge / cl_autoNudge adjustments.
+
+In the QVM this value becomes AttackTime (g_active.c:1420).
+The QVM's own FIFO antilag further subtracts ut_timenudge:
+    finaltime = AttackTime - ut_timenudge
+but since our shadow rewind overrides the FIFO positions entirely,
+ut_timenudge is correctly irrelevant here — we rewind to where the
+client actually saw the world, not where the FIFO system estimated.
+
+Previous code used svs.time - cl->ping (full RTT), which over-rewound
+by approximately half the RTT.  For a 40 ms ping player this meant
+a 40 ms rewind when the correct value is ~20 ms, causing bullets to
+register against positions further in the past than the client saw.
 */
 static int SV_Antilag_GetClientFireTime( int shooterNum ) {
     client_t *cl;
@@ -277,11 +289,10 @@ static int SV_Antilag_GetClientFireTime( int shooterNum ) {
 
     cl = &svs.clients[shooterNum];
 
-    // Best estimate: current server time minus measured ping.
-    // This mirrors what the QVM's AttackTime - ut_timenudge approximates.
-    // The QVM's own FIFO system will also rewind, but our shadow rewind
-    // operates on the higher-resolution shadow history independently.
-    fireTime = svs.time - cl->ping;
+    // Use the client's actual command time — this is exactly what the
+    // QVM sees as AttackTime and represents the client's perception of
+    // server time when they pressed fire.
+    fireTime = cl->lastUsercmd.serverTime;
 
     // Clamp: never rewind more than sv_antilagMaxMs
     maxRewind = sv_antilagMaxMs ? sv_antilagMaxMs->integer : SV_ANTILAG_MAX_REWIND_MS;
