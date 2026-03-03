@@ -21,25 +21,26 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 */
 // win_main.c
 
-#include "../qcommon/q_shared.h"
-#include "../qcommon/qcommon.h"
-#ifndef DEDICATED
 #include "../client/client.h"
+#include "../qcommon/qcommon.h"
+#ifdef USE_SENTRY
+//#define SENTRY_BUILD_STATIC 1
+#include "../sentry/include/sentry.h"
 #endif
 #include "win_local.h"
+#include "glw_win.h"
 #include "resource.h"
 #include <sys/types.h>
 #include <sys/stat.h>
-#include <errno.h>
 #include <direct.h>
-#include <io.h>
 
+#ifdef USE_SENTRY
+#define sleep_s(SECONDS) Sleep((SECONDS)*1000)
+#endif
 
 #define MEM_THRESHOLD (96*1024*1024)
 
 WinVars_t	g_wv;
-
-#ifndef DEDICATED
 
 /*
 ==================
@@ -47,20 +48,9 @@ Sys_LowPhysicalMemory
 ==================
 */
 qboolean Sys_LowPhysicalMemory( void ) {
-#if	_MSC_VER < 1600 // MSVC 2008 and lower, assume win9x compatibility builds
 	MEMORYSTATUS stat;
 	GlobalMemoryStatus( &stat );
 	return (stat.dwTotalPhys <= MEM_THRESHOLD) ? qtrue : qfalse;
-#else
-	MEMORYSTATUSEX stat;
-	stat.dwLength = sizeof(stat);
-
-	if ( !GlobalMemoryStatusEx( &stat ) ) {
-		return qfalse;
-	}
-
-	return (stat.ullAvailPhys <= MEM_THRESHOLD) ? qtrue : qfalse;
-#endif
 }
 
 
@@ -73,7 +63,6 @@ void Sys_BeginProfiling( void ) {
 	// this is just used on the mac build
 }
 
-#endif // !DEDICATED
 
 /*
 =============
@@ -82,7 +71,12 @@ Sys_Error
 Show the early console as an error dialog
 =============
 */
-void NORETURN FORMAT_PRINTF(1, 2) QDECL Sys_Error( const char *error, ... ) {
+void QDECL Sys_Error( const char *error, ... ) {
+#ifdef USE_SENTRY
+    const char *logger = "Sys_Error";
+    sentry_capture_event(sentry_value_new_message_event(SENTRY_LEVEL_ERROR, logger, error));
+#endif
+
 	va_list	argptr;
 	char	text[4096];
 	MSG		msg;
@@ -90,6 +84,10 @@ void NORETURN FORMAT_PRINTF(1, 2) QDECL Sys_Error( const char *error, ... ) {
 	va_start( argptr, error );
 	Q_vsnprintf( text, sizeof( text ), error, argptr );
 	va_end( argptr );
+
+#ifdef USE_SENTRY
+	sentry_shutdown();
+#endif
 
 #ifndef DEDICATED
 	CL_Shutdown( text, qtrue );
@@ -103,7 +101,7 @@ void NORETURN FORMAT_PRINTF(1, 2) QDECL Sys_Error( const char *error, ... ) {
 
 	timeEndPeriod( 1 );
 
-	// wait for the user to quit
+    // wait for the user to quit
 	while ( 1 ) {
 		if ( GetMessage( &msg, NULL, 0, 0 ) <= 0 ) {
 			Cmd_Clear();
@@ -113,9 +111,7 @@ void NORETURN FORMAT_PRINTF(1, 2) QDECL Sys_Error( const char *error, ... ) {
 		DispatchMessage( &msg );
 	}
 
-	SetUnhandledExceptionFilter( NULL );
-
-	Sys_DestroyConsole();
+    Sys_DestroyConsole();
 
 	exit( 1 );
 }
@@ -126,11 +122,13 @@ void NORETURN FORMAT_PRINTF(1, 2) QDECL Sys_Error( const char *error, ... ) {
 Sys_Quit
 ==============
 */
-void NORETURN Sys_Quit( void ) {
+void Sys_Quit( void ) {
+
+#ifdef USE_SENTRY
+	sentry_shutdown();
+#endif
 
 	timeEndPeriod( 1 );
-
-	SetUnhandledExceptionFilter( NULL );
 
 	Sys_DestroyConsole();
 
@@ -150,48 +148,13 @@ void Sys_Print( const char *msg )
 
 
 /*
-=============
-Sys_Sleep
-=============
-*/
-void Sys_Sleep( int msec ) {
-
-	if ( msec < 0 ) {
-		// special case: wait for event or network packet
-		DWORD dwResult;
-		msec = 300;
-		do {
-			dwResult = MsgWaitForMultipleObjects( 0, NULL, FALSE, msec, QS_ALLEVENTS );
-		}
-		while ( dwResult == WAIT_TIMEOUT && NET_Sleep( 10 * 1000 ) );
-		//WaitMessage();
-		return;
-	}
-
-	// busy wait there because Sleep(0) will relinquish CPU - which is not what we want
-	//if ( msec == 0 )
-	//	return;
-
-	Sleep( msec );
-}
-
-
-/*
 ==============
 Sys_Mkdir
 ==============
 */
-qboolean Sys_Mkdir( const char *path )
+void Sys_Mkdir( const char *path )
 {
-	if ( _mkdir( path ) == 0 ) {
-		return qtrue;
-	} else {
-		if ( errno == EEXIST ) {
-			return qtrue;
-		} else {
-			return qfalse;
-		}
-	}
+	_mkdir( path );
 }
 
 
@@ -287,150 +250,190 @@ DIRECTORY SCANNING
 ==============================================================
 */
 
+void Sys_ListFilteredFiles( const char *basedir, const char *subdirs, const char *filter, char **list, int *numfiles ) {
+	char		search[MAX_OSPATH*2+1];
+	char		newsubdirs[MAX_OSPATH*2];
+	char		filename[MAX_OSPATH*2];
+	intptr_t	findhandle;
+	struct _finddata_t findinfo;
+
+	if ( *numfiles >= MAX_FOUND_FILES - 1 ) {
+		return;
+	}
+
+	if ( *subdirs ) {
+		Com_sprintf( search, sizeof(search), "%s\\%s\\*", basedir, subdirs );
+	}
+	else {
+		Com_sprintf( search, sizeof(search), "%s\\*", basedir );
+	}
+
+	findhandle = _findfirst (search, &findinfo);
+	if (findhandle == -1) {
+		return;
+	}
+
+	do {
+		if (findinfo.attrib & _A_SUBDIR) {
+			if ( !Q_streq( findinfo.name, "." ) && !Q_streq( findinfo.name, ".." ) ) {
+				if ( *subdirs ) {
+					Com_sprintf( newsubdirs, sizeof(newsubdirs), "%s\\%s", subdirs, findinfo.name );
+				} else {
+					Com_sprintf( newsubdirs, sizeof(newsubdirs), "%s", findinfo.name );
+				}
+				Sys_ListFilteredFiles( basedir, newsubdirs, filter, list, numfiles );
+			}
+		}
+		if ( *numfiles >= MAX_FOUND_FILES - 1 ) {
+			break;
+		}
+		Com_sprintf( filename, sizeof(filename), "%s\\%s", subdirs, findinfo.name );
+		if ( !Com_FilterPath( filter, filename ) )
+			continue;
+		list[ *numfiles ] = FS_CopyString( filename );
+		(*numfiles)++;
+	} while ( _findnext (findhandle, &findinfo) != -1 );
+
+	_findclose (findhandle);
+}
+
 
 /*
 =============
-Sys_ListExtFiles
+Sys_Sleep
 =============
 */
-static int Sys_ListExtFiles( const char *directory, const char *subdir, const char *extension, const char *filter, char **list, int maxfiles, int subdirs ) {
+void Sys_Sleep( int msec ) {
+	
+	if ( msec < 0 ) {
+		// special case: wait for event or network packet
+		DWORD dwResult;
+		msec = 300;
+		do {
+			dwResult = MsgWaitForMultipleObjects( 0, NULL, FALSE, msec, QS_ALLEVENTS );
+		} while ( dwResult == WAIT_TIMEOUT && NET_Sleep( 10 * 1000 ) );
+		//WaitMessage();
+		return;
+	}
+
+	// busy wait there because Sleep(0) will relinquish CPU - which is not what we want
+	if ( msec == 0 )
+		return;
+
+	Sleep ( msec );
+}
+
+
+/*
+=============
+Sys_ListFiles
+=============
+*/
+char **Sys_ListFiles( const char *directory, const char *extension, const char *filter, int *numfiles, qboolean wantsubs ) {
 	char		search[MAX_OSPATH*2+MAX_QPATH+1];
-	char		filename[MAX_OSPATH * 2];
 	int			nfiles;
+	char		**listCopy;
+	char		*list[MAX_FOUND_FILES];
 	struct _finddata_t findinfo;
 	intptr_t	findhandle;
 	int			flag;
 	int			extLen;
+	int			length;
+	int			i;
 	const char	*x;
 	qboolean	hasPatterns;
 
+	if ( filter ) {
+
+		nfiles = 0;
+		Sys_ListFilteredFiles( directory, "", filter, list, &nfiles );
+
+		list[ nfiles ] = NULL;
+		*numfiles = nfiles;
+
+		if (!nfiles)
+			return NULL;
+
+		listCopy = Z_Malloc( ( nfiles + 1 ) * sizeof( listCopy[0] ) );
+		for ( i = 0 ; i < nfiles ; i++ ) {
+			listCopy[i] = list[i];
+		}
+		listCopy[i] = NULL;
+
+		return listCopy;
+	}
+
+	if ( !extension ) {
+		extension = "";
+	}
+
 	// passing a slash as extension will find directories
-	if ( extension[0] == '/' && extension[1] == '\0' ) {
+	if ( extension[0] == '/' && extension[1] == 0 ) {
 		extension = "";
 		flag = 0;
 	} else {
 		flag = _A_SUBDIR;
 	}
 
+	Com_sprintf( search, sizeof(search), "%s\\*%s", directory, extension );
+
+	findhandle = _findfirst( search, &findinfo );
+	if ( findhandle == -1 ) {
+		*numfiles = 0;
+		return NULL;
+	}
+
 	extLen = (int)strlen( extension );
-	hasPatterns = Com_HasPatterns( extension ); // contains either '?' or '*'
+	hasPatterns = Com_HasPatterns( extension );
 	if ( hasPatterns && extension[0] == '.' && extension[1] != '\0' ) {
 		extension++;
 	}
 
+	// search
 	nfiles = 0;
 
-	if ( *subdir != '\0' ) {
-		Com_sprintf( search, sizeof( search ), "%s\\%s\\*", directory, subdir );
-	} else {
-		Com_sprintf( search, sizeof( search ), "%s\\*", directory );
-	}
-
-	if ( subdirs > 0 ) {
-		// handle recursion
-		findhandle = _findfirst( search, &findinfo );
-		if ( findhandle != -1 ) {
-			do {
-				if ( findinfo.attrib & _A_SUBDIR ) {
-					if ( !Q_streq( findinfo.name, "." ) && !Q_streq( findinfo.name, ".." ) ) {
-						char subdir2[MAX_OSPATH * 2 + MAX_QPATH + 1];
-						if ( *subdir != '\0' ) {
-							Com_sprintf( subdir2, sizeof( subdir2 ), "%s\\%s", subdir, findinfo.name );
-						} else {
-							Q_strncpyz( subdir2, findinfo.name, sizeof( subdir2 ) );
-						}
-						if ( nfiles >= maxfiles ) {
-							break;
-						}
-						nfiles += Sys_ListExtFiles( directory, subdir2, extension, filter, list + nfiles, maxfiles - nfiles, subdirs - 1);
-					}
-				}
-			} while ( _findnext( findhandle, &findinfo ) == 0 );
-		}
-		_findclose( findhandle );
-	}
-
-	Q_strcat( search, sizeof( search ), extension );
-
-	findhandle = _findfirst( search, &findinfo );
-	if ( findhandle == -1 ) {
-		return nfiles;
-	}
-
 	do {
-		if ( flag ^ ( findinfo.attrib & _A_SUBDIR ) ) {
-			if ( *subdir != '\0' ) {
-				Com_sprintf( filename, sizeof( filename ), "%s\\%s", subdir, findinfo.name );
-			} else {
-				Q_strncpyz( filename, findinfo.name, sizeof( filename ) );
+		if ( (!wantsubs && flag ^ ( findinfo.attrib & _A_SUBDIR )) || (wantsubs && findinfo.attrib & _A_SUBDIR) ) {
+			if ( nfiles == MAX_FOUND_FILES - 1 ) {
+				break;
 			}
-			if ( filter != NULL && *filter != '\0' ) {
-				if ( !Com_FilterPath( filter, filename ) ) {
-					continue;
-				}
-			} else if ( *extension != '\0' ) {
+			if ( *extension ) {
 				if ( hasPatterns ) {
 					x = strrchr( findinfo.name, '.' );
-					if ( x == NULL || !Com_FilterExt( extension, x + 1 ) ) {
+					if ( !x || !Com_FilterExt( extension, x+1 ) ) {
 						continue;
 					}
 				} else {
-					// check for exact extension
-					const int length = strlen( findinfo.name );
+					length = strlen( findinfo.name );
 					if ( length < extLen || Q_stricmp( findinfo.name + length - extLen, extension ) ) {
 						continue;
 					}
 				}
 			}
-			if ( nfiles >= maxfiles ) {
-				break;
-			}
-			list[ nfiles++ ] = FS_CopyString( filename );
+			list[ nfiles ] = FS_CopyString( findinfo.name );
+			nfiles++;
 		}
-	} while ( _findnext( findhandle, &findinfo ) == 0 );
+	} while ( _findnext (findhandle, &findinfo) != -1 );
 
-	_findclose( findhandle );
+	list[ nfiles ] = NULL;
 
-	return nfiles;
+	_findclose (findhandle);
 
-}
+	// return a copy of the list
+	*numfiles = nfiles;
 
-char** Sys_ListFiles( const char *directory, const char *extension, const char *filter, int *numfiles, int subdirs )
-{
-	char** listCopy;
-	char* list[MAX_FOUND_FILES];
-	int		i, nfiles;
-
-	if ( extension == NULL ) {
-		extension = "";
+	if ( !nfiles ) {
+		return NULL;
 	}
 
-	nfiles = Sys_ListExtFiles( directory, "", extension, filter, list, ARRAY_LEN( list ), subdirs );
-
-	// copy list from stack, reserve extra space for NULL
-	listCopy = Z_Malloc( (nfiles + 1) * sizeof( listCopy[0] ) );
-	for ( i = 0; i < nfiles; i++ ) {
+	listCopy = Z_Malloc( ( nfiles + 1 ) * sizeof( listCopy[0] ) );
+	for ( i = 0 ; i < nfiles ; i++ ) {
 		listCopy[i] = list[i];
 	}
 	listCopy[i] = NULL;
 
-	if ( nfiles > 1 ) {
-		Com_SortList( listCopy, nfiles - 1 );
-		if ( nfiles > 2 ) {
-			if ( Q_streq( listCopy[0], "." ) && Q_streq( listCopy[1], ".." ) ) {
-				// emulate old strgtr() function sort behavior for special entries
-				char* dot1 = listCopy[0];
-				char* dot2 = listCopy[1];
-				for ( i = 0; i < nfiles - 2; i++ ) {
-					listCopy[i] = listCopy[i + 2];
-				}
-				listCopy[nfiles - 2] = dot1;
-				listCopy[nfiles - 1] = dot2;
-			}
-		}
-	}
+	Com_SortFileList( listCopy, nfiles, extension[0] != '\0' );
 
-	*numfiles = nfiles;
 	return listCopy;
 }
 
@@ -620,6 +623,14 @@ are initialized
 ================
 */
 void Sys_Init( void ) {
+#ifdef USE_SENTRY
+    sentry_options_t *options = sentry_options_new();
+    sentry_options_set_dsn(options, "https://7c897904b5194675a86f4263fe5fb8eb@o479973.ingest.sentry.io/5525876");
+    sentry_options_set_release(options, SVN_VERSION);
+    sentry_init(options);
+
+//	sentry_capture_event(sentry_value_new_message_event(SENTRY_LEVEL_DEBUG, "Sys_Init", "Client Launched"));
+#endif
 
 	// make sure the timer is high precision, otherwise
 	// NT gets 18ms resolution
@@ -639,7 +650,7 @@ SetDPIAwareness
 ==================
 */
 #if 0
-static void SetDPIAwareness( void ) 
+static void SetDPIAwareness( void )
 {
 	typedef HANDLE (WINAPI *pfnSetThreadDpiAwarenessContext)( HANDLE dpiContext );
 	typedef HRESULT (WINAPI *pfnSetProcessDpiAwareness)( int value );
@@ -713,58 +724,37 @@ static LONG WINAPI ExceptionFilter( struct _EXCEPTION_POINTERS *ExceptionInfo )
 		if ( com_cl_running  && com_cl_running->integer ) {
 			// assume we can restart client module
 		} else {
-			GLW_RestoreGamma();
-			GLW_HideFullscreenWindow();
+			if ( glw_state.gammaSet )
+				GLW_RestoreGamma();
+
+			if ( g_wv.hWnd && glw_state.cdsFullscreen )
+				ShowWindow( g_wv.hWnd, SW_HIDE );
 		}
 	}
 #endif
 
 	if ( ExceptionInfo->ExceptionRecord->ExceptionCode != EXCEPTION_BREAKPOINT )
 	{
-		char msg[128], name[MAX_OSPATH];
-		const char *basename;
-		HMODULE hModule, hKernel32;
-		byte *addr;
+		char msg[128];
+		byte *addr, *base;
+		qboolean vma;
 
-		hModule = NULL;
-		name[0] = '\0';
-		basename = name;
 		addr = (byte*)ExceptionInfo->ExceptionRecord->ExceptionAddress;
+		base = (byte*)GetModuleHandle( NULL );
 
-		hKernel32 = GetModuleHandleA( "kernel32" );
-		if ( hKernel32 != NULL ) {
-			typedef BOOL (WINAPI *PFN_GetModuleHandleExA)( DWORD dwFlags, LPCSTR lpModuleName, HMODULE *phModule );
-			PFN_GetModuleHandleExA pGetModuleHandleExA;
-
-			pGetModuleHandleExA = (PFN_GetModuleHandleExA) GetProcAddress( hKernel32, "GetModuleHandleExA" );
-			if ( pGetModuleHandleExA != NULL ) {
-				if ( pGetModuleHandleExA( GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCTSTR)addr, &hModule ) ) {
-					if (GetModuleFileNameA( hModule, name, ARRAY_LEN(name) - 1) != 0 ) {
-						name[ARRAY_LEN(name) - 1] = '\0';
-						basename = strrchr( name, '\\' );
-						if ( basename ) {
-							basename = basename + 1;
-						}
-						else {
-							basename = strrchr( name, '/' );
-							if ( basename ) {
-								basename = basename + 1;
-							}
-						}
-					}
-				}
-			}
+		if ( addr >= base )
+		{
+			addr = (byte*)(addr - base);
+			vma = qtrue;
+		}
+		else
+		{
+			vma = qfalse;
 		}
 
-		if ( basename && *basename ) {
-			Com_sprintf( msg, sizeof( msg ), "Exception Code: %s\nException Address: %s@%x",
-				GetExceptionName( ExceptionInfo->ExceptionRecord->ExceptionCode ),
-				basename, (uint32_t)(addr - (byte*)hModule) );
-		} else {
-			Com_sprintf( msg, sizeof( msg ), "Exception Code: %s\nException Address: %p",
-				GetExceptionName( ExceptionInfo->ExceptionRecord->ExceptionCode ),
-				addr );
-		}
+		sprintf( msg, "Exception Code: %s\nException Address: %p%s",
+			GetExceptionName( ExceptionInfo->ExceptionRecord->ExceptionCode ),
+			addr, vma ? " (VMA)" : "" );
 
 		Com_Error( ERR_DROP, "Unhandled exception caught\n%s", msg );
 	}
@@ -814,7 +804,13 @@ int WINAPI WinMain( HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLin
 
 	SetUnhandledExceptionFilter( ExceptionFilter );
 
+	// get the initial time base
+	Sys_Milliseconds();
+
 	Com_Init( sys_cmdline );
+	NET_Init();
+
+	Com_Printf( "Working directory: %s\n", Sys_Pwd() );
 
 	// hide the early console since we've reached the point where we
 	// have a working graphics subsystems
@@ -823,7 +819,7 @@ int WINAPI WinMain( HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLin
 	}
 
 	// main game loop
-	while ( 1 ) {
+	while( 1 ) {
 		// set low precision every frame, because some system calls
 		// reset it arbitrarily
 		// _controlfp( _PC_24, _MCW_PC );

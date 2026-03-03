@@ -40,7 +40,7 @@ When a key event issues a button command (+forward, +attack, etc), it appends
 its key number as argv(1) so it can be matched up with the release.
 
 argv(2) will be set to the time the event happened, which allows exact
-control even at low framerates when the down and up events may both get queued
+control even at low framerates when the down and up events may both get qued
 at the same time.
 
 ===============================================================================
@@ -639,7 +639,7 @@ CL_CreateNewCommands
 Create a new usercmd_t structure for this frame
 =================
 */
-static void CL_CreateNewCommands( void ) {
+void CL_CreateNewCommands( void ) {
 	int			cmdNum;
 
 	// no need to create usercmds until we have a gamestate
@@ -690,9 +690,12 @@ static qboolean CL_ReadyToSendPacket( void ) {
 		return qfalse;
 	}
 
-	// If we are downloading, we send no less than 50ms between packets
-	if ( *clc.downloadTempName && cls.realtime - clc.lastPacketSentTime < 50 ) {
-		return qfalse;
+	// If we are downloading, throttle packet rate to avoid flooding
+	{
+		int throttleMs = ( cl_adaptiveTiming->integer && cl.snapshotMsec > 0 ) ? cl.snapshotMsec : 50;
+		if ( *clc.downloadTempName && cls.realtime - clc.lastPacketSentTime < throttleMs ) {
+			return qfalse;
+		}
 	}
 
 	// if we don't have a valid gamestate yet, only send
@@ -746,7 +749,7 @@ During normal gameplay, a client packet will contain something like:
 
 ===================
 */
-void CL_WritePacket( int repeat ) {
+void CL_WritePacket( void ) {
 	msg_t		buf;
 	byte		data[ MAX_MSGLEN_BUF ];
 	int			i, j, n;
@@ -804,10 +807,11 @@ void CL_WritePacket( int repeat ) {
 		}
 
 		// begin a client move command
-		if ( cl_nodelta->integer || !cl.snap.valid || clc.demowaiting || clc.serverMessageSequence != cl.snap.messageNum ) {
-			MSG_WriteByte( &buf, clc_moveNoDelta );
+		if ( cl_nodelta->integer || !cl.snap.valid || clc.demowaiting
+			|| clc.serverMessageSequence != cl.snap.messageNum ) {
+			MSG_WriteByte (&buf, clc_moveNoDelta);
 		} else {
-			MSG_WriteByte( &buf, clc_move );
+			MSG_WriteByte (&buf, clc_move);
 		}
 
 		// write the command count
@@ -842,21 +846,8 @@ void CL_WritePacket( int repeat ) {
 		Com_Printf( "%i ", buf.cursize );
 	}
 
-	MSG_WriteByte( &buf, clc_EOF );
-
-	if ( buf.overflowed ) {
-		if ( cls.state >= CA_CONNECTED && cls.state != CA_CINEMATIC ) {
-			cls.state = CA_CONNECTING; // to avoid recursive error
-		}
-		Com_Error( ERR_DROP, "%s: message overflowed", __func__ );
-	}
-
-	if ( repeat == 0 || clc.netchan.remoteAddress.type == NA_LOOPBACK ) {
-		CL_Netchan_Transmit( &clc.netchan, &buf );
-	} else {
-		CL_Netchan_Enqueue( &clc.netchan, &buf, repeat + 1 );
-		NET_FlushPacketQueue( 0 );
-	}
+	CL_Netchan_Transmit( &clc.netchan, &buf );
+	SCR_NetMonitorAddOutgoing( buf.cursize );
 }
 
 
@@ -889,7 +880,7 @@ void CL_SendCmd( void ) {
 		return;
 	}
 
-	CL_WritePacket( 0 );
+	CL_WritePacket();
 }
 
 
@@ -899,135 +890,163 @@ CL_InitInput
 ============
 */
 void CL_InitInput( void ) {
-	Cmd_AddCommand ("centerview",IN_CenterView);
-
-	Cmd_AddCommand ("+moveup",IN_UpDown);
-	Cmd_AddCommand ("-moveup",IN_UpUp);
-	Cmd_AddCommand ("+movedown",IN_DownDown);
-	Cmd_AddCommand ("-movedown",IN_DownUp);
-	Cmd_AddCommand ("+left",IN_LeftDown);
-	Cmd_AddCommand ("-left",IN_LeftUp);
-	Cmd_AddCommand ("+right",IN_RightDown);
-	Cmd_AddCommand ("-right",IN_RightUp);
-	Cmd_AddCommand ("+forward",IN_ForwardDown);
-	Cmd_AddCommand ("-forward",IN_ForwardUp);
-	Cmd_AddCommand ("+back",IN_BackDown);
-	Cmd_AddCommand ("-back",IN_BackUp);
-	Cmd_AddCommand ("+lookup", IN_LookupDown);
-	Cmd_AddCommand ("-lookup", IN_LookupUp);
-	Cmd_AddCommand ("+lookdown", IN_LookdownDown);
-	Cmd_AddCommand ("-lookdown", IN_LookdownUp);
-	Cmd_AddCommand ("+strafe", IN_StrafeDown);
-	Cmd_AddCommand ("-strafe", IN_StrafeUp);
-	Cmd_AddCommand ("+moveleft", IN_MoveleftDown);
-	Cmd_AddCommand ("-moveleft", IN_MoveleftUp);
-	Cmd_AddCommand ("+moveright", IN_MoverightDown);
-	Cmd_AddCommand ("-moveright", IN_MoverightUp);
-	Cmd_AddCommand ("+speed", IN_SpeedDown);
-	Cmd_AddCommand ("-speed", IN_SpeedUp);
-	Cmd_AddCommand ("+attack", IN_Button0Down);
-	Cmd_AddCommand ("-attack", IN_Button0Up);
-	Cmd_AddCommand ("+button0", IN_Button0Down);
-	Cmd_AddCommand ("-button0", IN_Button0Up);
-	Cmd_AddCommand ("+button1", IN_Button1Down);
-	Cmd_AddCommand ("-button1", IN_Button1Up);
-	Cmd_AddCommand ("+button2", IN_Button2Down);
-	Cmd_AddCommand ("-button2", IN_Button2Up);
-	Cmd_AddCommand ("+button3", IN_Button3Down);
-	Cmd_AddCommand ("-button3", IN_Button3Up);
-	Cmd_AddCommand ("+button4", IN_Button4Down);
-	Cmd_AddCommand ("-button4", IN_Button4Up);
-	Cmd_AddCommand ("+button5", IN_Button5Down);
-	Cmd_AddCommand ("-button5", IN_Button5Up);
-	Cmd_AddCommand ("+button6", IN_Button6Down);
-	Cmd_AddCommand ("-button6", IN_Button6Up);
-	Cmd_AddCommand ("+button7", IN_Button7Down);
-	Cmd_AddCommand ("-button7", IN_Button7Up);
-	Cmd_AddCommand ("+button8", IN_Button8Down);
-	Cmd_AddCommand ("-button8", IN_Button8Up);
-	Cmd_AddCommand ("+button9", IN_Button9Down);
-	Cmd_AddCommand ("-button9", IN_Button9Up);
-	Cmd_AddCommand ("+button10", IN_Button10Down);
-	Cmd_AddCommand ("-button10", IN_Button10Up);
-	Cmd_AddCommand ("+button11", IN_Button11Down);
-	Cmd_AddCommand ("-button11", IN_Button11Up);
-	Cmd_AddCommand ("+button12", IN_Button12Down);
-	Cmd_AddCommand ("-button12", IN_Button12Up);
-	Cmd_AddCommand ("+button13", IN_Button13Down);
-	Cmd_AddCommand ("-button13", IN_Button13Up);
-	Cmd_AddCommand ("+button14", IN_Button14Down);
-	Cmd_AddCommand ("-button14", IN_Button14Up);
-	Cmd_AddCommand ("+button15", IN_Button15Down);
-	Cmd_AddCommand ("-button15", IN_Button15Up);
-	Cmd_AddCommand ("+mlook", IN_MLookDown);
+    Cmd_AddCommand ("centerview",IN_CenterView);
+    Cmd_SetDescription("centerview", "Quickly move current view to the center of screen\nUsage: bind <key> centerview");
+    Cmd_AddCommand ("+moveup",IN_UpDown);
+    Cmd_SetDescription("+moveup", "Start moving up (jump, climb up, swim up)\nUsage: bind <key> +moveup");
+    Cmd_AddCommand ("-moveup",IN_UpUp);
+    Cmd_AddCommand ("+movedown",IN_DownDown);
+    Cmd_SetDescription("+movedown", "Start moving down (crouch, climb down, swim down)\nUsage: bind <key> +movedown");
+    Cmd_AddCommand ("-movedown",IN_DownUp);
+    Cmd_AddCommand ("+left",IN_LeftDown);
+    Cmd_SetDescription("+left", "Start turning left\nUsage: bind <key> +left");
+    Cmd_AddCommand ("-left",IN_LeftUp);
+    Cmd_AddCommand ("+right",IN_RightDown);
+    Cmd_SetDescription("+right", "Start turning right\nUsage: bind <key> +right");
+    Cmd_AddCommand ("-right",IN_RightUp);
+    Cmd_AddCommand ("+forward",IN_ForwardDown);
+    Cmd_SetDescription("+forward", "Start moving forward\nUsage: bind <key> +forward");
+    Cmd_AddCommand ("-forward",IN_ForwardUp);
+    Cmd_AddCommand ("+back",IN_BackDown);
+    Cmd_SetDescription("+back", "Start moving backwards\nUsage: bind <key> +back");
+    Cmd_AddCommand ("-back",IN_BackUp);
+    Cmd_AddCommand ("+lookup", IN_LookupDown);
+    Cmd_SetDescription("+lookup", "Start looking up\nUsage: bind <key> +lookup");
+    Cmd_AddCommand ("-lookup", IN_LookupUp);
+    Cmd_AddCommand ("+lookdown", IN_LookdownDown);
+    Cmd_SetDescription("+lookdown", "Start looking down\nUsage: bind <key> +lookdown");
+    Cmd_AddCommand ("-lookdown", IN_LookdownUp);
+    Cmd_AddCommand ("+strafe", IN_StrafeDown);
+    Cmd_SetDescription("+strafe", "Start changing directional movement into strafing movement\nUsage: bind <key> +strafe");
+    Cmd_AddCommand ("-strafe", IN_StrafeUp);
+    Cmd_AddCommand ("+moveleft", IN_MoveleftDown);
+    Cmd_SetDescription("+moveleft", "Start strafing to the left\nUsage: bind <key> +moveleft");
+    Cmd_AddCommand ("-moveleft", IN_MoveleftUp);
+    Cmd_AddCommand ("+moveright", IN_MoverightDown);
+    Cmd_SetDescription("+moveright", "Start strafing to the right\nUsage: bind <key> +moveright");
+    Cmd_AddCommand ("-moveright", IN_MoverightUp);
+    Cmd_AddCommand ("+speed", IN_SpeedDown);
+    Cmd_SetDescription("+speed", "Speed toggle bound to shift key by default toggles run/walk\nUsage: bind <key> +speed");
+    Cmd_AddCommand ("-speed", IN_SpeedUp);
+    Cmd_AddCommand ("+attack", IN_Button0Down);
+    Cmd_SetDescription("+attack", "Start attacking (shooting, punching)\nUsage: bind <key> +attack");
+    Cmd_AddCommand ("-attack", IN_Button0Up);
+    Cmd_AddCommand ("+button0", IN_Button0Down);
+    Cmd_SetDescription("+button0", "Start firing same as mouse button 1 (fires weapon)\nUsage: bind <key> +button0");
+    Cmd_AddCommand ("-button0", IN_Button0Up);
+    Cmd_AddCommand ("+button1", IN_Button1Down);
+    Cmd_SetDescription("+button1", "Start displaying chat bubble\nUsage: bind <key> +button1");
+    Cmd_AddCommand ("-button1", IN_Button1Up);
+    Cmd_AddCommand ("+button2", IN_Button2Down);
+    Cmd_SetDescription("+button2", "Start using items (same as enter)\nUsage: bind <key> +button2");
+    Cmd_AddCommand ("-button2", IN_Button2Up);
+    Cmd_AddCommand ("+button3", IN_Button3Down);
+    Cmd_SetDescription("+button3", "Start player taunt animation\nUsage: bind <key> +button3");
+    Cmd_AddCommand ("-button3", IN_Button3Up);
+    Cmd_AddCommand ("+button4", IN_Button4Down);
+    Cmd_SetDescription("+button4", "Fixed +button4 not causing footsteps\nUsage: bind <key> +button4");
+    Cmd_AddCommand ("-button4", IN_Button4Up);
+    Cmd_AddCommand ("+button5", IN_Button5Down);
+    Cmd_SetDescription("+button5", "Used for MODS also used by Team Arena Mission Pack\nUsage: bind <key> +button5");
+    Cmd_AddCommand ("-button5", IN_Button5Up);
+    Cmd_AddCommand ("+button6", IN_Button6Down);
+    Cmd_SetDescription("+button6", "Used for MODS also used by Team Arena Mission Pack\nUsage: bind <key> +button6");
+    Cmd_AddCommand ("-button6", IN_Button6Up);
+    Cmd_AddCommand ("+button7", IN_Button7Down);
+    Cmd_SetDescription("+button7", "Start hand signal, player model looks like it's motioning to team \"move forward\"\nUsage: bind <key> +button7");
+    Cmd_AddCommand ("-button7", IN_Button7Up);
+    Cmd_AddCommand ("+button8", IN_Button8Down);
+    Cmd_SetDescription("+button8", "Start hand signal, player model looks like it's motioning to team \"come here\"\nUsage: bind <key> +button8");
+    Cmd_AddCommand ("-button8", IN_Button8Up);
+    Cmd_AddCommand ("+button9", IN_Button9Down);
+    Cmd_SetDescription("+button9", "Stop hand signal, player model looks like it's motioning to team \"come to my left side\"\nUsage: bind <key> +button9");
+    Cmd_AddCommand ("-button9", IN_Button9Up);
+    Cmd_AddCommand ("+button10", IN_Button10Down);
+    Cmd_SetDescription("+button10", "Start hand signal, player model looks like it's motioning to team \"come to my right side\"\nUsage: bind <key> +button10");
+    Cmd_AddCommand ("-button10", IN_Button10Up);
+    Cmd_AddCommand ("+button11", IN_Button11Down);
+    Cmd_AddCommand ("-button11", IN_Button11Up);
+    Cmd_AddCommand ("+button12", IN_Button12Down);
+    Cmd_AddCommand ("-button12", IN_Button12Up);
+    Cmd_AddCommand ("+button13", IN_Button13Down);
+    Cmd_AddCommand ("-button13", IN_Button13Up);
+    Cmd_AddCommand ("+button14", IN_Button14Down);
+    Cmd_AddCommand ("-button14", IN_Button14Up);
+    Cmd_AddCommand ("+button15", IN_Button15Down);
+    Cmd_AddCommand ("-button15", IN_Button15Up);
+    Cmd_AddCommand ("+mlook", IN_MLookDown);
+    Cmd_SetDescription("+mlook", "Start using mouse movements to control head movement\nUsage: bind <key> +mlook");
 	Cmd_AddCommand ("-mlook", IN_MLookUp);
 
+    cl_nodelta = Cvar_Get( "cl_nodelta", "0", 0 );
+    Cvar_SetDescription( cl_nodelta, "Disable delta compression (slows net performance, not recommended)\nDefault: 0" );
+    cl_debugMove = Cvar_Get( "cl_debugMove", "0", 0 );
+    Cvar_SetDescription( cl_debugMove, "Used for debugging movement, shown in debug graph\nDefault: 0" );
 	cl_nodelta = Cvar_Get( "cl_nodelta", "0", CVAR_DEVELOPER );
-	Cvar_SetDescription( cl_nodelta, "Flag server to disable delta compression on server snapshots." );
 	cl_debugMove = Cvar_Get( "cl_debugMove", "0", 0 );
 	Cvar_CheckRange( cl_debugMove, "0", "2", CV_INTEGER );
-	Cvar_SetDescription( cl_debugMove, "Prints a graph of view angle deltas.\n 0: Disabled\n 1: Yaw\n 2: Pitch" );
 
-	cl_showSend = Cvar_Get( "cl_showSend", "0", CVAR_TEMP );
-	Cvar_SetDescription( cl_showSend, "Prints client to server packet information." );
+    cl_showSend = Cvar_Get( "cl_showSend", "0", CVAR_TEMP );
+    Cvar_SetDescription( cl_showSend, "Show network packets as they are sent\nDefault: 0" );
 
-	cl_yawspeed = Cvar_Get( "cl_yawspeed", "140", CVAR_ARCHIVE_ND );
-	Cvar_SetDescription( cl_yawspeed, "Side-to-side turning speed using keys (+left and +right)." );
-	cl_pitchspeed = Cvar_Get( "cl_pitchspeed", "140", CVAR_ARCHIVE_ND );
-	Cvar_SetDescription( cl_pitchspeed, "Up and down pitching speed using keys (+lookup and +lookdown)." );
-	cl_anglespeedkey = Cvar_Get( "cl_anglespeedkey", "1.5", 0 );
-	Cvar_SetDescription( cl_anglespeedkey, "Set the speed that the direction keys (not mouse) change the view angle." );
+    cl_yawspeed = Cvar_Get( "cl_yawspeed", "140", CVAR_ARCHIVE_ND );
+    Cvar_SetDescription( cl_yawspeed, "Set the yaw rate when +left and/or +right are active\nDefault: 140" );
+    cl_pitchspeed = Cvar_Get( "cl_pitchspeed", "140", CVAR_ARCHIVE_ND );
+    Cvar_SetDescription( cl_pitchspeed, "Set the pitch rate when +lookup and/or +lookdown are active\nDefault: 140" );
+    cl_anglespeedkey = Cvar_Get( "cl_anglespeedkey", "1.5", 0 );
+    Cvar_SetDescription( cl_anglespeedkey, "Set the speed that the direction keys (not mouse) change the view angle\nDefault: 1.5" );
 
-	cl_maxpackets = Cvar_Get ("cl_maxpackets", "125", CVAR_ARCHIVE );
-	Cvar_CheckRange( cl_maxpackets, "15", "125", CV_INTEGER );
-	Cvar_SetDescription( cl_maxpackets, "Set how many client packets are sent to the server per second, can't exceed \\com_maxFPS." );
-	cl_packetdup = Cvar_Get( "cl_packetdup", "1", CVAR_ARCHIVE_ND );
-	Cvar_CheckRange( cl_packetdup, "0", "5", CV_INTEGER );
-	Cvar_SetDescription( cl_packetdup, "Limits the number of previous client commands added in packet, helps in packet loss mitigation, increases client command packets size a bit." );
+    cl_maxpackets = Cvar_Get ("cl_maxpackets", "60", CVAR_ARCHIVE );
+    Cvar_CheckRange( cl_maxpackets, "15", "125", CV_INTEGER );
+    Cvar_SetDescription(cl_maxpackets, "Set the transmission packet size or how many packets are sent to client\nDefault: 60");
+    cl_packetdup = Cvar_Get( "cl_packetdup", "1", CVAR_ARCHIVE_ND );
+    Cvar_CheckRange( cl_packetdup, "0", "5", CV_INTEGER );
+    Cvar_SetDescription(cl_packetdup, "How many times should a packet try to resend to the server\nDefault: 1");
 
-	cl_run = Cvar_Get( "cl_run", "1", CVAR_ARCHIVE_ND );
-	Cvar_SetDescription( cl_run, "Persistent player running movement." );
-	cl_sensitivity = Cvar_Get( "sensitivity", "5", CVAR_ARCHIVE );
-	Cvar_SetDescription( cl_sensitivity, "Sets base mouse sensitivity (mouse speed)." );
-	cl_mouseAccel = Cvar_Get( "cl_mouseAccel", "0", CVAR_ARCHIVE_ND );
-	Cvar_SetDescription( cl_mouseAccel, "Toggle the use of mouse acceleration the mouse speeds up or becomes more sensitive as it continues in one direction." );
-	cl_freelook = Cvar_Get( "cl_freelook", "1", CVAR_ARCHIVE_ND );
-	Cvar_SetDescription( cl_freelook, "Allow pitching or up/down look with mouse." );
+    cl_run = Cvar_Get( "cl_run", "1", CVAR_ARCHIVE_ND );
+    Cvar_SetDescription(cl_run, "Default to player running instead of walking\nDefault: 1");
+    cl_sensitivity = Cvar_Get( "sensitivity", "5", CVAR_ARCHIVE );
+    Cvar_SetDescription(cl_sensitivity, "Set how far your mouse moves in relation to travel on the mouse pad\nDefault: 5");
+    cl_mouseAccel = Cvar_Get( "cl_mouseAccel", "0", CVAR_ARCHIVE_ND );
+    Cvar_SetDescription( cl_mouseAccel, "Toggle the use of mouse acceleration\nDefault: 0");
+    cl_freelook = Cvar_Get( "cl_freelook", "1", CVAR_ARCHIVE_ND );
+    Cvar_SetDescription( cl_freelook, "Toggle the use of freelook with the mouse, looking up or down\nDefault: 1");
 
 	// 0: legacy mouse acceleration
 	// 1: new implementation
 	cl_mouseAccelStyle = Cvar_Get( "cl_mouseAccelStyle", "0", CVAR_ARCHIVE_ND );
-	Cvar_SetDescription( cl_mouseAccelStyle, "Choose between two different mouse acceleration styles." );
-	// offset for the power function (for style 1, ignored otherwise)
+    Cvar_SetDescription( cl_mouseAccelStyle, "Change the style of mouse acceleration in a given direction\n1 - the mouse speeds up\n2 - becomes more sensitive as it continues in one direction\nDefault 0");
+    // offset for the power function (for style 1, ignored otherwise)
 	// this should be set to the max rate value
 	cl_mouseAccelOffset = Cvar_Get( "cl_mouseAccelOffset", "5", CVAR_ARCHIVE_ND );
 	Cvar_CheckRange( cl_mouseAccelOffset, "0.001", "50000", CV_FLOAT );
-	Cvar_SetDescription( cl_mouseAccelOffset, "Sets how much base mouse delta will be doubled by acceleration. Requires 'cl_mouseAccelStyle 1'." );
+    Cvar_SetDescription(cl_mouseAccelOffset, "Mouse acceleration amplifier\nDefault: 0.001");
 
-	cl_showMouseRate = Cvar_Get( "cl_showMouseRate", "0", 0 );
-	Cvar_SetDescription( cl_showMouseRate, "Prints mouse acceleration info when 'cl_mouseAccel' has a value set (rate of mouse samples per frame)." );
+    cl_showMouseRate = Cvar_Get ("cl_showmouserate", "0", 0);
+    Cvar_SetDescription(cl_showMouseRate, "Show the mouse rate of mouse samples per frame\nDefault: 0");
 
-	m_pitch = Cvar_Get( "m_pitch", "0.022", CVAR_ARCHIVE_ND );
-	Cvar_SetDescription( m_pitch, "Set the up and down movement distance of the player in relation to how much the mouse moves." );
-	m_yaw = Cvar_Get( "m_yaw", "0.022", CVAR_ARCHIVE_ND );
-	Cvar_SetDescription( m_yaw, "Set the speed at which the player's screen moves left and right while using the mouse." );
-	m_forward = Cvar_Get( "m_forward", "0.25", CVAR_ARCHIVE_ND );
-	Cvar_SetDescription( m_forward, "Set the back and forth movement distance of the player in relation to how much the mouse moves." );
-	m_side = Cvar_Get( "m_side", "0.25", CVAR_ARCHIVE_ND );
-	Cvar_SetDescription( m_side, "Set the strafe movement distance of the player in relation to how much the mouse moves." );
+    m_pitch = Cvar_Get( "m_pitch", "0.022", CVAR_ARCHIVE_ND );
+    Cvar_SetDescription(m_pitch, "Set the up and down movement distance of the player in relation to how much the mouse moves\nDefault: 0.022");
+    m_yaw = Cvar_Get( "m_yaw", "0.022", CVAR_ARCHIVE_ND );
+    Cvar_SetDescription(m_yaw, "Set the speed at which the player's screen moves left and right while using the mouse\nDefault: 0.022");
+    m_forward = Cvar_Get( "m_forward", "0.25", CVAR_ARCHIVE_ND );
+    Cvar_SetDescription(m_forward, "Set the up and down movement distance of the player in relation to how much the mouse moves\nDefault: 0.25");
+    m_side = Cvar_Get( "m_side", "0.25", CVAR_ARCHIVE_ND );
+    Cvar_SetDescription( m_side, "Set the strafe movement distance of the player in relation to how much the mouse moves\nDefault: 0.25");
 #ifdef MACOS_X
 	// Input is jittery on OS X w/o this
 	m_filter = Cvar_Get( "m_filter", "1", CVAR_ARCHIVE_ND );
+    Cvar_SetDescription( m_filter, "Toggle use of mouse smoothing\nDefault: 1");
 #else
 	m_filter = Cvar_Get( "m_filter", "0", CVAR_ARCHIVE_ND );
+    Cvar_SetDescription( m_filter, "Toggle use of mouse smoothing\nDefault: 0");
 #endif
-	Cvar_SetDescription( m_filter, "Toggle use of mouse 'smoothing'." );
 }
 
 
 /*
 ============
-CL_ClearInput
+CL_InitInput
 ============
 */
 void CL_ClearInput( void ) {

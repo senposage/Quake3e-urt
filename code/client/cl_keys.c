@@ -423,6 +423,9 @@ static void Console_Key( int key ) {
 		// copy line to history buffer
 		Con_SaveField( &g_consoleField );
 
+		/* log the command to the net debug session log (if cl_netlog > 0) */
+		SCR_LogConsoleInput( g_consoleField.buffer );
+
 		Field_Clear( &g_consoleField );
 		g_consoleField.widthInChars = g_console_field_width;
 
@@ -486,6 +489,18 @@ static void Console_Key( int key ) {
 		return;
 	}
 
+	// shift-right, console tabs: next tab
+	if ((key == K_RIGHTARROW && keys[K_SHIFT].down) || (key == K_MOUSE2)) {
+		Con_NextTab();
+		return;
+	}
+
+	// shift-left, console tabs: previous tab
+	if ((key == K_LEFTARROW && keys[K_SHIFT].down) || (key == K_MOUSE1)) {
+		Con_PrevTab();
+		return;
+	}
+
 	// pass to the normal editline routine
 	Field_KeyDownEvent( &g_consoleField, key );
 }
@@ -546,24 +561,24 @@ Called by CL_KeyEvent to handle a keypress
 static void CL_KeyDownEvent( int key, unsigned time )
 {
 	keys[key].down = qtrue;
-	keys[key].bound = qfalse;
 	keys[key].repeats++;
 
-	if ( keys[key].repeats == 1 ) {
+	if ( keys[key].repeats == 1 )
 		anykeydown++;
-	}
 
 #ifndef _WIN32
-	if ( keys[K_ALT].down && key == K_ENTER )
-	{
-		Cvar_SetValue( "r_fullscreen", !Cvar_VariableIntegerValue( "r_fullscreen" ) );
+	if( keys[K_ALT].down && key == K_ENTER )
+			{
+				Cvar_SetValue( "r_fullscreen",
+						!Cvar_VariableIntegerValue( "r_fullscreen" ) );
 		Cbuf_ExecuteText( EXEC_APPEND, "vid_restart\n" );
-		return;
-	}
+				return;
+			}
 #endif
 
 	// console key is hardcoded, so the user can never unbind it
-	if ( key == K_CONSOLE || ( keys[K_SHIFT].down && key == K_ESCAPE ) ) {
+	if( key == K_CONSOLE || ( keys[K_SHIFT].down && key == K_ESCAPE ) )
+	{
 		Con_ToggleConsole_f();
 		Key_ClearStates();
 		return;
@@ -580,12 +595,31 @@ static void CL_KeyDownEvent( int key, unsigned time )
 	}
 
 	// keys can still be used for bound actions
-	if ( ( key < 128 || key == K_MOUSE1 ) && cls.state == CA_CINEMATIC && Key_GetCatcher() == 0 ) {
+	if ( ( key < 128 || key == K_MOUSE1 )
+		&& cls.state == CA_CINEMATIC && Key_GetCatcher( ) == 0 ) {
+
 		if ( Cvar_VariableIntegerValue( "com_cameraMode" ) == 0 ) {
 			Cvar_Set ("nextdemo","");
 			key = K_ESCAPE;
 		}
 	}
+
+#ifdef USE_MV
+    if ( (/* key == K_MOUSE1 || */ key == K_MOUSE2) && clc.demoplaying && cl.snap.multiview ) {
+        int id, n, d;
+        //if ( key == K_MOUSE1 )
+            d = 1;
+        //else
+        //	d = -1;
+        for ( id = (clc.clientView + d + MAX_CLIENTS ) % MAX_CLIENTS, n = 0; n < MAX_CLIENTS; n++, id = ( id + d + MAX_CLIENTS ) % MAX_CLIENTS ) {
+            if ( cl.snap.clps[ id ].valid ) {
+                Com_Printf( S_COLOR_CYAN "MultiView: switch POV %d => %d\n", clc.clientView, id );
+                clc.clientView = id;
+                break;
+            }
+        }
+    }
+#endif // USE_MV
 
 	// escape is always handled special
 	if ( key == K_ESCAPE ) {
@@ -594,7 +628,7 @@ static void CL_KeyDownEvent( int key, unsigned time )
 			Com_DL_Cleanup( &download );
 		}
 #endif
-		if ( Key_GetCatcher() & KEYCATCH_CONSOLE ) {
+		if ( Key_GetCatcher( ) & KEYCATCH_CONSOLE ) {
 			// escape always closes console
 			Con_ToggleConsole_f();
 			Key_ClearStates();
@@ -639,6 +673,7 @@ static void CL_KeyDownEvent( int key, unsigned time )
 		return;
 	}
 
+
 	// distribute the key down event to the appropriate handler
 	if ( Key_GetCatcher( ) & KEYCATCH_CONSOLE ) {
 		Console_Key( key );
@@ -670,25 +705,20 @@ Called by CL_KeyEvent to handle a keyrelease
 */
 static void CL_KeyUpEvent( int key, unsigned time )
 {
-	const qboolean bound = keys[key].bound;
-
 	keys[key].repeats = 0;
 	keys[key].down = qfalse;
-	keys[key].bound = qfalse;
+	anykeydown--;
 
-	if ( --anykeydown < 0 ) {
+	if ( anykeydown < 0 )
 		anykeydown = 0;
-	}
 
 	// don't process key-up events for the console key
-	if ( key == K_CONSOLE || ( key == K_ESCAPE && keys[K_SHIFT].down ) ) {
+	if ( key == K_CONSOLE || ( key == K_ESCAPE && keys[K_SHIFT].down ) )
 		return;
-	}
 
 	// hardcoded screenshot key
-	if ( key == K_PRINT ) {
+	if ( key == K_PRINT )
 		return;
-	}
 
 	//
 	// key up events only perform actions if the game key binding is
@@ -696,20 +726,13 @@ static void CL_KeyUpEvent( int key, unsigned time )
 	// console mode and menu mode, to keep the character from continuing
 	// an action started before a mode switch.
 	//
-	if ( cls.state != CA_DISCONNECTED ) {
-		if ( bound || ( Key_GetCatcher() & KEYCATCH_CGAME ) ) {
-			Key_ParseBinding( key, qfalse, time );
-		}
-	}
+	if( cls.state != CA_DISCONNECTED )
+		Key_ParseBinding( key, qfalse, time );
 
-	if ( Key_GetCatcher() & KEYCATCH_UI ) {
-		if ( uivm ) {
-			VM_Call( uivm, 2, UI_KEY_EVENT, key, qfalse );
-		}
-	} else if ( Key_GetCatcher() & KEYCATCH_CGAME ) {
-		if ( cgvm ) {
-			VM_Call( cgvm, 2, CG_KEY_EVENT, key, qfalse );
-		}
+	if ( Key_GetCatcher( ) & KEYCATCH_UI && uivm ) {
+		VM_Call( uivm, 2, UI_KEY_EVENT, key, qfalse );
+	} else if ( Key_GetCatcher( ) & KEYCATCH_CGAME && cgvm ) {
+		VM_Call( cgvm, 2, CG_KEY_EVENT, key, qfalse );
 	}
 }
 

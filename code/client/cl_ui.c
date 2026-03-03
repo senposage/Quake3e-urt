@@ -39,7 +39,10 @@ static void GetClientState( uiClientState_t *state ) {
 	Q_strncpyz( state->servername, cls.servername, sizeof( state->servername ) );
 	Q_strncpyz( state->updateInfoString, cls.updateInfoString, sizeof( state->updateInfoString ) );
 	Q_strncpyz( state->messageString, clc.serverMessage, sizeof( state->messageString ) );
-	state->clientNum = cl.snap.ps.clientNum;
+    state->clientNum = cl.snap.ps.clientNum;
+#ifdef USE_AUTH
+    Q_strncpyz( state->serverAddress, NET_AdrToStringwPort(&clc.serverAddress), sizeof( state->serverAddress ) );
+#endif
 }
 
 
@@ -48,7 +51,7 @@ static void GetClientState( uiClientState_t *state ) {
 LAN_LoadCachedServers
 ====================
 */
-static void LAN_LoadCachedServers( void ) {
+void LAN_LoadCachedServers( void ) {
 	fileHandle_t fileIn;
 	int size, file_size;
 
@@ -84,7 +87,7 @@ static void LAN_LoadCachedServers( void ) {
 LAN_SaveServersToCache
 ====================
 */
-static void LAN_SaveServersToCache( void ) {
+void LAN_SaveServersToCache( void ) {
 	fileHandle_t fileOut;
 	int size;
 
@@ -311,6 +314,7 @@ static void LAN_GetServerInfo( int source, int n, char *buf, int buflen ) {
 		Info_SetValueForKey( info, "hostname", server->hostName);
 		Info_SetValueForKey( info, "mapname", server->mapName);
 		Info_SetValueForKey( info, "clients", va("%i",server->clients));
+        Info_SetValueForKey( info, "bots", va("%i",server->bots));
 		Info_SetValueForKey( info, "sv_maxclients", va("%i",server->maxClients));
 		Info_SetValueForKey( info, "ping", va("%i",server->ping));
 		Info_SetValueForKey( info, "minping", va("%i",server->minPing));
@@ -320,6 +324,9 @@ static void LAN_GetServerInfo( int source, int n, char *buf, int buflen ) {
 		Info_SetValueForKey( info, "nettype", va("%i",server->netType));
 		Info_SetValueForKey( info, "addr", NET_AdrToStringwPort(&server->adr));
 		Info_SetValueForKey( info, "punkbuster", va("%i", server->punkbuster));
+        Info_SetValueForKey( info, "auth", va("%i", server->auth));
+        Info_SetValueForKey( info, "password", va("%i", server->password));
+        Info_SetValueForKey( info, "modversion", server->modversion);
 		Info_SetValueForKey( info, "g_needpass", va("%i", server->g_needpass));
 		Info_SetValueForKey( info, "g_humanplayers", va("%i", server->g_humanplayers));
 		Q_strncpyz(buf, info, buflen);
@@ -584,7 +591,7 @@ static int LAN_ServerIsVisible(int source, int n ) {
 LAN_UpdateVisiblePings
 =======================
 */
-static qboolean LAN_UpdateVisiblePings(int source ) {
+qboolean LAN_UpdateVisiblePings(int source ) {
 	return CL_UpdateVisiblePings_f(source);
 }
 
@@ -692,11 +699,11 @@ static void CLUI_SetCDKey( char *buf ) {
 	if ( UI_usesUniqueCDKey() && gamedir[0] != '\0' ) {
 		Com_Memcpy( &cl_cdkey[16], buf, 16 );
 		cl_cdkey[32] = '\0';
-		// set the flag so the flag will be written at the next opportunity
+		// set the flag so the fle will be written at the next opportunity
 		cvar_modifiedFlags |= CVAR_ARCHIVE;
 	} else {
 		Com_Memcpy( cl_cdkey, buf, 16 );
-		// set the flag so the flag will be written at the next opportunity
+		// set the flag so the fle will be written at the next opportunity
 		cvar_modifiedFlags |= CVAR_ARCHIVE;
 	}
 }
@@ -767,11 +774,6 @@ static qboolean UI_GetValue( char* value, int valueSize, const char* key ) {
 
 	if ( !Q_stricmp( key, "trap_R_AddLinearLightToScene_Q3E" ) && re.AddLinearLightToScene ) {
 		Com_sprintf( value, valueSize, "%i", UI_R_ADDLINEARLIGHTTOSCENE );
-		return qtrue;
-	}
-
-	if ( !Q_stricmp( key, "trap_Cvar_SetDescription_Q3E" ) ) {
-		Com_sprintf( value, valueSize, "%i", UI_CVAR_SETDESCRIPTION );
 		return qtrue;
 	}
 
@@ -1065,8 +1067,8 @@ static intptr_t CL_UISystemCalls( intptr_t *args ) {
 		return Hunk_MemoryRemaining();
 
 	case UI_GET_CDKEY:
-		VM_CHECKBOUNDS( uivm, args[1], args[2] );
-		CLUI_GetCDKey( VMA(1), args[2] );
+//		VM_CHECKBOUNDS( uivm, args[1], args[2] );
+//		CLUI_GetCDKey( VMA(1), args[2] );
 		return 0;
 
 	case UI_SET_CDKEY:
@@ -1096,7 +1098,7 @@ static intptr_t CL_UISystemCalls( intptr_t *args ) {
 
 	case TRAP_STRNCPY:
 		VM_CHECKBOUNDS( uivm, args[1], args[3] );
-		Q_strncpy( VMA(1), VMA(2), args[3] );
+		strncpy( VMA(1), VMA(2), args[3] );
 		return args[1];
 
 	case TRAP_SIN:
@@ -1139,17 +1141,20 @@ static intptr_t CL_UISystemCalls( intptr_t *args ) {
 		return Com_RealTime( VMA(1) );
 
 	case UI_CIN_PLAYCINEMATIC:
-		Com_DPrintf("UI_CIN_PlayCinematic\n");
-		return CIN_PlayCinematic(VMA(1), args[2], args[3], args[4], args[5], args[6]);
+//		Com_DPrintf("UI_CIN_PlayCinematic\n");
+//		return CIN_PlayCinematic(VMA(1), args[2], args[3], args[4], args[5], args[6]);
+        return 0;
 
 	case UI_CIN_STOPCINEMATIC:
-		return CIN_StopCinematic(args[1]);
+//		return CIN_StopCinematic(args[1]);
+        return 0;
 
 	case UI_CIN_RUNCINEMATIC:
-		return CIN_RunCinematic(args[1]);
+//		return CIN_RunCinematic(args[1]);
+        return 0;
 
 	case UI_CIN_DRAWCINEMATIC:
-		CIN_DrawCinematic(args[1]);
+//		CIN_DrawCinematic(args[1]);
 		return 0;
 
 	case UI_CIN_SETEXTENTS:
@@ -1161,7 +1166,7 @@ static intptr_t CL_UISystemCalls( intptr_t *args ) {
 		return 0;
 
 	case UI_VERIFY_CDKEY:
-		return Com_CDKeyValidate(VMA(1), VMA(2));
+		return 0;
 
 	// engine extensions
 	case UI_R_ADDREFENTITYTOSCENE2:
@@ -1173,13 +1178,36 @@ static intptr_t CL_UISystemCalls( intptr_t *args ) {
 		re.AddLinearLightToScene( VMA(1), VMA(2), VMF(3), VMF(4), VMF(5), VMF(6) );
 		return 0;
 
-	case UI_CVAR_SETDESCRIPTION:
-		Cvar_SetDescription2( (const char*)VMA(1), (const char*)VMA(2) );
-		return 0;
-
 	case UI_TRAP_GETVALUE:
 		VM_CHECKBOUNDS( uivm, args[1], args[2] );
 		return UI_GetValue( VMA(1), args[2], VMA(3) );
+
+#ifdef USE_AUTH
+    case UI_NET_STRINGTOADR:
+		return NET_StringToAdr( VMA(1), VMA(2), NA_IP);
+
+	case UI_Q_VSNPRINTF:
+		return Q_vsnprintf( VMA(1), *((size_t *)VMA(2)), VMA(3), VMA(4));
+
+	case UI_NET_SENDPACKET:
+		{
+			netadr_t addr;
+			const char * destination = VMA(4);
+
+			NET_StringToAdr( destination, &addr, NA_IP);
+			NET_SendPacket( args[1], args[2], VMA(3), &addr );
+		}
+		return 0;
+
+	case UI_COPYSTRING:
+		CopyString(VMA(1));
+		return 0;
+
+//	case UI_SYS_STARTPROCESS:
+//		Sys_StartProcess( VMA(1), VMA(2) );
+//		return 0;
+
+#endif
 
 	default:
 		Com_Error( ERR_DROP, "Bad UI system trap: %ld", (long int) args[0] );

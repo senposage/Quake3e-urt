@@ -29,7 +29,7 @@ cvar_t	*cl_debugMove;
 cvar_t	*cl_motd;
 
 #ifdef USE_RENDERER_DLOPEN
-static cvar_t *cl_renderer;
+cvar_t	*cl_renderer;
 #endif
 
 cvar_t	*rcon_client_password;
@@ -42,7 +42,6 @@ cvar_t	*cl_showTimeDelta;
 
 cvar_t	*cl_shownet;
 cvar_t	*cl_autoRecordDemo;
-cvar_t	*cl_drawRecording;
 
 cvar_t	*cl_aviFrameRate;
 cvar_t	*cl_aviMotionJpeg;
@@ -58,14 +57,22 @@ cvar_t	*cl_allowDownload;
 cvar_t	*cl_mapAutoDownload;
 #endif
 cvar_t	*cl_conXOffset;
-cvar_t	*cl_conColor;
 cvar_t	*cl_inGameVideo;
 
 cvar_t	*cl_serverStatusResendTime;
 
 cvar_t	*cl_lanForcePackets;
 
+cvar_t	*cl_lastServerAddress;
+
 cvar_t	*cl_guidServerUniq;
+
+#ifdef USE_AUTH
+cvar_t  *cl_auth_engine;
+cvar_t  *cl_auth;
+cvar_t  *authc;
+cvar_t  *authl;
+#endif
 
 cvar_t	*cl_dlURL;
 cvar_t	*cl_dlDirectory;
@@ -105,6 +112,11 @@ char				cl_oldGame[ MAX_QPATH ];
 qboolean			cl_oldGameSet;
 static	qboolean	noGameRestart = qfalse;
 
+#ifdef USE_MV
+void CL_Multiview_f( void );
+void CL_MultiviewFollow_f( void );
+#endif
+
 #ifdef USE_CURL
 download_t			download;
 #endif
@@ -115,7 +127,7 @@ refexport_t	re;
 static void	*rendererLib;
 #endif
 
-static ping_t cl_pinglist[MAX_PINGREQUESTS];
+ping_t	cl_pinglist[MAX_PINGREQUESTS];
 
 typedef struct serverStatus_s
 {
@@ -127,7 +139,7 @@ typedef struct serverStatus_s
 	qboolean retrieved;
 } serverStatus_t;
 
-static serverStatus_t cl_serverStatusList[MAX_SERVERSTATUSREQUESTS];
+serverStatus_t cl_serverStatusList[MAX_SERVERSTATUSREQUESTS];
 
 static void CL_CheckForResend( void );
 static void CL_ShowIP_f( void );
@@ -135,9 +147,7 @@ static void CL_ServerStatus_f( void );
 static void CL_ServerStatusResponse( const netadr_t *from, msg_t *msg );
 static void CL_ServerInfoPacket( const netadr_t *from, msg_t *msg );
 
-#ifdef USE_CURL
 static void CL_Download_f( void );
-#endif
 static void CL_LocalServers_f( void );
 static void CL_GlobalServers_f( void );
 static void CL_Ping_f( void );
@@ -230,6 +240,11 @@ static void CL_WriteDemoMessage( msg_t *msg, int headerBytes ) {
 	swlen = LittleLong(len);
 	FS_Write( &swlen, 4, clc.recordfile );
 	FS_Write( msg->data + headerBytes, len, clc.recordfile );
+
+    #ifdef USE_URT_DEMO
+        // add size of packet in the end for backward play /* holblin */
+		FS_Write (&swlen, 4, clc.recordfile);
+    #endif
 }
 
 
@@ -245,7 +260,9 @@ void CL_StopRecord_f( void ) {
 	if ( clc.recordfile != FS_INVALID_HANDLE ) {
 		char tempName[MAX_OSPATH];
 		char finalName[MAX_OSPATH];
+#ifndef USE_URT_DEMO
 		int protocol;
+#endif
 		int	len, sequence;
 
 		// finish up
@@ -255,20 +272,19 @@ void CL_StopRecord_f( void ) {
 		FS_FCloseFile( clc.recordfile );
 		clc.recordfile = FS_INVALID_HANDLE;
 
-		// select proper extension
-		if ( clc.dm68compat || clc.demoplaying ) {
-			protocol = OLD_PROTOCOL_VERSION;
-		} else {
+        Com_sprintf( tempName, sizeof( tempName ), "%s.tmp", clc.recordName );
+
+#ifdef USE_URT_DEMO
+        Com_sprintf( finalName, sizeof( finalName ), "%s.%s", clc.recordName, URTDEMOEXT );
+#else
+        // select proper extension
+		if ( clc.dm68compat || clc.demoplaying )
+			protocol = PROTOCOL_VERSION;
+		else
 			protocol = NEW_PROTOCOL_VERSION;
-		}
 
-		if ( com_protocol->integer != DEFAULT_PROTOCOL_VERSION ) {
-			protocol = com_protocol->integer;
-		}
-
-		Com_sprintf( tempName, sizeof( tempName ), "%s.tmp", clc.recordName );
-
-		Com_sprintf( finalName, sizeof( finalName ), "%s.%s%d", clc.recordName, DEMOEXT, protocol );
+        Com_sprintf( finalName, sizeof( finalName ), "%s.%s%d", clc.recordName, DEMOEXT, protocol );
+#endif
 
 		if ( clc.explicitRecordName ) {
 			FS_Remove( finalName );
@@ -276,8 +292,11 @@ void CL_StopRecord_f( void ) {
 			// add sequence suffix to avoid overwrite
 			sequence = 0;
 			while ( FS_FileExists( finalName ) && ++sequence < 1000 ) {
-				Com_sprintf( finalName, sizeof( finalName ), "%s-%02d.%s%d",
-					clc.recordName, sequence, DEMOEXT, protocol );
+#ifdef USE_URT_DEMO
+                Com_sprintf( finalName, sizeof( finalName ), "%s-%02d.%s", clc.recordName, sequence, URTDEMOEXT );
+#else
+                Com_sprintf( finalName, sizeof( finalName ), "%s-%02d.%s%d", clc.recordName, sequence, DEMOEXT, protocol );
+#endif
 			}
 		}
 
@@ -303,12 +322,11 @@ CL_WriteServerCommands
 static void CL_WriteServerCommands( msg_t *msg ) {
 	int i;
 
-	if ( clc.serverCommandSequence - clc.demoCommandSequence > 0 ) {
+	if ( clc.demoCommandSequence < clc.serverCommandSequence ) {
 
 		// do not write more than MAX_RELIABLE_COMMANDS
-		if ( clc.serverCommandSequence - clc.demoCommandSequence > MAX_RELIABLE_COMMANDS ) {
+		if ( clc.serverCommandSequence - clc.demoCommandSequence > MAX_RELIABLE_COMMANDS )
 			clc.demoCommandSequence = clc.serverCommandSequence - MAX_RELIABLE_COMMANDS;
-		}
 
 		for ( i = clc.demoCommandSequence + 1 ; i <= clc.serverCommandSequence; i++ ) {
 			MSG_WriteByte( msg, svc_serverCommand );
@@ -401,6 +419,11 @@ static void CL_WriteGamestate( qboolean initial )
 	len = LittleLong( msg.cursize );
 	FS_Write( &len, 4, clc.recordfile );
 	FS_Write( msg.data, msg.cursize, clc.recordfile );
+
+#ifdef USE_URT_DEMO
+    // add size of packet in the end for backward play /* holblin */
+    FS_Write (&len, 4, clc.recordfile);
+#endif
 }
 
 
@@ -556,9 +579,16 @@ Begins recording a demo from the current position
 static void CL_Record_f( void ) {
 	char		demoName[MAX_OSPATH];
 	char		name[MAX_OSPATH];
-	char		demoExt[16];
-	const char	*ext;
 	qtime_t		t;
+
+#ifdef USE_URT_DEMO
+    char		*s2;
+	int			size, v, len;
+	const char  *serverInfo;
+#else
+    char		demoExt[16];
+    const char	*ext;
+#endif
 
 	if ( Cmd_Argc() > 2 ) {
 		Com_Printf( "record <demoname>\n" );
@@ -585,10 +615,12 @@ static void CL_Record_f( void ) {
 	if ( Cmd_Argc() == 2 ) {
 		// explicit demo name specified
 		Q_strncpyz( demoName, Cmd_Argv( 1 ), sizeof( demoName ) );
+
+#ifndef USE_URT_DEMO
 		ext = COM_GetExtension( demoName );
 		if ( *ext ) {
 			// strip demo extension
-			sprintf( demoExt, "%s%d", DEMOEXT, OLD_PROTOCOL_VERSION );
+			sprintf( demoExt, "%s%d", DEMOEXT, PROTOCOL_VERSION );
 			if ( Q_stricmp( ext, demoExt ) == 0 ) {
 				*(strrchr( demoName, '.' )) = '\0';
 			} else {
@@ -599,14 +631,15 @@ static void CL_Record_f( void ) {
 				}
 			}
 		}
+#endif
 		Com_sprintf( name, sizeof( name ), "demos/%s", demoName );
 
 		clc.explicitRecordName = qtrue;
 	} else {
 
 		Com_RealTime( &t );
-		Com_sprintf( name, sizeof( name ), "demos/demo-%04d%02d%02d-%02d%02d%02d",
-			1900 + t.tm_year, 1 + t.tm_mon,	t.tm_mday, t.tm_hour, t.tm_min, t.tm_sec );
+        Com_sprintf( name, sizeof( name ), "demos/demo-%04d%02d%02d-%02d%02d%02d",
+                     1900 + t.tm_year, 1 + t.tm_mon,	t.tm_mday, t.tm_hour, t.tm_min, t.tm_sec );
 
 		clc.explicitRecordName = qfalse;
 	}
@@ -627,7 +660,25 @@ static void CL_Record_f( void ) {
 		return;
 	}
 
-	clc.demorecording = qtrue;
+#ifdef USE_URT_DEMO
+    serverInfo = cl.gameState.stringData + cl.gameState.stringOffsets[ CS_SERVERINFO ];
+    s2 = Info_ValueForKey(serverInfo, "g_modversion");
+
+    size = strlen( s2 );
+    len = LittleLong( size );
+    FS_Write( &len, 4, clc.recordfile );
+    FS_Write( s2 , size ,  clc.recordfile );
+
+    v = LittleLong( URT_PROTOCOL_VERSION );
+    FS_Write ( &v, 4 , clc.recordfile );
+
+    len = 0;
+    len = LittleLong( len );
+    FS_Write ( &len, 4 , clc.recordfile );
+    FS_Write ( &len, 4 , clc.recordfile );
+#endif
+
+    clc.demorecording = qtrue;
 
 	Com_TruncateLongString( clc.recordNameShort, clc.recordName );
 
@@ -655,13 +706,17 @@ static void CL_Record_f( void ) {
 CL_CompleteRecordName
 ====================
 */
-static void CL_CompleteRecordName(const char *args, int argNum )
+static void CL_CompleteRecordName( char *args, int argNum )
 {
-	if ( argNum == 2 )
+	if( argNum == 2 )
 	{
 		char demoExt[ 16 ];
 
-		Com_sprintf( demoExt, sizeof( demoExt ), "." DEMOEXT "%d", com_protocol->integer );
+#ifdef USE_URT_DEMO
+        Com_sprintf( demoExt, sizeof( demoExt ), ".urtdemo" );
+#else
+        Com_sprintf( demoExt, sizeof( demoExt ), ".dm_%d", PROTOCOL_VERSION );
+#endif
 		Field_CompleteFilename( "demos", demoExt, qtrue, FS_MATCH_EXTERN | FS_MATCH_STICK );
 	}
 }
@@ -695,6 +750,17 @@ static void CL_DemoCompleted( void ) {
 	CL_NextDemo();
 }
 
+void CL_CheckDemoProtocol( void ) {
+    if ( clc.demoprotocol == 0 ) {
+        char *ext;
+        ext = strrchr(clc.demoName, '.'); //dm_ demo
+        if (ext && !Q_stricmpn(ext + 1, URTDEMOEXT, ARRAY_LEN(URTDEMOEXT) - 1))
+            clc.demoprotocol = URT_PROTOCOL_VERSION;
+        else if (ext && !Q_stricmpn(ext + 1, DEMOEXT, ARRAY_LEN(DEMOEXT) - 1))
+            clc.demoprotocol = atoi(ext + ARRAY_LEN(DEMOEXT));
+    }
+}
+
 
 /*
 =================
@@ -706,6 +772,11 @@ void CL_ReadDemoMessage( void ) {
 	msg_t		buf;
 	byte		bufData[ MAX_MSGLEN_BUF ];
 	int			s;
+
+#ifdef USE_URT_DEMO
+    // skip the end length (read it a second time) ... Is usefull only in backward read /* holblin */
+    int  length_backward;
+#endif
 
 	if ( clc.demofile == FS_INVALID_HANDLE ) {
 		CL_DemoCompleted();
@@ -729,11 +800,21 @@ void CL_ReadDemoMessage( void ) {
 		CL_DemoCompleted();
 		return;
 	}
+
 	buf.cursize = LittleLong( buf.cursize );
 	if ( buf.cursize == -1 ) {
 		CL_DemoCompleted();
 		return;
 	}
+
+#ifdef USE_URT_DEMO
+	CL_CheckDemoProtocol();
+    if ( clc.demoprotocol == URT_PROTOCOL_VERSION && buf.cursize == 0 ) { // backward read gain the header demo /* holblin */
+        CL_DemoCompleted ();
+        return;
+    }
+#endif
+
 	if ( buf.cursize > buf.maxsize ) {
 		Com_Error (ERR_DROP, "CL_ReadDemoMessage: demoMsglen > MAX_MSGLEN");
 	}
@@ -743,6 +824,24 @@ void CL_ReadDemoMessage( void ) {
 		CL_DemoCompleted();
 		return;
 	}
+
+#ifdef USE_URT_DEMO
+    // skip the end length (read it a second time) ... Is usefull only in backward read /* holblin */
+    if ( clc.demoprotocol == URT_PROTOCOL_VERSION ) {
+        r = FS_Read (&length_backward, 4, clc.demofile);
+        if ( r != 4 ) {
+            CL_DemoCompleted ();
+            return;
+        }
+        // now, check demo file format !!! /* holblin */
+        length_backward = LittleLong( length_backward );
+        if ( length_backward != buf.cursize ){
+            CL_DemoCompleted ();
+            return;
+        }
+    }
+
+#endif
 
 	clc.lastPacketTime = cls.realtime;
 	buf.readcount = 0;
@@ -768,7 +867,7 @@ void CL_ReadDemoMessage( void ) {
 CL_WalkDemoExt
 ====================
 */
-static int CL_WalkDemoExt( const char *arg, char *name, int name_len, fileHandle_t *handle )
+static int CL_WalkDemoExt( const char *arg, char *name, fileHandle_t *handle )
 {
 	int i;
 
@@ -777,7 +876,15 @@ static int CL_WalkDemoExt( const char *arg, char *name, int name_len, fileHandle
 
 	while ( demo_protocols[ i ] )
 	{
-		Com_sprintf( name, name_len, "demos/%s.%s%d", arg, DEMOEXT, demo_protocols[ i ] );
+#ifdef USE_URT_DEMO
+	    if (demo_protocols[i] == URT_PROTOCOL_VERSION) {
+	        Com_sprintf(name, MAX_OSPATH, "demos/%s.urtdemo", arg);
+	    } else {
+#endif
+            Com_sprintf(name, MAX_OSPATH, "demos/%s.dm_%d", arg, demo_protocols[i]);
+#ifdef USE_URT_DEMO
+        }
+#endif
 		FS_BypassPure();
 		FS_FOpenFileRead( name, handle, qtrue );
 		FS_RestorePure();
@@ -801,19 +908,26 @@ CL_DemoExtCallback
 */
 static qboolean CL_DemoNameCallback_f( const char *filename, int length )
 {
-	const int ext_len = strlen( "." DEMOEXT );
-	const int num_len = 2;
 	int version;
 
-	if ( length <= ext_len + num_len || Q_stricmpn( filename + length - (ext_len + num_len), "." DEMOEXT, ext_len ) != 0 )
+#ifdef USE_URT_DEMO
+	int isVersionUrT = Q_stricmpn( filename + length - 8, ".urtdemo", 8 );
+
+	if ( length < 9 && isVersionUrT ) {
+	    return qfalse;
+    }
+	else if ( isVersionUrT != 0 ) {
+#endif
+    if ( length < 7 || Q_stricmpn( filename + length - 6, ".dm_", 4 ) )
 		return qfalse;
 
-	version = atoi( filename + length - num_len );
-	if ( version == com_protocol->integer )
-		return qtrue;
+    version = atoi( filename + length - 2 );
+    if ( version < 66 || version > NEW_PROTOCOL_VERSION )
+        return qfalse;
+#ifdef USE_URT_DEMO
+	}
+#endif
 
-	if ( version < 66 || version > NEW_PROTOCOL_VERSION )
-		return qfalse;
 
 	return qtrue;
 }
@@ -824,12 +938,15 @@ static qboolean CL_DemoNameCallback_f( const char *filename, int length )
 CL_CompleteDemoName
 ====================
 */
-static void CL_CompleteDemoName(const char *args, int argNum )
+static void CL_CompleteDemoName( char *args, int argNum )
 {
-	if ( argNum == 2 )
+	if( argNum == 2 )
 	{
 		FS_SetFilenameCallback( CL_DemoNameCallback_f );
-		Field_CompleteFilename( "demos", "." DEMOEXT "??", qfalse, FS_MATCH_ANY | FS_MATCH_STICK | FS_MATCH_SUBDIRS );
+        Field_CompleteFilename( "demos", ".dm_??", qfalse, FS_MATCH_ANY | FS_MATCH_STICK );
+#ifdef USE_URT_DEMO
+        Field_CompleteFilename( "demos", ".urtdemo", qfalse, FS_MATCH_ANY | FS_MATCH_STICK );
+#endif
 		FS_SetFilenameCallback( NULL );
 	}
 }
@@ -845,14 +962,17 @@ demo <demoname>
 */
 static void CL_PlayDemo_f( void ) {
 	char		name[MAX_OSPATH];
-	const char		*arg;
-	char		*ext_test;
-	int			protocol, i;
+	char		*arg, *ext_test;
+#ifdef USE_URT_DEMO
+    int			r, len, v1, v2;
+	char		*s2;
+#endif
+	int			i;
 	char		retry[MAX_OSPATH];
 	const char	*shortname, *slash;
 	fileHandle_t hFile;
 
-	if ( Cmd_Argc() != 2 ) {
+    if ( Cmd_Argc() != 2 ) {
 		Com_Printf( "demo <demoname>\n" );
 		return;
 	}
@@ -861,18 +981,33 @@ static void CL_PlayDemo_f( void ) {
 	arg = Cmd_Argv( 1 );
 
 	// check for an extension .DEMOEXT_?? (?? is protocol)
-	ext_test = strrchr(arg, '.');
+	// check for an extension .urtdemo
+
+    ext_test = strrchr(arg, '.'); //dm_ demo
+
+#ifdef USE_URT_DEMO
+    if ( ext_test && !Q_stricmpn(ext_test + 1, URTDEMOEXT, ARRAY_LEN(URTDEMOEXT) - 1) )
+    {
+        Com_sprintf(name, sizeof(name), "demos/%s", arg);
+        FS_BypassPure();
+        FS_FOpenFileRead( name, &hFile, qtrue );
+        FS_RestorePure();
+
+        clc.demoprotocol = URT_PROTOCOL_VERSION;
+    }
+    else
+#endif
 	if ( ext_test && !Q_stricmpn(ext_test + 1, DEMOEXT, ARRAY_LEN(DEMOEXT) - 1) )
 	{
-		protocol = atoi(ext_test + ARRAY_LEN(DEMOEXT));
+        clc.demoprotocol = atoi(ext_test + ARRAY_LEN(DEMOEXT));
 
 		for( i = 0; demo_protocols[ i ]; i++ )
 		{
-			if ( demo_protocols[ i ] == protocol )
+			if ( demo_protocols[ i ] == clc.demoprotocol )
 				break;
 		}
 
-		if ( demo_protocols[ i ] || protocol == com_protocol->integer  )
+		if ( demo_protocols[ i ] )
 		{
 			Com_sprintf(name, sizeof(name), "demos/%s", arg);
 			FS_BypassPure();
@@ -883,20 +1018,20 @@ static void CL_PlayDemo_f( void ) {
 		{
 			size_t len;
 
-			Com_Printf("Protocol %d not supported for demos\n", protocol );
+			Com_Printf("Legacy: Protocol %d not supported for demos\n", clc.demoprotocol );
 			len = ext_test - arg;
 
-			if ( len > ARRAY_LEN( retry ) - 1 ) {
-				len = ARRAY_LEN( retry ) - 1;
-			}
+			if(len >= ARRAY_LEN(retry))
+				len = ARRAY_LEN(retry) - 1;
 
 			Q_strncpyz( retry, arg, len + 1);
 			retry[len] = '\0';
-			protocol = CL_WalkDemoExt( retry, name, sizeof( name ), &hFile );
+            clc.demoprotocol = CL_WalkDemoExt( retry, name, &hFile );
 		}
 	}
-	else
-		protocol = CL_WalkDemoExt( arg, name, sizeof( name ), &hFile );
+    else {
+        clc.demoprotocol = CL_WalkDemoExt(arg, name, &hFile);
+    }
 
 	if ( hFile == FS_INVALID_HANDLE ) {
 		Com_Printf( S_COLOR_YELLOW "couldn't open %s\n", name );
@@ -929,11 +1064,75 @@ static void CL_PlayDemo_f( void ) {
 
 	Con_Close();
 
+#ifdef USE_URT_DEMO
+    //@Barbatos: get the mod version from the server
+	//serverInfo = cl.gameState.stringData + cl.gameState.stringOffsets[ CS_SERVERINFO ];
+	//s1 = Info_ValueForKey(serverInfo, "g_modversion");
+	CL_CheckDemoProtocol();
+    if ( clc.demoprotocol == URT_PROTOCOL_VERSION ) {
+        r = FS_Read( &len, 4, clc.demofile );
+        if ( r != 4 ) {
+            CL_DemoCompleted ();
+            return;
+        }
+
+        len = LittleLong( len );
+
+        s2 = malloc( len + 1 );
+        r = FS_Read( s2 , len ,  clc.demofile );
+        if ( r != len ) {
+            CL_DemoCompleted ();
+            free(s2);
+            return;
+        }
+        s2[len] = '\0';
+
+        v1 = LittleLong( URT_PROTOCOL_VERSION );
+        r = FS_Read ( &v2, 4 , clc.demofile );
+        if ( r != 4 ) {
+            CL_DemoCompleted ();
+            free(s2);
+            return;
+        }
+
+        //@Barbatos: FIXME
+        /*if ( strcmp(s1, s2) ){
+            Com_Printf("Game version %s not supported for demos\n", s2);
+            free(s2);
+            CL_DemoCompleted ();
+            return;
+        }
+        */
+        free(s2);
+
+        if ( v1 != v2 ){
+            Com_Printf("UrTDemo: Protocol %d not supported for demos\n", v2);
+            CL_DemoCompleted ();
+            return;
+        }
+
+        r = FS_Read( &len, 4, clc.demofile );
+        len = LittleLong( len );
+        if ( r != 4 || len != 0) {
+            CL_DemoCompleted ();
+            return;
+        }
+
+        r = FS_Read( &len, 4, clc.demofile );
+        len = LittleLong( len );
+        if ( r != 4 || len != 0) {
+            CL_DemoCompleted ();
+            return;
+        }
+    }
+
+#endif
+
 	cls.state = CA_CONNECTED;
 	clc.demoplaying = qtrue;
 	Q_strncpyz( cls.servername, shortname, sizeof( cls.servername ) );
 
-	if ( protocol <= OLD_PROTOCOL_VERSION )
+	if ( clc.demoprotocol < URT_PROTOCOL_VERSION )
 		clc.compat = qtrue;
 	else
 		clc.compat = qfalse;
@@ -1093,7 +1292,7 @@ void CL_MapLoading( void ) {
 		Com_Memset( cls.updateInfoString, 0, sizeof( cls.updateInfoString ) );
 		Com_Memset( clc.serverMessage, 0, sizeof( clc.serverMessage ) );
 		Com_Memset( &cl.gameState, 0, sizeof( cl.gameState ) );
-		clc.lastPacketSentTime = cls.realtime - 9999;  // send packet immediately
+		clc.lastPacketSentTime = -9999;
 		cls.framecount++;
 		SCR_UpdateScreen();
 	} else {
@@ -1235,7 +1434,7 @@ qboolean CL_Disconnect( qboolean showMainMenu ) {
 		// Finish rendering current frame
 		cls.framecount++;
 		SCR_UpdateScreen();
-		CL_CloseAVI( qfalse );
+		CL_CloseAVI();
 	}
 
 	if ( cgvm ) {
@@ -1267,7 +1466,9 @@ qboolean CL_Disconnect( qboolean showMainMenu ) {
 	// send it a few times in case one is dropped
 	if ( cls.state >= CA_CONNECTED && cls.state != CA_CINEMATIC && !clc.demoplaying ) {
 		CL_AddReliableCommand( "disconnect", qtrue );
-		CL_WritePacket( 2 );
+		CL_WritePacket();
+		CL_WritePacket();
+		CL_WritePacket();
 	}
 
 	CL_ClearState();
@@ -1343,7 +1544,7 @@ CL_RequestMotd
 ===================
 */
 #if 0
-static void CL_RequestMotd( void ) {
+void CL_RequestMotd( void ) {
 	char		info[MAX_INFO_STRING];
 
 	if ( !cl_motd->integer ) {
@@ -1416,47 +1617,47 @@ in anyway.
 */
 #ifndef STANDALONE
 static void CL_RequestAuthorization( void ) {
-	char	nums[64];
-	int		i, j, l;
-	cvar_t	*fs;
-
-	if ( !cls.authorizeServer.port ) {
-		Com_Printf( "Resolving %s\n", AUTHORIZE_SERVER_NAME );
-		if ( !NET_StringToAdr( AUTHORIZE_SERVER_NAME, &cls.authorizeServer, NA_IP ) ) {
-			Com_Printf( "Couldn't resolve address\n" );
-			return;
-		}
-
-		cls.authorizeServer.port = BigShort( PORT_AUTHORIZE );
-		Com_Printf( "%s resolved to %i.%i.%i.%i:%i\n", AUTHORIZE_SERVER_NAME,
-			cls.authorizeServer.ipv._4[0], cls.authorizeServer.ipv._4[1],
-			cls.authorizeServer.ipv._4[2], cls.authorizeServer.ipv._4[3],
-			BigShort( cls.authorizeServer.port ) );
-	}
-	if ( cls.authorizeServer.type == NA_BAD ) {
-		return;
-	}
-
-	// only grab the alphanumeric values from the cdkey, to avoid any dashes or spaces
-	j = 0;
-	l = strlen( cl_cdkey );
-	if ( l > 32 ) {
-		l = 32;
-	}
-	for ( i = 0 ; i < l ; i++ ) {
-		if ( ( cl_cdkey[i] >= '0' && cl_cdkey[i] <= '9' )
-				|| ( cl_cdkey[i] >= 'a' && cl_cdkey[i] <= 'z' )
-				|| ( cl_cdkey[i] >= 'A' && cl_cdkey[i] <= 'Z' )
-			 ) {
-			nums[j] = cl_cdkey[i];
-			j++;
-		}
-	}
-	nums[j] = 0;
-
-	fs = Cvar_Get( "cl_anonymous", "0", CVAR_INIT | CVAR_SYSTEMINFO );
-
-	NET_OutOfBandPrint(NS_CLIENT, &cls.authorizeServer, "getKeyAuthorize %i %s", fs->integer, nums );
+//	char	nums[64];
+//	int		i, j, l;
+//	cvar_t	*fs;
+//
+//	if ( !cls.authorizeServer.port ) {
+//		Com_Printf( "Resolving %s\n", AUTHORIZE_SERVER_NAME );
+//		if ( !NET_StringToAdr( AUTHORIZE_SERVER_NAME, &cls.authorizeServer, NA_IP ) ) {
+//			Com_Printf( "Couldn't resolve address\n" );
+//			return;
+//		}
+//
+//		cls.authorizeServer.port = BigShort( PORT_AUTHORIZE );
+//		Com_Printf( "%s resolved to %i.%i.%i.%i:%i\n", AUTHORIZE_SERVER_NAME,
+//			cls.authorizeServer.ipv._4[0], cls.authorizeServer.ipv._4[1],
+//			cls.authorizeServer.ipv._4[2], cls.authorizeServer.ipv._4[3],
+//			BigShort( cls.authorizeServer.port ) );
+//	}
+//	if ( cls.authorizeServer.type == NA_BAD ) {
+//		return;
+//	}
+//
+//	// only grab the alphanumeric values from the cdkey, to avoid any dashes or spaces
+//	j = 0;
+//	l = strlen( cl_cdkey );
+//	if ( l > 32 ) {
+//		l = 32;
+//	}
+//	for ( i = 0 ; i < l ; i++ ) {
+//		if ( ( cl_cdkey[i] >= '0' && cl_cdkey[i] <= '9' )
+//				|| ( cl_cdkey[i] >= 'a' && cl_cdkey[i] <= 'z' )
+//				|| ( cl_cdkey[i] >= 'A' && cl_cdkey[i] <= 'Z' )
+//			 ) {
+//			nums[j] = cl_cdkey[i];
+//			j++;
+//		}
+//	}
+//	nums[j] = 0;
+//
+//	fs = Cvar_Get ("cl_anonymous", "0", CVAR_INIT|CVAR_SYSTEMINFO );
+//
+//	NET_OutOfBandPrint(NS_CLIENT, &cls.authorizeServer, "getKeyAuthorize %i %s", fs->integer, nums );
 }
 #endif
 
@@ -1543,7 +1744,7 @@ static void CL_Connect_f( void ) {
 	netadr_t	addr;
 	char	buffer[ sizeof( cls.servername ) ];  // same length as cls.servername
 	char	args[ sizeof( cls.servername ) + MAX_CVAR_VALUE_STRING ];
-	const char	*server;
+	char	*server;
 	const char	*serverString;
 	int		len;
 	int		argc;
@@ -1591,8 +1792,8 @@ static void CL_Connect_f( void ) {
 	}
 
 	// some programs may add ending slash
-	if ( buffer[len-1] == '/' ) {
-		buffer[len-1] = '\0';
+	if ( server[len-1] == '/' ) {
+		server[len-1] = '\0';
 	}
 
 	if ( !*server ) {
@@ -1657,6 +1858,7 @@ static void CL_Connect_f( void ) {
 	}
 
 	Key_SetCatcher( 0 );
+    Cvar_Set("cl_lastServerAddress", serverString);
 	clc.connectTime = -99999;	// CL_CheckForResend() will fire immediately
 	clc.connectPacketCount = 0;
 
@@ -1673,12 +1875,12 @@ static void CL_Connect_f( void ) {
 CL_CompleteRcon
 ==================
 */
-static void CL_CompleteRcon(const char *args, int argNum )
+static void CL_CompleteRcon( char *args, int argNum )
 {
 	if ( argNum >= 2 )
 	{
 		// Skip "rcon "
-		const char *p = Com_SkipTokens( args, 1, " " );
+		char *p = Com_SkipTokens( args, 1, " " );
 
 		if ( p > args )
 			Field_CompleteCommand( p, qtrue, qtrue );
@@ -1780,11 +1982,11 @@ we also have to reload the UI and CGame because the renderer
 doesn't know what graphics to reload
 =================
 */
-static void CL_Vid_Restart( refShutdownCode_t shutdownCode ) {
+static void CL_Vid_Restart( qboolean keepWindow ) {
 
 	// Settings may have changed so stop recording now
 	if ( CL_VideoRecording() )
-		CL_CloseAVI( qfalse );
+		CL_CloseAVI();
 
 	if ( clc.demorecording )
 		CL_StopRecord_f();
@@ -1796,7 +1998,7 @@ static void CL_Vid_Restart( refShutdownCode_t shutdownCode ) {
 	CL_ShutdownVMs();
 
 	// shutdown the renderer and clear the renderer interface
-	CL_ShutdownRef( shutdownCode ); // REF_KEEP_CONTEXT, REF_KEEP_WINDOW, REF_DESTROY_WINDOW
+	CL_ShutdownRef( keepWindow ? REF_KEEP_WINDOW : REF_DESTROY_WINDOW );
 
 	// client is no longer pure until new checksums are sent
 	CL_ResetPureClientAtServer();
@@ -1839,18 +2041,15 @@ Wrapper for CL_Vid_Restart
 */
 static void CL_Vid_Restart_f( void ) {
 
-	if ( Q_stricmp( Cmd_Argv( 1 ), "keep_window" ) == 0 || Q_stricmp( Cmd_Argv( 1 ), "fast" ) == 0 ) {
-		// fast path: keep window
-		CL_Vid_Restart( REF_KEEP_WINDOW );
-	} else {
-		if ( cls.lastVidRestart ) {
-			if ( abs( cls.lastVidRestart - Sys_Milliseconds() ) < 500 ) {
-				// hack for OSP mod: do not allow vid restart right after cgame init
-				return;
-			}
-		}
-		CL_Vid_Restart( REF_DESTROY_WINDOW );
-	}
+	 // hack for OSP mod: do not allow vid restart right after cgame init
+	if ( cls.lastVidRestart )
+		if ( abs( cls.lastVidRestart - Sys_Milliseconds() ) < 500 )
+			return;
+
+	if ( Q_stricmp( Cmd_Argv(1), "keep_window" ) == 0 )
+		CL_Vid_Restart( qtrue );
+	else
+		CL_Vid_Restart( qfalse );
 }
 
 
@@ -1868,7 +2067,7 @@ static void CL_Snd_Restart_f( void )
 	S_Shutdown();
 
 	// sound will be reinitialized by vid_restart
-	CL_Vid_Restart( REF_KEEP_CONTEXT /*REF_KEEP_WINDOW*/ );
+	CL_Vid_Restart( qtrue );
 }
 
 
@@ -1965,12 +2164,12 @@ static void CL_Systeminfo_f( void ) {
 }
 
 
-static void CL_CompleteCallvote(const char *args, int argNum )
+static void CL_CompleteCallvote( char *args, int argNum )
 {
 	if( argNum >= 2 )
 	{
 		// Skip "callvote "
-		const char *p = Com_SkipTokens( args, 1, " " );
+		char *p = Com_SkipTokens( args, 1, " " );
 
 		if ( p > args )
 			Field_CompleteCommand( p, qtrue, qtrue );
@@ -2051,7 +2250,9 @@ static void CL_DownloadsComplete( void ) {
 	// set pure checksums
 	CL_SendPureChecksums();
 
-	CL_WritePacket( 2 );
+	CL_WritePacket();
+	CL_WritePacket();
+	CL_WritePacket();
 }
 
 
@@ -2108,7 +2309,7 @@ void CL_NextDownload( void )
 			Com_Error(ERR_DROP, "Incorrect checksum for file: %s", clc.downloadName);
 	}
 
-	*clc.downloadTempName = *clc.downloadName = '\0';
+	*clc.downloadTempName = *clc.downloadName = 0;
 	Cvar_Set("cl_downloadName", "");
 
 	// We are looking to start a download here
@@ -2129,6 +2330,7 @@ void CL_NextDownload( void )
 
 		*s++ = '\0';
 		localName = s;
+        Com_sprintf(localName, MAX_STRING_CHARS, "q3ut4/download/%s", COM_SkipPath(CopyString(localName)));
 		if ( (s = strchr(s, '@')) != NULL )
 			*s++ = '\0';
 		else
@@ -2188,6 +2390,54 @@ void CL_NextDownload( void )
 	CL_DownloadsComplete();
 }
 
+#ifdef USE_CURL
+static void CL_FirstDownload(void) {
+	char *s, *name;
+	// Remove everything that isn't the current map in the download list
+	while (*clc.downloadList) {
+		qboolean keep = qfalse;
+		s = clc.downloadList;
+		if (*s == '@')
+			s++;
+
+		name = s;
+
+		if ((s = strchr(s, '@')) == NULL) {
+			*clc.downloadList = 0;
+			break;
+		}
+
+		*s = 0;
+
+		if (!Q_stricmp(COM_SkipPath(name), va("%s.pk3", clc.mapname))) {
+			keep = qtrue;
+		}
+
+		*s++ = '@';
+
+		name = s;
+
+		if ((s = strchr(s, '@')) == NULL) {
+			s = name + strlen(name);
+		}
+
+		if (keep) {
+			*s = 0;
+			break;
+		} else {
+			memmove(clc.downloadList, s, strlen(s) + 1);
+		}
+	}
+
+	Com_DPrintf("Rewritten download list: %s\n", clc.downloadList);
+
+	if (*clc.downloadList) {
+		CL_NextDownload();
+	} else {
+		CL_DownloadsComplete();
+	}
+}
+#endif
 
 /*
 =================
@@ -2208,7 +2458,7 @@ void CL_InitDownloads( void ) {
 		if ( FS_ComparePaks( missingfiles, sizeof( missingfiles ), qfalse ) )
 		{
 			// NOTE TTimo I would rather have that printed as a modal message box
-			// but at this point while joining the game we don't know whether we will successfully join or not
+			// but at this point while joining the game we don't know wether we will successfully join or not
 			Com_Printf( "\nWARNING: You are missing some files referenced by the server:\n%s"
 				"You might not be able to join the game\n"
 				"Go to the setting menu to turn on autodownload, or get the file elsewhere\n\n", missingfiles );
@@ -2225,7 +2475,11 @@ void CL_InitDownloads( void ) {
 			*clc.downloadTempName = *clc.downloadName = '\0';
 			Cvar_Set( "cl_downloadName", "" );
 
+        #ifdef USE_CURL
+            CL_FirstDownload();
+        #else
 			CL_NextDownload();
+        #endif
 			return;
 		}
 
@@ -2318,12 +2572,12 @@ static void CL_CheckForResend( void ) {
 			notOverflowed = qtrue;
 		}
 
-		if ( com_protocol->integer != DEFAULT_PROTOCOL_VERSION ) {
+		if ( com_protocol->integer != PROTOCOL_VERSION ) {
 			notOverflowed &= Info_SetValueForKey_s( info, MAX_USERINFO_LENGTH, "protocol",
 				com_protocol->string );
 		} else {
 			notOverflowed &= Info_SetValueForKey_s( info, MAX_USERINFO_LENGTH, "protocol",
-				clc.compat ? XSTRING( OLD_PROTOCOL_VERSION ) : XSTRING( NEW_PROTOCOL_VERSION ) );
+				clc.compat ? XSTRING( PROTOCOL_VERSION ) : XSTRING( NEW_PROTOCOL_VERSION ) );
 		}
 
 		notOverflowed &= Info_SetValueForKey_s( info, MAX_USERINFO_LENGTH, "qport",
@@ -2396,6 +2650,7 @@ CL_InitServerInfo
 static void CL_InitServerInfo( serverInfo_t *server, const netadr_t *address ) {
 	server->adr = *address;
 	server->clients = 0;
+	server->bots = 0;
 	server->hostName[0] = '\0';
 	server->mapName[0] = '\0';
 	server->maxClients = 0;
@@ -2405,6 +2660,10 @@ static void CL_InitServerInfo( serverInfo_t *server, const netadr_t *address ) {
 	server->game[0] = '\0';
 	server->gameType = 0;
 	server->netType = 0;
+	server->auth = 0;
+    server->password = 0;
+    server->modversion[0] = '\0';
+    server->bots = 0;
 	server->punkbuster = 0;
 	server->g_humanplayers = 0;
 	server->g_needpass = 0;
@@ -2417,11 +2676,11 @@ typedef struct hash_chain_s {
 	struct hash_chain_s *next;
 } hash_chain_t;
 
-static hash_chain_t *hash_table[1024];
-static hash_chain_t hash_list[MAX_GLOBAL_SERVERS];
-static unsigned int hash_count = 0;
+hash_chain_t *hash_table[1024];
+hash_chain_t hash_list[MAX_GLOBAL_SERVERS];
+unsigned int hash_count = 0;
 
-static unsigned int hash_func( const netadr_t *addr ) {
+unsigned int hash_func( const netadr_t *addr ) {
 
 	const byte		*ip = NULL;
 	unsigned int	size;
@@ -2634,45 +2893,44 @@ static qboolean CL_ConnectionlessPacket( const netadr_t *from, msg_t *msg ) {
 	}
 
 	// challenge from the server we are connecting to
-	if ( !Q_stricmp(c, "challengeResponse" ) ) {
+	if (!Q_stricmp(c, "challengeResponse"))
+	{
+		char *strver;
+		int ver;
 
-		if ( cls.state != CA_CONNECTING ) {
+		if ( cls.state != CA_CONNECTING )
+		{
 			Com_DPrintf( "Unwanted challenge response received. Ignored.\n" );
 			return qfalse;
 		}
 
 		c = Cmd_Argv( 2 );
-		if ( *c != '\0' )
+		if ( *c )
 			challenge = atoi( c );
 
-		clc.compat = qtrue;
-		s = Cmd_Argv( 3 ); // analyze server protocol version
-		if ( *s != '\0' ) {
-			int sv_proto = atoi( s );
-			if ( sv_proto > OLD_PROTOCOL_VERSION ) {
-				if ( sv_proto == NEW_PROTOCOL_VERSION || sv_proto == com_protocol->integer ) {
+ 		clc.compat = qtrue;
+		strver = Cmd_Argv( 3 ); // analyze server protocol version
+		if ( *strver ) {
+			ver = atoi( strver );
+			if ( ver != PROTOCOL_VERSION ) {
+				if ( ver == NEW_PROTOCOL_VERSION ) {
 					clc.compat = qfalse;
 				} else {
-					int cl_proto = com_protocol->integer;
-					if ( cl_proto == DEFAULT_PROTOCOL_VERSION ) {
-						// we support new protocol features by default
-						cl_proto = NEW_PROTOCOL_VERSION;
-					}
 					Com_Printf( S_COLOR_YELLOW "Warning: Server reports protocol version %d, "
-						"we have %d. Trying legacy protocol %d.\n",
-						sv_proto, cl_proto, OLD_PROTOCOL_VERSION );
+						   "we have %d. Trying legacy protocol %d.\n",
+						   ver, NEW_PROTOCOL_VERSION, PROTOCOL_VERSION );
 				}
 			}
 		}
 
 		if ( clc.compat )
 		{
-			if ( !NET_CompareAdr( from, &clc.serverAddress ) )
+			if( !NET_CompareAdr( from, &clc.serverAddress ) )
 			{
 				// This challenge response is not coming from the expected address.
 				// Check whether we have a matching client challenge to prevent
 				// connection hi-jacking.
-				if ( *c == '\0' || challenge != clc.challenge )
+				if( !*c || challenge != clc.challenge )
 				{
 					Com_DPrintf( "Challenge response received from unexpected source. Ignored.\n" );
 					return qfalse;
@@ -2681,7 +2939,7 @@ static qboolean CL_ConnectionlessPacket( const netadr_t *from, msg_t *msg ) {
 		}
 		else
 		{
-			if ( *c == '\0' || challenge != clc.challenge )
+			if( !*c || challenge != clc.challenge )
 			{
 				Com_Printf( "Bad challenge for challengeResponse. Ignored.\n" );
 				return qfalse;
@@ -2716,44 +2974,30 @@ static qboolean CL_ConnectionlessPacket( const netadr_t *from, msg_t *msg ) {
 			return qfalse;
 		}
 
-		if ( !clc.compat ) {
-			// first argument: challenge response
-			c = Cmd_Argv( 1 );
-			if ( *c != '\0' ) {
-				challenge = atoi( c );
-			} else {
-				Com_Printf( "Bad connectResponse received. Ignored.\n" );
+		if ( !clc.compat )
+		{
+			c = Cmd_Argv(1);
+
+			if(*c)
+				challenge = atoi(c);
+			else
+			{
+				Com_Printf("Bad connectResponse received. Ignored.\n");
 				return qfalse;
 			}
 
-			if ( challenge != clc.challenge ) {
-				Com_Printf( "ConnectResponse with bad challenge received. Ignored.\n" );
+			if(challenge != clc.challenge)
+			{
+				Com_Printf("ConnectResponse with bad challenge received. Ignored.\n");
 				return qfalse;
-			}
-
-			if ( com_protocolCompat ) {
-				// enforce dm68-compatible stream for legacy/unknown servers
-				clc.compat = qtrue;
-			}
-
-			// second (optional) argument: actual protocol version used on server-side
-			c = Cmd_Argv( 2 );
-			if ( *c != '\0' ) {
-				int protocol = atoi( c );
-				if ( protocol > 0 ) {
-					if ( protocol <= OLD_PROTOCOL_VERSION ) {
-						clc.compat = qtrue;
-					} else {
-						clc.compat = qfalse;
-					}
-				}
 			}
 		}
 
-		Netchan_Setup( NS_CLIENT, &clc.netchan, from, Cvar_VariableIntegerValue( "net_qport" ), clc.challenge, clc.compat );
+		Netchan_Setup( NS_CLIENT, &clc.netchan, from, Cvar_VariableIntegerValue("net_qport"),
+			clc.challenge, clc.compat );
 
 		cls.state = CA_CONNECTED;
-		clc.lastPacketSentTime = cls.realtime - 9999; // send first packet immediately
+		clc.lastPacketSentTime = -9999;		// send first packet immediately
 		return qtrue;
 	}
 
@@ -2812,6 +3056,14 @@ static qboolean CL_ConnectionlessPacket( const netadr_t *from, msg_t *msg ) {
 		CL_ServersResponsePacket( from, msg, qtrue );
 		return qfalse;
 	}
+
+	#ifdef USE_AUTH
+	//@Barbatos @Kalish
+	if ( strstr(c, "AUTH:CL") ) {
+    	VM_Call(uivm, 1, UI_AUTHSERVER_PACKET, from);
+		return qfalse;
+	}
+	#endif
 
 	Com_DPrintf( "Unknown connectionless packet command.\n" );
 	return qfalse;
@@ -2980,6 +3232,8 @@ CL_Frame
 ==================
 */
 void CL_Frame( int msec, int realMsec ) {
+	float fps;
+	float frameDuration;
 
 #ifdef USE_CURL
 	if ( download.cURL ) {
@@ -3027,7 +3281,6 @@ void CL_Frame( int msec, int realMsec ) {
 	if ( CL_VideoRecording() && msec ) {
 		// save the current screen
 		if ( cls.state == CA_ACTIVE || cl_forceavidemo->integer ) {
-			float fps, frameDuration;
 
 			if ( com_timescale->value > 0.0001f )
 				fps = MIN( cl_aviFrameRate->value / com_timescale->value, 1000.0f );
@@ -3040,8 +3293,6 @@ void CL_Frame( int msec, int realMsec ) {
 
 			msec = (int)frameDuration;
 			clc.aviVideoFrameRemainder = frameDuration - msec;
-
-			realMsec = msec; // sync sound duration
 		}
 	}
 
@@ -3067,7 +3318,7 @@ void CL_Frame( int msec, int realMsec ) {
 			// Replace the ":" in the address as it is not a valid
 			// file name character
 			p = strchr( serverName, ':' );
-			if ( p ) {
+			if( p ) {
 				*p = '.';
 			}
 
@@ -3077,15 +3328,17 @@ void CL_Frame( int msec, int realMsec ) {
 			Cbuf_ExecuteText( EXEC_NOW,
 					va( "record %s-%s-%s", nowString, serverName, mapName ) );
 		}
-		else if ( cls.state != CA_ACTIVE && clc.demorecording ) {
+		else if( cls.state != CA_ACTIVE && clc.demorecording ) {
 			// Recording, but not CA_ACTIVE, so stop recording
-			CL_StopRecord_f();
+			CL_StopRecord_f( );
 		}
 	}
 
 	// decide the simulation time
 	cls.frametime = msec;
 	cls.realtime += msec;
+
+	SCR_NetMonitorAddFrametime( msec );
 
 	if ( cl_timegraph->integer ) {
 		SCR_DebugGraph( msec * 0.25f );
@@ -3129,7 +3382,7 @@ void CL_Frame( int msec, int realMsec ) {
 CL_RefPrintf
 ================
 */
-static void FORMAT_PRINTF(2, 3) QDECL CL_RefPrintf( printParm_t level, const char *fmt, ... ) {
+static __attribute__ ((format (printf, 2, 3))) void QDECL CL_RefPrintf( printParm_t level, const char *fmt, ... ) {
 	va_list		argptr;
 	char		msg[MAXPRINTMSG];
 
@@ -3140,8 +3393,8 @@ static void FORMAT_PRINTF(2, 3) QDECL CL_RefPrintf( printParm_t level, const cha
 	switch ( level ) {
 		default: Com_Printf( "%s", msg ); break;
 		case PRINT_DEVELOPER: Com_DPrintf( "%s", msg ); break;
-		case PRINT_WARNING: Com_Printf( S_COLOR_WARNING "%s", msg ); break;
-		case PRINT_ERROR: Com_Printf( S_COLOR_ERROR "%s", msg ); break;
+		case PRINT_WARNING: Com_Printf( S_COLOR_YELLOW "%s", msg ); break;
+		case PRINT_ERROR: Com_Printf( S_COLOR_RED "%s", msg ); break;
 	}
 }
 
@@ -3193,12 +3446,6 @@ CL_InitRenderer
 ============
 */
 static void CL_InitRenderer( void ) {
-
-	// fixup renderer -EC-
-	if ( !re.BeginRegistration ) {
-		CL_InitRef();
-	}
-
 	// this sets up the renderer and calls R_Init
 	re.BeginRegistration( &cls.glconfig );
 
@@ -3206,11 +3453,13 @@ static void CL_InitRenderer( void ) {
 	cls.charSetShader = re.RegisterShader( "gfx/2d/bigchars" );
 	cls.whiteShader = re.RegisterShader( "white" );
 	cls.consoleShader = re.RegisterShader( "console" );
-
-	Con_CheckResize();
-
-	g_console_field_width = ((cls.glconfig.vidWidth / smallchar_width)) - 2;
+	g_console_field_width = cls.glconfig.vidWidth / smallchar_width - 2;
 	g_consoleField.widthInChars = g_console_field_width;
+
+	if (FS_ReadFile("fonts/fontImage_20.dat", NULL) > 0) {
+		re.RegisterFont("fonts/fontImage_20.dat", 20, &cls.font);
+		cls.fontFont = qtrue;
+	}
 
 	// for 640x480 virtualized screen
 	cls.biasY = 0;
@@ -3243,25 +3492,9 @@ void CL_StartHunkUsers( void ) {
 		return;
 	}
 
-	if ( cls.state >= CA_LOADING ) {
-		// try to apply map-depending configuration from cvar cl_mapConfig_<mapname> cvars
-		const char *info = cl.gameState.stringData + cl.gameState.stringOffsets[ CS_SERVERINFO ];
-		const char *mapname = Info_ValueForKey( info, "mapname" );
-		if ( mapname && *mapname != '\0' ) {
-			const char *fmt = "cl_mapConfig_%s";
-			const char *cmd = Cvar_VariableString( va( fmt, mapname ) );
-			if ( cmd && *cmd != '\0' ) {
-				Cbuf_AddText( cmd );
-				Cbuf_AddText( "\n" );
-			} else {
-				// apply mapname "default" if present
-				cmd = Cvar_VariableString( va( fmt, "default" ) );
-				if ( cmd && *cmd != '\0' ) {
-					Cbuf_AddText( cmd );
-					Cbuf_AddText( "\n" );
-				}
-			}
-		}
+	// fixup renderer -EC-
+	if ( !re.BeginRegistration ) {
+		CL_InitRef();
 	}
 
 	if ( !cls.rendererStarted ) {
@@ -3335,12 +3568,22 @@ Sets console chars height
 */
 static void CL_SetScaling( float factor, int captureWidth, int captureHeight ) {
 
-	if ( cls.con_factor != factor ) {
-		// rescale console
-		con_scale->modified = qtrue;
-	}
+	float scale;
+	int h;
 
-	cls.con_factor = factor;
+	// adjust factor proportionally to FullHD height (1080 pixels), with 1/16 granularity
+	h = (captureHeight * 16 / 1080);
+	scale = h / 16.0f;
+	if ( scale < 1.0f )
+		scale = 1.0f;
+
+	factor *= scale;
+
+	// set console scaling
+	smallchar_width = SMALLCHAR_WIDTH * factor;
+	smallchar_height = SMALLCHAR_HEIGHT * factor;
+	bigchar_width = BIGCHAR_WIDTH * factor;
+	bigchar_height = BIGCHAR_HEIGHT * factor;
 
 	// set custom capture resolution
 	cls.captureWidth = captureWidth;
@@ -3358,7 +3601,7 @@ static void CL_InitRef( void ) {
 	refexport_t	*ret;
 #ifdef USE_RENDERER_DLOPEN
 	GetRefAPI_t		GetRefAPI;
-	char			dllName[ MAX_OSPATH ], *ospath;
+	char			dllName[ MAX_OSPATH ];
 #endif
 
 	CL_InitGLimp_Cvars();
@@ -3374,14 +3617,12 @@ static void CL_InitRef( void ) {
 #endif
 
 	Com_sprintf( dllName, sizeof( dllName ), RENDERER_PREFIX "_%s_" REND_ARCH_STRING DLL_EXT, cl_renderer->string );
-	ospath = FS_BuildOSPath( Sys_DefaultBasePath(), dllName, NULL );
-	rendererLib = Sys_LoadLibrary( ospath );
+	rendererLib = FS_LoadLibrary( dllName );
 	if ( !rendererLib )
 	{
 		Cvar_ForceReset( "cl_renderer" );
 		Com_sprintf( dllName, sizeof( dllName ), RENDERER_PREFIX "_%s_" REND_ARCH_STRING DLL_EXT, cl_renderer->string );
-		ospath = FS_BuildOSPath( Sys_DefaultBasePath(), dllName, NULL );
-		rendererLib = Sys_LoadLibrary( ospath );
+		rendererLib = FS_LoadLibrary( dllName );
 		if ( !rendererLib )
 		{
 			Com_Error( ERR_FATAL, "Failed to load renderer %s", dllName );
@@ -3402,6 +3643,7 @@ static void CL_InitRef( void ) {
 
 	rimp.Cmd_AddCommand = Cmd_AddCommand;
 	rimp.Cmd_RemoveCommand = Cmd_RemoveCommand;
+//    rimp.Cmd_SetDescription = Cmd_SetDescription;
 	rimp.Cmd_Argc = Cmd_Argc;
 	rimp.Cmd_Argv = Cmd_Argv;
 	rimp.Cmd_ExecuteText = Cbuf_ExecuteText;
@@ -3462,16 +3704,14 @@ static void CL_InitRef( void ) {
 	rimp.Sys_LowPhysicalMemory = Sys_LowPhysicalMemory;
 	rimp.Com_RealTime = Com_RealTime;
 
-	rimp.GLimp_InitGamma = GLimp_InitGamma;
-	rimp.GLimp_SetGamma = GLimp_SetGamma;
-
 	// OpenGL API
-#ifdef USE_OPENGL_API
 	rimp.GLimp_Init = GLimp_Init;
 	rimp.GLimp_Shutdown = GLimp_Shutdown;
 	rimp.GL_GetProcAddress = GL_GetProcAddress;
+
 	rimp.GLimp_EndFrame = GLimp_EndFrame;
-#endif
+	rimp.GLimp_InitGamma = GLimp_InitGamma;
+	rimp.GLimp_SetGamma = GLimp_SetGamma;
 
 	// Vulkan API
 #ifdef USE_VULKAN_API
@@ -3499,7 +3739,7 @@ static void CL_InitRef( void ) {
 //===========================================================================================
 
 
-static void CL_SetModel_f( void ) {
+void CL_SetModel_f( void ) {
 	const char *arg;
 	char name[ MAX_CVAR_VALUE_STRING ];
 
@@ -3525,7 +3765,7 @@ video
 video [filename]
 ===============
 */
-static void CL_Video_f( void )
+void CL_Video_f( void )
 {
 	char filename[ MAX_OSPATH ];
 	const char *ext;
@@ -3589,7 +3829,7 @@ static void CL_Video_f( void )
 	Q_strncpyz( clc.videoName, filename, sizeof( clc.videoName ) );
 	clc.videoIndex = 0;
 
-	CL_OpenAVIForWriting( va( "%s.%s", clc.videoName, ext ), pipe, qfalse );
+	CL_OpenAVIForWriting( va( "%s.%s", clc.videoName, ext ), pipe );
 }
 
 
@@ -3600,7 +3840,7 @@ CL_StopVideo_f
 */
 static void CL_StopVideo_f( void )
 {
-	CL_CloseAVI( qfalse );
+  CL_CloseAVI();
 }
 
 
@@ -3609,9 +3849,9 @@ static void CL_StopVideo_f( void )
 CL_CompleteRecordName
 ====================
 */
-static void CL_CompleteVideoName(const char *args, int argNum )
+static void CL_CompleteVideoName( char *args, int argNum )
 {
-	if ( argNum == 2 )
+	if( argNum == 2 )
 	{
 		Field_CompleteFilename( "videos", ".avi", qtrue, FS_MATCH_EXTERN | FS_MATCH_STICK );
 	}
@@ -3674,32 +3914,30 @@ typedef struct vidmode_s
 
 static const vidmode_t cl_vidModes[] =
 {
-	{ "Mode  0: 320x240",			320,	240,	1 },
-	{ "Mode  1: 400x300",			400,	300,	1 },
-	{ "Mode  2: 512x384",			512,	384,	1 },
-	{ "Mode  3: 640x480",			640,	480,	1 },
-	{ "Mode  4: 800x600",			800,	600,	1 },
-	{ "Mode  5: 960x720",			960,	720,	1 },
-	{ "Mode  6: 1024x768",			1024,	768,	1 },
-	{ "Mode  7: 1152x864",			1152,	864,	1 },
-	{ "Mode  8: 1280x1024 (5:4)",	1280,	1024,	1 },
-	{ "Mode  9: 1600x1200",			1600,	1200,	1 },
-	{ "Mode 10: 2048x1536",			2048,	1536,	1 },
-	{ "Mode 11: 856x480 (wide)",	856,	480,	1 },
-	// extra modes:
-	{ "Mode 12: 1280x960",			1280,	960,	1 },
-	{ "Mode 13: 1280x720",			1280,	720,	1 },
-	{ "Mode 14: 1280x800 (16:10)",	1280,	800,	1 },
-	{ "Mode 15: 1366x768",			1366,	768,	1 },
-	{ "Mode 16: 1440x900 (16:10)",	1440,	900,	1 },
-	{ "Mode 17: 1600x900",			1600,	900,	1 },
+    { "Mode  0: 320x240 (4:3)",		320,	240,	1 },
+    { "Mode  1: 400x300 (4:3)",		400,	300,	1 },
+    { "Mode  2: 512x384 (4:3)",		512,	384,	1 },
+    { "Mode  3: 640x480 (4:3)",		640,	480,	1 },
+    { "Mode  4: 800x600 (4:3)",		800,	600,	1 },
+    { "Mode  5: 960x720 (4:3)",		960,	720,	1 },
+    { "Mode  6: 1024x768 (4:3)",	1024,	768,	1 },
+    { "Mode  7: 1152x864 (4:3)",	1152,	864,	1 },
+    { "Mode  8: 1280x1024 (5:4)",	1280,	1024,	1 },
+    { "Mode  9: 1600x1200 (4:3)",	1600,	1200,	1 },
+    { "Mode 10: 2048x1536 (4:3)",	2048,	1536,	1 },
+    { "Mode 11: 856x480 (wide)",	856,	480,	1 },
+    { "Mode 12: 1280x720 (wide)",	1280, 	720,	1 },
+    { "Mode 13: 1366x768 (wide)",	1366,	768,	1 },
+    { "Mode 14: 1600x900 (wide)",	1600,	900,	1 },
+    { "Mode 15: 1680x1050 (wide)",	1680,	1050,	1 },
+    { "Mode 16: 1920x1080 (wide)",	1920,	1080,	1 },
+    { "Mode 17: 2560x1440 (wide)",	2560,	1440,	1 },
 	{ "Mode 18: 1680x1050 (16:10)",	1680,	1050,	1 },
-	{ "Mode 19: 1920x1080",			1920,	1080,	1 },
-	{ "Mode 20: 1920x1200 (16:10)",	1920,	1200,	1 },
-	{ "Mode 21: 2560x1080 (21:9)",	2560,	1080,	1 },
-	{ "Mode 22: 3440x1440 (21:9)",	3440,	1440,	1 },
-	{ "Mode 23: 3840x2160",			3840,	2160,	1 },
-	{ "Mode 24: 4096x2160 (4K)",	4096,	2160,	1 }
+	{ "Mode 19: 1920x1200 (16:10)",	1920,	1200,	1 },
+	{ "Mode 20: 2560x1080 (21:9)",	2560,	1080,	1 },
+	{ "Mode 21: 3440x1440 (21:9)",	3440,	1440,	1 },
+	{ "Mode 22: 3840x2160 (16:9)",	3840,	2160,	1 },
+	{ "Mode 23: 4096x2160 (4K)",	4096,	2160,	1 }
 };
 static const int s_numVidModes = ARRAY_LEN( cl_vidModes );
 
@@ -3775,72 +4013,77 @@ static void CL_InitGLimp_Cvars( void )
 {
 	// shared with GLimp
 	r_allowSoftwareGL = Cvar_Get( "r_allowSoftwareGL", "0", CVAR_LATCH );
-	Cvar_SetDescription( r_allowSoftwareGL, "Toggle the use of the default software OpenGL driver supplied by the Operating System." );
+    Cvar_SetDescription( r_allowSoftwareGL, "Toggle the use of the default software OpenGL driver\nDefault: 0" );
+
+    r_swapInterval = Cvar_Get( "r_swapInterval", "0", CVAR_ARCHIVE_ND );
+    Cvar_SetDescription( r_swapInterval, "Toggle frame swapping\nDefault: 0" );
+
+    r_glDriver = Cvar_Get( "r_glDriver", OPENGL_DRIVER_NAME, CVAR_ARCHIVE_ND | CVAR_LATCH );
+    Cvar_SetDescription( r_glDriver, "Used OpenGL driver by name\nDefault: opengl32" );
+
 	r_swapInterval = Cvar_Get( "r_swapInterval", "0", CVAR_ARCHIVE_ND );
-	Cvar_SetDescription( r_swapInterval, "V-blanks to wait before swapping buffers.\n 0: No V-Sync\n 1: Synced to the monitor's refresh rate." );
 	r_glDriver = Cvar_Get( "r_glDriver", OPENGL_DRIVER_NAME, CVAR_ARCHIVE_ND | CVAR_LATCH );
-	Cvar_SetDescription( r_glDriver, "Specifies the OpenGL driver to use, will revert back to default if driver name set is invalid." );
 
 	r_displayRefresh = Cvar_Get( "r_displayRefresh", "0", CVAR_LATCH );
-	Cvar_CheckRange( r_displayRefresh, "0", "500", CV_INTEGER );
-	Cvar_SetDescription( r_displayRefresh, "Override monitor refresh rate in fullscreen mode:\n   0 - use current monitor refresh rate\n > 0 - use custom refresh rate" );
+	Cvar_CheckRange( r_displayRefresh, "0", "360", CV_INTEGER );
+	Cvar_SetDescription( r_displayRefresh, "Override monitor refresh rate in fullscreen mode:\n  0 - use current monitor refresh rate\n >0 - use custom refresh rate" );
 
-	vid_xpos = Cvar_Get( "vid_xpos", "3", CVAR_ARCHIVE );
-	Cvar_CheckRange( vid_xpos, NULL, NULL, CV_INTEGER );
-	Cvar_SetDescription( vid_xpos, "Saves/sets window X-coordinate when windowed, requires \\vid_restart." );
-	vid_ypos = Cvar_Get( "vid_ypos", "22", CVAR_ARCHIVE );
+    vid_xpos = Cvar_Get( "vid_xpos", "3", CVAR_ARCHIVE );
+    Cvar_CheckRange( vid_xpos, NULL, NULL, CV_INTEGER );
+
+    vid_ypos = Cvar_Get( "vid_ypos", "22", CVAR_ARCHIVE );
+    Cvar_SetDescription( vid_xpos, "Set the window y starting position on the screen\nDefault: 22" );
 	Cvar_CheckRange( vid_ypos, NULL, NULL, CV_INTEGER );
-	Cvar_SetDescription( vid_ypos, "Saves/sets window Y-coordinate when windowed, requires \\vid_restart." );
 
 	r_noborder = Cvar_Get( "r_noborder", "0", CVAR_ARCHIVE_ND | CVAR_LATCH );
 	Cvar_CheckRange( r_noborder, "0", "1", CV_INTEGER );
-	Cvar_SetDescription( r_noborder, "Setting to 1 will remove window borders and title bar in windowed mode, hold ALT to drag & drop it with opened console." );
+    Cvar_SetDescription( r_noborder, "Set window borderless mode usually set by SDL and fullscreen mode\nDefault: 0" );
 
-	r_mode = Cvar_Get( "r_mode", "-2", CVAR_ARCHIVE | CVAR_LATCH );
+    r_mode = Cvar_Get( "r_mode", "-2", CVAR_ARCHIVE | CVAR_LATCH );
+	r_modeFullscreen = Cvar_Get( "r_modeFullscreen", "", 0 );
 	Cvar_CheckRange( r_mode, "-2", va( "%i", s_numVidModes-1 ), CV_INTEGER );
 	Cvar_SetDescription( r_mode, "Set video mode:\n -2 - use current desktop resolution\n -1 - use \\r_customWidth and \\r_customHeight\n  0..N - enter \\modelist for details" );
-#ifdef _DEBUG
-	r_modeFullscreen = Cvar_Get( "r_modeFullscreen", "", CVAR_ARCHIVE | CVAR_LATCH );
-#else
-	r_modeFullscreen = Cvar_Get( "r_modeFullscreen", "-2", CVAR_ARCHIVE | CVAR_LATCH );
-#endif
-	Cvar_SetDescription( r_modeFullscreen, "Dedicated fullscreen mode, set to \"\" to use \\r_mode in all cases." );
+	Cvar_SetDescription( r_modeFullscreen, "Dedicated fullscreen mode, set to \"\" to use \\r_mode in all cases" );
+
 	r_fullscreen = Cvar_Get( "r_fullscreen", "1", CVAR_ARCHIVE | CVAR_LATCH );
-	Cvar_SetDescription( r_fullscreen, "Fullscreen mode. Set to 0 for windowed mode." );
-	r_customPixelAspect = Cvar_Get( "r_customPixelAspect", "1", CVAR_ARCHIVE_ND | CVAR_LATCH );
-	Cvar_SetDescription( r_customPixelAspect, "Enables custom aspect of the screen, with \\r_mode -1." );
-	r_customwidth = Cvar_Get( "r_customWidth", "1600", CVAR_ARCHIVE | CVAR_LATCH );
-	Cvar_CheckRange( r_customwidth, "4", NULL, CV_INTEGER );
-	Cvar_SetDescription( r_customwidth, "Custom width to use with \\r_mode -1." );
+    Cvar_SetDescription( r_fullscreen, "Set fullscreen mode on startup\nDefault: 1" );
+
+    r_customPixelAspect = Cvar_Get( "r_customPixelAspect", "1", CVAR_ARCHIVE_ND | CVAR_LATCH );
+    Cvar_SetDescription( r_customPixelAspect, "Custom pixel aspect to use with \\r_mode -1\nDefault: 1" );
+
+    r_customwidth = Cvar_Get( "r_customWidth", "1600", CVAR_ARCHIVE | CVAR_LATCH );
 	r_customheight = Cvar_Get( "r_customHeight", "1024", CVAR_ARCHIVE | CVAR_LATCH );
+	Cvar_CheckRange( r_customwidth, "4", NULL, CV_INTEGER );
 	Cvar_CheckRange( r_customheight, "4", NULL, CV_INTEGER );
-	Cvar_SetDescription( r_customheight, "Custom height to use with \\r_mode -1." );
+	Cvar_SetDescription( r_customwidth, "Custom width to use with \\r_mode -1" );
+	Cvar_SetDescription( r_customheight, "Custom height to use with \\r_mode -1" );
 
 	r_colorbits = Cvar_Get( "r_colorbits", "0", CVAR_ARCHIVE_ND | CVAR_LATCH );
 	Cvar_CheckRange( r_colorbits, "0", "32", CV_INTEGER );
-	Cvar_SetDescription( r_colorbits, "Sets color bit depth, set to 0 to use desktop settings." );
+    Cvar_SetDescription( r_colorbits, "Set number of bits used for each color from 0 to 32 bit, usually set by SDL\nDefault: 0" );
 
-	// shared with renderer:
+    // shared with renderer:
 	cl_stencilbits = Cvar_Get( "r_stencilbits", "8", CVAR_ARCHIVE_ND | CVAR_LATCH );
 	Cvar_CheckRange( cl_stencilbits, "0", "8", CV_INTEGER );
-	Cvar_SetDescription( cl_stencilbits, "Stencil buffer size, required to be 8 for stencil shadows." );
-	cl_depthbits = Cvar_Get( "r_depthbits", "0", CVAR_ARCHIVE_ND | CVAR_LATCH );
-	Cvar_CheckRange( cl_depthbits, "0", "32", CV_INTEGER );
-	Cvar_SetDescription( cl_depthbits, "Sets precision of Z-buffer." );
+    Cvar_SetDescription(cl_stencilbits, "Stencil buffer size (0, 8bit, and 16bit)\nDefault: 8" );
 
-	cl_drawBuffer = Cvar_Get( "r_drawBuffer", "GL_BACK", CVAR_CHEAT );
-	Cvar_SetDescription( cl_drawBuffer, "Specifies buffer to draw from: GL_FRONT or GL_BACK." );
+    cl_depthbits = Cvar_Get( "r_depthbits", "0", CVAR_ARCHIVE_ND | CVAR_LATCH );
+	Cvar_CheckRange( cl_depthbits, "0", "32", CV_INTEGER );
+    Cvar_SetDescription(cl_depthbits, "Set the number of depth bits\nDefault: 0");
+
+    cl_drawBuffer = Cvar_Get( "r_drawBuffer", "GL_BACK", CVAR_CHEAT );
+    Cvar_SetDescription(cl_drawBuffer, "Set which frame buffer to draw into using framebuffers\nDefault: GL_BACK");
+
 #ifdef USE_RENDERER_DLOPEN
 #ifdef RENDERER_DEFAULT
 	cl_renderer = Cvar_Get( "cl_renderer", XSTRING( RENDERER_DEFAULT ), CVAR_ARCHIVE | CVAR_LATCH );
 #else
 	cl_renderer = Cvar_Get( "cl_renderer", "opengl", CVAR_ARCHIVE | CVAR_LATCH );
 #endif
-	Cvar_SetDescription( cl_renderer, "Sets your desired renderer, requires \\vid_restart." );
-
 	if ( !isValidRenderer( cl_renderer->string ) ) {
 		Cvar_ForceReset( "cl_renderer" );
 	}
+    Cvar_SetDescription(cl_renderer, "Set the name of the dynamically linked renderer\nDefault: opengl");
 #endif
 }
 
@@ -3852,7 +4095,6 @@ CL_Init
 */
 void CL_Init( void ) {
 	const char *s;
-	cvar_t *cv;
 
 	Com_Printf( "----- Client Initialization -----\n" );
 
@@ -3871,67 +4113,75 @@ void CL_Init( void ) {
 	// register client variables
 	//
 	cl_noprint = Cvar_Get( "cl_noprint", "0", 0 );
-	Cvar_SetDescription( cl_noprint, "Disable printing of information in the console." );
-	cl_motd = Cvar_Get( "cl_motd", "1", 0 );
-	Cvar_SetDescription( cl_motd, "Toggle the display of the 'Message of the day'. When Quake 3 Arena starts a map up, it sends the GL_RENDERER string to the Message Of The Day server at id. This responds back with a message of the day to the client." );
+//    Cvar_SetDescription("cl_noprint", "Don't printout messages to your screen, only the console\nDefault: 0");
 
-	cl_timeout = Cvar_Get( "cl_timeout", "200", 0 );
+    cl_motd = Cvar_Get( "cl_motd", "1", 0 );
+    Cvar_SetDescription(cl_motd, "Show the message of the day from the server\nDefault: 1");
+
+    cl_timeout = Cvar_Get( "cl_timeout", "200", 0 );
 	Cvar_CheckRange( cl_timeout, "5", NULL, CV_INTEGER );
-	Cvar_SetDescription( cl_timeout, "Duration of receiving nothing from server for client to decide it must be disconnected (in seconds)." );
+    Cvar_SetDescription(cl_timeout, "Seconds to wait before client drops from the server after a timeout\nDefault: 10 seconds");
 
-	cl_autoNudge = Cvar_Get( "cl_autoNudge", "0", CVAR_TEMP );
+    cl_autoNudge = Cvar_Get( "cl_autoNudge", "0", CVAR_TEMP );
 	Cvar_CheckRange( cl_autoNudge, "0", "1", CV_FLOAT );
-	Cvar_SetDescription( cl_autoNudge, "Automatic time nudge that uses your average ping as the time nudge, values:\n  0 - use fixed \\cl_timeNudge\n (0..1] - factor of median average ping to use as timenudge\n" );
-	cl_timeNudge = Cvar_Get( "cl_timeNudge", "0", CVAR_TEMP );
+    Cvar_SetDescription(cl_autoNudge, "Automatically set cl_timeNudge value based on connection stream\nDefault: 0");
+
+    cl_timeNudge = Cvar_Get( "cl_timeNudge", "0", CVAR_PROTECTED );
 	Cvar_CheckRange( cl_timeNudge, "-30", "30", CV_INTEGER );
-	Cvar_SetDescription( cl_timeNudge, "Allows more or less latency to be added in the interest of better smoothness or better responsiveness." );
+    Cvar_SetDescription(cl_timeNudge, "Effectively adds local lag to interpolate movement instead of skipping (try 100 for a really laggy server)\nDefault: 0");
 
-	cl_shownet = Cvar_Get ("cl_shownet", "0", CVAR_TEMP );
-	Cvar_SetDescription( cl_shownet, "Toggle the display of current network status." );
-	cl_showTimeDelta = Cvar_Get ("cl_showTimeDelta", "0", CVAR_TEMP );
-	Cvar_SetDescription( cl_showTimeDelta, "Prints the time delta of each packet to the console (the time delta between server updates)." );
-	rcon_client_password = Cvar_Get ("rconPassword", "", CVAR_TEMP );
-	Cvar_SetDescription( rcon_client_password, "Sets a remote console password so clients may change server settings without direct access to the server console." );
-	cl_activeAction = Cvar_Get( "activeAction", "", CVAR_TEMP );
-	Cvar_SetDescription( cl_activeAction, "Contents of this variable will be executed upon first frame of play.\nNote: It is cleared every time it is executed." );
+    cl_shownet = Cvar_Get ("cl_shownet", "0", CVAR_TEMP );
+    Cvar_SetDescription( cl_shownet, "Display network quality info\nDefault: 0" );
 
-	cl_autoRecordDemo = Cvar_Get ("cl_autoRecordDemo", "0", CVAR_ARCHIVE);
-	Cvar_SetDescription( cl_autoRecordDemo, "Auto-record demos when starting or joining a game." );
-	cl_drawRecording = Cvar_Get("cl_drawRecording", "1", CVAR_ARCHIVE);
-	Cvar_SetDescription( cl_drawRecording, "Hide (0) or shorten (1) \"RECORDING\" HUD message when recording demo." );
+    cl_showTimeDelta = Cvar_Get ("cl_showTimeDelta", "0", CVAR_TEMP );
+    Cvar_SetDescription( cl_showTimeDelta, "Display time delta between server updates\nDefault: 0" );
 
-	cl_aviFrameRate = Cvar_Get ("cl_aviFrameRate", "25", CVAR_ARCHIVE);
+    rcon_client_password = Cvar_Get ("rconPassword", "", CVAR_TEMP );
+    Cvar_SetDescription( rcon_client_password, "Set the rcon password when connecting to a passworded server\nDefault: empty" );
+
+    cl_activeAction = Cvar_Get( "activeAction", "", CVAR_TEMP );
+    Cvar_SetDescription( cl_activeAction, "Variable holds a command to be executed upon connecting to a server\nDefault: empty" );
+
+    cl_autoRecordDemo = Cvar_Get ("cl_autoRecordDemo", "0", CVAR_ARCHIVE);
+    Cvar_SetDescription( cl_autoRecordDemo, "Automatically start a demo recording when the game start\nDefault: 0" );
+
+    cl_aviFrameRate = Cvar_Get ("cl_aviFrameRate", "25", CVAR_ARCHIVE);
 	Cvar_CheckRange( cl_aviFrameRate, "1", "1000", CV_INTEGER );
-	Cvar_SetDescription( cl_aviFrameRate, "The framerate used for capturing video." );
-	cl_aviMotionJpeg = Cvar_Get ("cl_aviMotionJpeg", "1", CVAR_ARCHIVE);
-	Cvar_SetDescription( cl_aviMotionJpeg, "Enable/disable the MJPEG codec for avi output." );
-	cl_forceavidemo = Cvar_Get ("cl_forceavidemo", "0", 0);
-	Cvar_SetDescription( cl_forceavidemo, "Forces all demo recording into a sequence of screenshots in TGA format." );
+    Cvar_SetDescription( cl_aviFrameRate, "Frame rate for AVI video capture\nDefault: 25" );
 
-	cl_aviPipeFormat = Cvar_Get( "cl_aviPipeFormat",
-		"-preset medium -crf 23 -c:v libx264 -flags +cgop -pix_fmt yuvj420p "
-		"-bf 2 -c:a aac -strict -2 -b:a 160k -movflags faststart",
+    cl_aviMotionJpeg = Cvar_Get ("cl_aviMotionJpeg", "1", CVAR_ARCHIVE);
+    Cvar_SetDescription( cl_aviMotionJpeg, "Use the motion JPEG format for AVI video capture\nDefault: 1" );
+
+    cl_forceavidemo = Cvar_Get ("cl_forceavidemo", "0", 0);
+    Cvar_SetDescription( cl_forceavidemo, "Force the use of AVI video format for demo capture\nDefault: 0" );
+
+
+    cl_aviPipeFormat = Cvar_Get( "cl_aviPipeFormat",
+		"-preset medium -crf 23 -vcodec libx264 -flags +cgop -pix_fmt yuv420p "
+		"-bf 2 -codec:a aac -strict -2 -b:a 160k -r:a 22050 -movflags faststart",
 		CVAR_ARCHIVE );
-	Cvar_SetDescription( cl_aviPipeFormat, "Encoder parameters used for \\video-pipe." );
+    Cvar_SetDescription(cl_aviPipeFormat, "Extra flags send to the AVI encoding pipeline\nDefault: -preset medium -r:a ...");
 
 	rconAddress = Cvar_Get ("rconAddress", "", 0);
-	Cvar_SetDescription( rconAddress, "The IP address of the remote console you wish to connect to." );
+    Cvar_SetDescription(rconAddress, "Set the server address for rcon commands, rcon can be used without being connected to a game\nDefault: empty");
 
-	cl_allowDownload = Cvar_Get( "cl_allowDownload", "1", CVAR_ARCHIVE_ND );
-	Cvar_SetDescription( cl_allowDownload, "Enables downloading of content needed in server. Valid bitmask flags:\n 1: Downloading enabled\n 2: Do not use HTTP/FTP downloads\n 4: Do not use UDP downloads" );
+    cl_lastServerAddress = Cvar_Get("cl_lastServerAddress", "", CVAR_ROM | CVAR_PROTECTED );
+	Cvar_SetDescription(cl_lastServerAddress, "Last server you were connected to.");
+
+	cl_allowDownload = Cvar_Get( "cl_allowDownload", "1", CVAR_ROM | CVAR_PROTECTED );
+    Cvar_SetDescription(cl_allowDownload, "Toggle automatic downloading of maps, models, sounds, and textures\n1 - allow downloads\n2 - disallow redirects, must download from the same server\n4 - Disallow UDP downloads\n8 - don't disconnect clients while they are downloading\nDefault: 1");
 #ifdef USE_CURL
-	cl_mapAutoDownload = Cvar_Get( "cl_mapAutoDownload", "0", CVAR_ARCHIVE_ND );
-	Cvar_SetDescription( cl_mapAutoDownload, "Automatic map download for play and demo playback (via automatic \\dlmap call)." );
+	cl_mapAutoDownload = Cvar_Get( "cl_mapAutoDownload", "1", CVAR_ARCHIVE );
+    Cvar_SetDescription( cl_mapAutoDownload, "Automatically download map files\nDefault: 0" );
+
 #ifdef USE_CURL_DLOPEN
 	cl_cURLLib = Cvar_Get( "cl_cURLLib", DEFAULT_CURL_LIB, 0 );
-	Cvar_SetDescription( cl_cURLLib, "Filename of cURL library to load." );
+    Cvar_SetDescription(cl_cURLLib, "Name of the cURL library to link\nDefault: libcurl");
 #endif
 #endif
 
 	cl_conXOffset = Cvar_Get ("cl_conXOffset", "0", 0);
-	Cvar_SetDescription( cl_conXOffset, "Console notifications X-offset." );
-	cl_conColor = Cvar_Get( "cl_conColor", "", 0 );
-	Cvar_SetDescription( cl_conColor, "Console background color, set as R G B A values from 0-255, use with \\seta to save in config." );
+    Cvar_SetDescription(cl_conXOffset, "Offset the console message display\n0 - top lef\n999 - extreme top right\nDefault: 0");
 
 #ifdef MACOS_X
 	// In game video is REALLY slow in Mac OS X right now due to driver slowness
@@ -3939,105 +4189,163 @@ void CL_Init( void ) {
 #else
 	cl_inGameVideo = Cvar_Get( "r_inGameVideo", "1", CVAR_ARCHIVE_ND );
 #endif
-	Cvar_SetDescription( cl_inGameVideo, "Controls whether in-game video should be drawn." );
+    Cvar_SetDescription( cl_inGameVideo, "Controls whether in game video should be drawn\nDefault: 1" );
 
-	cl_serverStatusResendTime = Cvar_Get ("cl_serverStatusResendTime", "750", 0);
-	Cvar_SetDescription( cl_serverStatusResendTime, "Time between re-sending server status requests if no response is received (in milliseconds)." );
+    cl_serverStatusResendTime = Cvar_Get ("cl_serverStatusResendTime", "750", 0);
+    Cvar_SetDescription( cl_serverStatusResendTime, "The rate of the heartbeats to the master server, or check server status\nDefault: 750 seconds" );
 
-	// init cg_autoswitch so the ui will have it correctly even
+    // init autoswitch so the ui will have it correctly even
 	// if the cgame hasn't been started
 	Cvar_Get ("cg_autoswitch", "1", CVAR_ARCHIVE);
 
 	cl_motdString = Cvar_Get( "cl_motdString", "", CVAR_ROM );
-	Cvar_SetDescription( cl_motdString, "Message of the day string from id's master server, it is a read only variable." );
+    Cvar_SetDescription(cl_motdString, "Holds the message of the day variable from the server\nDefault: empty");
 
-	cv = Cvar_Get( "cl_maxPing", "800", CVAR_ARCHIVE_ND );
-	Cvar_CheckRange( cv, "100", "999", CV_INTEGER );
-	Cvar_SetDescription( cv, "Specify the maximum allowed ping to a server." );
+    Cvar_Get( "cl_maxPing", "800", CVAR_ARCHIVE_ND );
 
 	cl_lanForcePackets = Cvar_Get( "cl_lanForcePackets", "1", CVAR_ARCHIVE_ND );
-	Cvar_SetDescription( cl_lanForcePackets, "Bypass \\cl_maxpackets for LAN games, send packets every frame." );
+    Cvar_SetDescription( cl_lanForcePackets, "Send packets over LAN every frame whether the client state changes or not\nDefault: 1" );
 
-	cl_guidServerUniq = Cvar_Get( "cl_guidServerUniq", "1", CVAR_ARCHIVE_ND );
-	Cvar_SetDescription( cl_guidServerUniq, "Makes cl_guid unique for each server." );
+    cl_guidServerUniq = Cvar_Get( "cl_guidServerUniq", "1", CVAR_ARCHIVE_ND );
+    Cvar_SetDescription( cl_guidServerUniq, "Generate a unique GUID for every server, based on server ID and Q3 key (more secure)\nDefault: 1" );
 
-	cl_dlURL = Cvar_Get( "cl_dlURL", "http://ws.q3df.org/maps/download/%1", CVAR_ARCHIVE_ND );
-	Cvar_SetDescription( cl_dlURL, "Cvar must point to download location." );
+    cl_dlURL = Cvar_Get( "cl_dlURL", "http://urt.li/q3ut4", CVAR_ARCHIVE_ND );
+    Cvar_SetDescription(cl_dlURL, "Set the download URL for the client in case it isn't set by the server\nDefault: http://urt.li/q3ut4");
 
-	cl_dlDirectory = Cvar_Get( "cl_dlDirectory", "0", CVAR_ARCHIVE_ND );
+    cl_dlDirectory = Cvar_Get( "cl_dlDirectory", "0", CVAR_ARCHIVE_ND );
 	Cvar_CheckRange( cl_dlDirectory, "0", "1", CV_INTEGER );
 	s = va( "Save downloads initiated by \\dlmap and \\download commands in:\n"
-		" 0 - current game directory\n"
-		" 1 - basegame (%s) directory\n", FS_GetBaseGameDir() );
+        " 0 - current game /download directory\n"
+        " 1 - fs_basegame (%s) /download directory\n", FS_GetBaseGameDir() );
 	Cvar_SetDescription( cl_dlDirectory, s );
 
 	cl_reconnectArgs = Cvar_Get( "cl_reconnectArgs", "", CVAR_ARCHIVE_ND | CVAR_NOTABCOMPLETE );
 
+    #ifdef USE_AUTH
+    //@Barbatos
+	cl_auth_engine = Cvar_Get( "cl_auth_engine", "1", CVAR_TEMP | CVAR_ROM);
+	cl_auth = Cvar_Get("cl_auth", "0", CVAR_TEMP | CVAR_ROM);
+	authc = Cvar_Get("authc", "0", CVAR_TEMP | CVAR_USERINFO);
+	authl = Cvar_Get("authl", "", CVAR_TEMP | CVAR_USERINFO);
+    #endif
+
 	// userinfo
-	Cvar_Get ("name", "UnnamedPlayer", CVAR_USERINFO | CVAR_ARCHIVE_ND );
-	Cvar_Get ("rate", "25000", CVAR_USERINFO | CVAR_ARCHIVE );
-	Cvar_Get ("snaps", "40", CVAR_USERINFO | CVAR_ARCHIVE );
-	Cvar_Get ("model", "sarge", CVAR_USERINFO | CVAR_ARCHIVE_ND );
-	Cvar_Get ("headmodel", "sarge", CVAR_USERINFO | CVAR_ARCHIVE_ND );
- 	Cvar_Get ("team_model", "sarge", CVAR_USERINFO | CVAR_ARCHIVE_ND );
-	Cvar_Get ("team_headmodel", "sarge", CVAR_USERINFO | CVAR_ARCHIVE_ND );
-//	Cvar_Get ("g_redTeam", "Stroggs", CVAR_SERVERINFO | CVAR_ARCHIVE);
-//	Cvar_Get ("g_blueTeam", "Pagans", CVAR_SERVERINFO | CVAR_ARCHIVE);
-	Cvar_Get ("color1", "4", CVAR_USERINFO | CVAR_ARCHIVE );
-	Cvar_Get ("color2", "5", CVAR_USERINFO | CVAR_ARCHIVE );
-	Cvar_Get ("handicap", "100", CVAR_USERINFO | CVAR_ARCHIVE_ND );
-//	Cvar_Get ("teamtask", "0", CVAR_USERINFO );
-	Cvar_Get ("sex", "male", CVAR_USERINFO | CVAR_ARCHIVE_ND );
-	Cvar_Get ("cl_anonymous", "0", CVAR_USERINFO | CVAR_ARCHIVE_ND );
-
-	Cvar_Get ("password", "", CVAR_USERINFO | CVAR_NORESTART);
-	Cvar_Get ("cg_predictItems", "1", CVAR_USERINFO | CVAR_ARCHIVE );
-
-
-	// cgame might not be initialized before menu is used
-	Cvar_Get ("cg_viewsize", "100", CVAR_ARCHIVE_ND );
-	// Make sure cg_stereoSeparation is zero as that variable is deprecated and should not be used anymore.
-	Cvar_Get ("cg_stereoSeparation", "0", CVAR_ROM);
+#ifdef USE_FTWGL
+	Cvar_Get("ticket", "", CVAR_USERINFO | CVAR_TEMP);
+#endif
+    Cvar_Get ("name", "UnnamedPlayer", CVAR_USERINFO | CVAR_ARCHIVE );
+    Cvar_Get ("rate", "90000", CVAR_USERINFO | CVAR_ARCHIVE );
+    Cvar_Get ("snaps", "60", CVAR_USERINFO | CVAR_PROTECTED );
+    Cvar_Get ("color1",  "4", CVAR_USERINFO | CVAR_ARCHIVE );
+    Cvar_Get ("color2", "5", CVAR_USERINFO | CVAR_ARCHIVE );
+    Cvar_Get ("handicap", "100", CVAR_USERINFO | CVAR_ARCHIVE );
+    Cvar_Get ("sex", "male", CVAR_USERINFO | CVAR_ARCHIVE );
+    Cvar_Get ("password", "", CVAR_USERINFO);
 
 	//
 	// register client commands
 	//
 	Cmd_AddCommand ("cmd", CL_ForwardToServer_f);
-	Cmd_AddCommand ("configstrings", CL_Configstrings_f);
-	Cmd_AddCommand ("clientinfo", CL_Clientinfo_f);
-	Cmd_AddCommand ("snd_restart", CL_Snd_Restart_f);
-	Cmd_AddCommand ("vid_restart", CL_Vid_Restart_f);
-	Cmd_AddCommand ("disconnect", CL_Disconnect_f);
-	Cmd_AddCommand ("record", CL_Record_f);
-	Cmd_SetCommandCompletionFunc( "record", CL_CompleteRecordName );
-	Cmd_AddCommand ("demo", CL_PlayDemo_f);
-	Cmd_SetCommandCompletionFunc( "demo", CL_CompleteDemoName );
-	Cmd_AddCommand ("cinematic", CL_PlayCinematic_f);
-	Cmd_AddCommand ("stoprecord", CL_StopRecord_f);
-	Cmd_AddCommand ("connect", CL_Connect_f);
-	Cmd_AddCommand ("reconnect", CL_Reconnect_f);
-	Cmd_AddCommand ("localservers", CL_LocalServers_f);
-	Cmd_AddCommand ("globalservers", CL_GlobalServers_f);
-	Cmd_AddCommand ("rcon", CL_Rcon_f);
+    Cmd_SetDescription("cmd", "Send a command to server remote console\nusage: cmd <command>");
+
+    Cmd_AddCommand ("configstrings", CL_Configstrings_f);
+    Cmd_SetDescription("configstrings", "List the current config strings in effect\nusage: configstrings");
+
+    Cmd_AddCommand ("clientinfo", CL_Clientinfo_f);
+    Cmd_SetDescription("clientinfo", "Display name, rate, number of snaps, player model, rail color, and handicap\nusage: clientinfo");
+
+    Cmd_AddCommand ("snd_restart", CL_Snd_Restart_f);
+    Cmd_SetDescription("snd_restart", "Reinitialize sound\nusage: snd_restart");
+
+	Cmd_AddCommand("vid_restart", CL_Vid_Restart_f);
+    Cmd_SetDescription("vid_restart", "Reinitialize video\nusage: vid_restart");
+
+    Cmd_AddCommand ("disconnect", CL_Disconnect_f);
+    Cmd_SetDescription("disconnect", "Disconnect from a server, including local\nusage: disconnect");
+
+    Cmd_AddCommand ("record", CL_Record_f);
+    Cmd_SetDescription("record", "Record a demo\nusage: record <demoname>");
+    Cmd_SetCommandCompletionFunc( "record", CL_CompleteRecordName );
+
+    Cmd_AddCommand ("demo", CL_PlayDemo_f);
+    Cmd_SetDescription("demo", "Play a demo\nusage: demo <demoname>");
+    Cmd_SetCommandCompletionFunc( "demo", CL_CompleteDemoName );
+
+    Cmd_AddCommand ("cinematic", CL_PlayCinematic_f);
+    Cmd_SetDescription("cinematic", "Play a video or RoQ file\nusage: cinematic <videofile>");
+
+    Cmd_AddCommand ("stoprecord", CL_StopRecord_f);
+    Cmd_SetDescription("stoprecord", "Stop recording a demo\nusage: stoprecord");
+
+    Cmd_AddCommand ("connect", CL_Connect_f);
+    Cmd_SetDescription("connect", "Connect to a server\nusage: connect ([-4|-6]) <serveraddress>");
+
+    Cmd_AddCommand ("reconnect", CL_Reconnect_f);
+    Cmd_SetDescription("reconnect", "Reinitialize the connection to the last server you were connected to\nusage: reconnect");
+
+    Cmd_AddCommand ("localservers", CL_LocalServers_f);
+    Cmd_SetDescription("localservers", "List servers on LAN or local sub net only\nusage: localservers");
+
+    Cmd_AddCommand ("globalservers", CL_GlobalServers_f);
+    Cmd_SetDescription("globalservers", "List public servers on the internet\nusage: globalservers");
+
+    Cmd_AddCommand ("rcon", CL_Rcon_f);
 	Cmd_SetCommandCompletionFunc( "rcon", CL_CompleteRcon );
-	Cmd_AddCommand ("ping", CL_Ping_f );
-	Cmd_AddCommand ("serverstatus", CL_ServerStatus_f );
-	Cmd_AddCommand ("showip", CL_ShowIP_f );
-	Cmd_AddCommand ("fs_openedList", CL_OpenedPK3List_f );
+    Cmd_SetDescription("rcon", "Start a remote console to a server\nusage: rcon");
+
+    Cmd_AddCommand ("ping", CL_Ping_f );
+    Cmd_SetDescription( "ping", "Manually ping a server\nusage: ping <serveraddress>");
+
+    Cmd_AddCommand ("serverstatus", CL_ServerStatus_f );
+    Cmd_SetDescription( "serverstatus", "Display the current status of the connected server as well as connected users and their slot number\nusage: serverstatus (<serveraddress>)");
+
+    Cmd_AddCommand ("showip", CL_ShowIP_f );
+    Cmd_SetDescription("showip", "Display your current TCP/IP address\nusage: showip");
+
+    Cmd_AddCommand ("fs_openedList", CL_OpenedPK3List_f );
 	Cmd_AddCommand ("fs_referencedList", CL_ReferencedPK3List_f );
-	Cmd_AddCommand ("model", CL_SetModel_f );
-	Cmd_AddCommand ("video", CL_Video_f );
+    Cmd_SetDescription( "fs_referencedList", "Display a list of all referenced pak names\nusage: fs_referencedList");
+
+    Cmd_AddCommand ("model", CL_SetModel_f );
+    Cmd_SetDescription("model", "Display the name of current player model if no parameters are given\nUsage: model (<modelname>)");
+
+    Cmd_AddCommand ("video", CL_Video_f );
+    Cmd_SetCommandCompletionFunc( "video", CL_CompleteVideoName );
+    Cmd_SetDescription("video", "Convert a demo playback to a video file/stream\nUsage: video (<videopipe>)");
+
 	Cmd_AddCommand ("video-pipe", CL_Video_f );
-	Cmd_SetCommandCompletionFunc( "video", CL_CompleteVideoName );
-	Cmd_AddCommand ("stopvideo", CL_StopVideo_f );
-	Cmd_AddCommand ("serverinfo", CL_Serverinfo_f );
-	Cmd_AddCommand ("systeminfo", CL_Systeminfo_f );
+    Cmd_SetDescription("video-pipe", "Set the video pipe to convert demo playback to a video file\nUsage: video <videopipe>");
+
+    Cmd_AddCommand ("stopvideo", CL_StopVideo_f );
+    Cmd_SetDescription("stopvideo", "Stop convert a demo playback to video file\nUsage: stopvideo");
+
+    Cmd_AddCommand ("serverinfo", CL_Serverinfo_f );
+    Cmd_SetDescription("serverinfo", "Gives information about local server from the console of that server\nUsage: serverinfo");
+
+    Cmd_AddCommand ("systeminfo", CL_Systeminfo_f );
+    Cmd_SetDescription("systeminfo", "Returns values for g_syncronousclients, sv_serverid, and timescale\nUsage: systeminfo");
 
 #ifdef USE_CURL
 	Cmd_AddCommand( "download", CL_Download_f );
+    Cmd_SetDescription("download", "Download a file from the server\nusage: download <mapname>");
+
 	Cmd_AddCommand( "dlmap", CL_Download_f );
+    Cmd_SetDescription("dlmap", "Download a file from the server\nusage: dlmap <mapname>");
+
 #endif
 	Cmd_AddCommand( "modelist", CL_ModeList_f );
+    Cmd_SetDescription("modelist", "List of accessible screen resolutions\nusage: modelist");
+
+#ifdef USE_MV
+    Cmd_AddCommand( "mvjoin", CL_Multiview_f );
+    Cmd_SetDescription("mvjoin", "Join multiview to allow viewing of other players\nusage: mvjoin");
+
+    Cmd_AddCommand( "mvleave", CL_Multiview_f );
+    Cmd_SetDescription("mvleave", "Leave multiview and stop showing other players\nusage: mvleave");
+
+    Cmd_AddCommand( "mvfollow", CL_MultiviewFollow_f );
+    Cmd_SetDescription("mvfollow", "Follow a specific player in multiview\nusage: mvfollow <playernumber>");
+#endif
 
 	Cvar_Set( "cl_running", "1" );
 #ifdef USE_MD5
@@ -4119,6 +4427,12 @@ void CL_Shutdown( const char *finalmsg, qboolean quit ) {
 	Cmd_RemoveCommand( "dlmap" );
 #endif
 
+#ifdef USE_MV
+	Cmd_RemoveCommand( "mvjoin" );
+	Cmd_RemoveCommand( "mvleave" );
+	Cmd_RemoveCommand( "mvfollow" );
+#endif
+
 	CL_ClearInput();
 
 	Cvar_Set( "cl_running", "0" );
@@ -4135,6 +4449,7 @@ static void CL_SetServerInfo(serverInfo_t *server, const char *info, int ping) {
 	if (server) {
 		if (info) {
 			server->clients = atoi(Info_ValueForKey(info, "clients"));
+			server->bots = atoi(Info_ValueForKey(info, "bots"));
 			Q_strncpyz(server->hostName,Info_ValueForKey(info, "hostname"), MAX_NAME_LENGTH);
 			Q_strncpyz(server->mapName, Info_ValueForKey(info, "mapname"), MAX_NAME_LENGTH);
 			server->maxClients = atoi(Info_ValueForKey(info, "sv_maxclients"));
@@ -4144,7 +4459,10 @@ static void CL_SetServerInfo(serverInfo_t *server, const char *info, int ping) {
 			server->minPing = atoi(Info_ValueForKey(info, "minping"));
 			server->maxPing = atoi(Info_ValueForKey(info, "maxping"));
 			server->punkbuster = atoi(Info_ValueForKey(info, "punkbuster"));
-			server->g_humanplayers = atoi(Info_ValueForKey(info, "g_humanplayers"));
+            server->auth = atoi(Info_ValueForKey(info, "auth"));
+            server->password = atoi(Info_ValueForKey(info, "password"));
+            Q_strncpyz(server->modversion, Info_ValueForKey(info, "modversion"), MAX_NAME_LENGTH);
+            server->g_humanplayers = atoi(Info_ValueForKey(info, "g_humanplayers"));
 			server->g_needpass = atoi(Info_ValueForKey(info, "g_needpass"));
 		}
 		server->ping = ping;
@@ -4190,7 +4508,7 @@ static void CL_ServerInfoPacket( const netadr_t *from, msg_t *msg ) {
 
 	// if this isn't the correct protocol version, ignore it
 	prot = atoi( Info_ValueForKey( infoString, "protocol" ) );
-	if ( prot != OLD_PROTOCOL_VERSION && prot != NEW_PROTOCOL_VERSION && prot != com_protocol->integer ) {
+	if ( prot != PROTOCOL_VERSION && prot != NEW_PROTOCOL_VERSION ) {
 		Com_DPrintf( "Different protocol info packet: %s\n", infoString );
 		return;
 	}
@@ -4642,12 +4960,15 @@ void CL_GetPing( int n, char *buf, int buflen, int *pingtime )
 	Q_strncpyz( buf, str, buflen );
 
 	time = cl_pinglist[n].time;
-	if ( time == 0 )
+	if (!time)
 	{
 		// check for timeout
 		time = Sys_Milliseconds() - cl_pinglist[n].start;
 		maxPing = Cvar_VariableIntegerValue( "cl_maxPing" );
-		if ( time < maxPing )
+		if( maxPing < 100 ) {
+			maxPing = 100;
+		}
+		if (time < maxPing)
 		{
 			// not timed out yet
 			time = 0;
@@ -4784,7 +5105,7 @@ CL_Ping_f
 static void CL_Ping_f( void ) {
 	netadr_t	to;
 	ping_t*		pingptr;
-	const char*		server;
+	char*		server;
 	int			argc;
 	netadrtype_t	family = NA_UNSPEC;
 
@@ -4944,7 +5265,7 @@ CL_ServerStatus_f
 */
 static void CL_ServerStatus_f( void ) {
 	netadr_t	to, *toptr = NULL;
-	const char		*server;
+	char		*server;
 	serverStatus_t *serverStatus;
 	int			argc;
 	netadrtype_t	family = NA_UNSPEC;
@@ -5083,3 +5404,63 @@ static void CL_Download_f( void )
 	CL_Download( Cmd_Argv( 0 ), Cmd_Argv( 1 ), qfalse );
 }
 #endif // USE_CURL
+
+#ifdef USE_MV
+static qboolean GetConfigString(int index, char * buf, int size) {
+    int offset;
+
+    if (index < 0 || index >= MAX_CONFIGSTRINGS) {
+        buf[0] = '\0';
+        return qfalse;
+    }
+
+    offset = cl.gameState.stringOffsets[index];
+    if (!offset) {
+        if (size) {
+            buf[0] = '\0';
+        }
+        return qfalse;
+    }
+
+    Q_strncpyz(buf, cl.gameState.stringData + offset, size);
+
+    return qtrue;
+}
+
+void CL_Multiview_f(void) {
+    char serverinfo[MAX_INFO_STRING];
+    char * v;
+
+    if (cls.state != CA_ACTIVE || !cls.servername[0] || clc.demoplaying) {
+        Com_Printf("Not connected.\n");
+        return;
+    }
+
+    if (!GetConfigString(CS_SERVERINFO, serverinfo, sizeof(serverinfo)) || !serverinfo[0]) {
+        Com_Printf("No serverinfo available.\n");
+    }
+
+    v = Info_ValueForKey(serverinfo, "mvproto");
+    if (atoi(v) != MV_PROTOCOL_VERSION) {
+        Com_Printf(S_COLOR_YELLOW "Remote server does not support this function.\n");
+        return;
+    }
+
+    CL_AddReliableCommand(Cmd_Argv(0), qfalse);
+}
+
+void CL_MultiviewFollow_f(void) {
+    int clientNum;
+
+    if (!cl.snap.multiview)
+        return;
+
+    clientNum = atoi(Cmd_Argv(1));
+
+    if ((unsigned) clientNum >= MAX_CLIENTS)
+        return;
+
+    if (GET_ABIT(cl.snap.clientMask, clientNum))
+        clc.clientView = clientNum;
+}
+#endif // USE_MV

@@ -21,12 +21,25 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 */
 
 #include "server.h"
+#include "sv_antilag.h"
 
 serverStatic_t	svs;				// persistant server info
 server_t		sv;					// local server
 vm_t			*gvm = NULL;		// game virtual machine
 
 cvar_t	*sv_fps;				// time rate for running non-clients
+cvar_t	*sv_gameHz;				// rate at which level.time advances, independent of sv_fps
+cvar_t	*sv_snapshotFps;			// max snapshot send rate, independent of sv_fps
+cvar_t	*sv_busyWait;				// spin last N ms before frame instead of sleeping, for precise timing at high sv_fps
+cvar_t	*sv_pmoveMsec;				// max physics step size, enforces consistent movement regardless of client framerate
+cvar_t	*sv_extrapolate;			// engine-side position correction for high sv_fps snapshots
+cvar_t	*sv_smoothClients;			// TR_LINEAR trajectory trick for smoother client rendering
+cvar_t	*sv_bufferMs;				// per-client position ring buffer delay (ms)
+cvar_t	*sv_velSmooth;				// velocity smoothing window (ms) for TR_LINEAR mode
+cvar_t	*sv_antiwarp;				// engine-side antiwarp (replaces QVM g_antiwarp)
+cvar_t	*sv_antiwarpTol;			// antiwarp tolerance in ms (0=auto)
+cvar_t	*sv_antiwarpExtra;			// extrapolation window for mode 2 (ms, 0=auto=awTol)
+cvar_t	*sv_antiwarpDecay;			// decay duration for mode 2 (ms)
 cvar_t	*sv_timeout;			// seconds without any message
 cvar_t	*sv_zombietime;			// seconds to sink messages after disconnect
 cvar_t	*sv_rconPassword;		// password for remote server commands
@@ -35,6 +48,24 @@ cvar_t	*sv_allowDownload;
 cvar_t	*sv_maxclients;
 cvar_t	*sv_maxclientsPerIP;
 cvar_t	*sv_clientTLD;
+
+#ifdef USE_MV
+fileHandle_t	sv_demoFile = FS_INVALID_HANDLE;
+char	sv_demoFileName[ MAX_OSPATH ];
+char	sv_demoFileNameLast[ MAX_OSPATH ];
+int		sv_demoClientID; // current client
+int		sv_lastAck;
+int		sv_lastClientSeq;
+
+cvar_t	*sv_mvClients;
+cvar_t	*sv_mvPassword;
+cvar_t	*sv_demoFlags;
+cvar_t	*sv_autoRecord;
+
+cvar_t	*sv_mvFileCount;
+cvar_t	*sv_mvFolderSize;
+#endif
+
 
 cvar_t	*sv_privateClients;		// number of clients reserved for password
 cvar_t	*sv_hostname;
@@ -48,19 +79,33 @@ cvar_t	*sv_referencedPakNames;
 cvar_t	*sv_serverid;
 cvar_t	*sv_minRate;
 cvar_t	*sv_maxRate;
+cvar_t  *sv_minPing;
+cvar_t  *sv_maxPing;
 cvar_t	*sv_dlRate;
 cvar_t	*sv_gametype;
 cvar_t	*sv_pure;
 cvar_t	*sv_floodProtect;
 cvar_t	*sv_lanForceRate; // dedicated 1 (LAN) server forces local client rates to 99999 (bug #491)
 
+cvar_t  *sv_strictAuth;
+
 cvar_t *sv_levelTimeReset;
 cvar_t *sv_filter;
+
+#ifdef USE_AUTH
+cvar_t* sv_authServerIP;
+cvar_t* sv_auth_engine;
+#endif
 
 #ifdef USE_BANS
 cvar_t	*sv_banFile;
 serverBan_t serverBans[SERVER_MAXBANS];
 int serverBansCount = 0;
+#endif
+
+#ifdef USE_SERVER_DEMO
+cvar_t	*sv_demonotice;				// notice to print to a client being recorded server-side
+cvar_t 	*sv_demofolder;				//@Barbatos - the name of the folder that contains server-side demos
 #endif
 
 /*
@@ -161,8 +206,8 @@ void SV_AddServerCommand( client_t *client, const char *cmd ) {
 		Com_Printf( "===== pending server commands =====\n" );
 		n = client->reliableSequence - client->reliableAcknowledge;
 		for ( i = 0; i < n; i++ ) {
-			const int idx = client->reliableAcknowledge + 1 + i;
-			Com_Printf( "cmd %5d: %s\n", i, client->reliableCommands[ idx & ( MAX_RELIABLE_COMMANDS - 1 ) ] );
+			const int index = client->reliableAcknowledge + 1 + i;
+			Com_Printf( "cmd %5d: %s\n", i, client->reliableCommands[ index & ( MAX_RELIABLE_COMMANDS - 1 ) ] );
 		}
 		Com_Printf( "cmd %5d: %s\n", i, cmd );
 		SV_DropClient( client, "Server command overflow" );
@@ -207,7 +252,7 @@ void QDECL SV_SendServerCommand( client_t *cl, const char *fmt, ... ) {
 	}
 
 	// send the data to all relevant clients
-	for ( j = 0, client = svs.clients; j < sv.maxclients; j++, client++ ) {
+	for ( j = 0, client = svs.clients; j < sv_maxclients->integer ; j++, client++ ) {
 		if ( len <= 1022 || client->longstr ) {
 			SV_AddServerCommand( client, message );
 		}
@@ -254,6 +299,10 @@ static void SV_MasterHeartbeat( const char *message )
 		return;
 
 	svs.nextHeartbeatTime = svs.time + HEARTBEAT_MSEC;
+
+	#ifdef USE_AUTH
+	VM_Call(gvm, 0, GAME_AUTHSERVER_HEARTBEAT);
+	#endif
 
 	// send to group masters
 	for (i = 0; i < MAX_MASTER_SERVERS; i++)
@@ -313,7 +362,7 @@ static void SV_MasterHeartbeat( const char *message )
 		Com_Printf ("Sending heartbeat to %s\n", sv_master[i]->string );
 
 		// this command should be changed if the server info / status format
-		// ever changes incompatibly
+		// ever incompatably changes
 
 		if(adr[i][0].type != NA_BAD)
 			NET_OutOfBandPrint( NS_SERVER, &adr[i][0], "heartbeat %s\n", message);
@@ -342,6 +391,10 @@ void SV_MasterShutdown( void )
 
 	// when the master tries to poll the server, it won't respond, so
 	// it will be removed from the list
+
+	#ifdef USE_AUTH
+	VM_Call(gvm, 0, GAME_AUTHSERVER_SHUTDOWN);
+	#endif
 }
 
 
@@ -696,7 +749,7 @@ static void SVC_Status( const netadr_t *from ) {
 	status[0] = '\0';
 	statusLength = strlen( infostring ) + 16; // strlen( "statusResponse\n\n" )
 
-	for ( i = 0; i < sv.maxclients; i++ ) {
+	for ( i = 0 ; i < sv_maxclients->integer ; i++ ) {
 		cl = &svs.clients[i];
 		if ( cl->state >= CS_CONNECTED ) {
 
@@ -725,7 +778,7 @@ if a user is interested in a server to do a full status
 ================
 */
 static void SVC_Info( const netadr_t *from ) {
-	int		i, count, humans;
+	int		i, count, humans, bots;
 	const char	*gamedir;
 	char	infostring[MAX_INFO_STRING];
 
@@ -762,12 +815,15 @@ static void SVC_Info( const netadr_t *from ) {
 		return;
 
 	// don't count privateclients
-	count = humans = 0;
-	for ( i = sv_privateClients->integer; i < sv.maxclients; i++ ) {
+	count = humans = bots = 0;
+	for ( i = sv_privateClients->integer ; i < sv_maxclients->integer ; i++ ) {
 		if ( svs.clients[i].state >= CS_CONNECTED ) {
 			count++;
 			if (svs.clients[i].netchan.remoteAddress.type != NA_BOT) {
 				humans++;
+			}
+			else {
+				bots++;
 			}
 		}
 	}
@@ -778,21 +834,40 @@ static void SVC_Info( const netadr_t *from ) {
 	// to prevent timed spoofed reply packets that add ghost servers
 	Info_SetValueForKey( infostring, "challenge", Cmd_Argv(1) );
 
-	Info_SetValueForKey( infostring, "protocol", va( "%i", com_protocol->integer ) );
+	Info_SetValueForKey( infostring, "protocol", com_protocol->string );
 	Info_SetValueForKey( infostring, "hostname", sv_hostname->string );
 	Info_SetValueForKey( infostring, "mapname", sv_mapname->string );
 	Info_SetValueForKey( infostring, "clients", va("%i", count) );
-	Info_SetValueForKey( infostring, "g_humanplayers", va( "%i", humans ) );
-	Info_SetValueForKey( infostring, "sv_maxclients", va( "%i", sv.maxclients - sv_privateClients->integer ) );
-	Info_SetValueForKey( infostring, "gametype", va( "%i", sv_gametype->integer ) );
-	Info_SetValueForKey( infostring, "pure", va( "%i", sv.pure ) );
-	Info_SetValueForKey( infostring, "g_needpass", va( "%d", Cvar_VariableIntegerValue( "g_needpass" ) ) );
+	Info_SetValueForKey( infostring, "bots", va("%i", bots) );
+	Info_SetValueForKey(infostring, "g_humanplayers", va("%i", humans));
+	Info_SetValueForKey( infostring, "sv_maxclients", 
+		va("%i", sv_maxclients->integer - sv_privateClients->integer ) );
+	Info_SetValueForKey( infostring, "gametype", va("%i", sv_gametype->integer ) );
+	Info_SetValueForKey( infostring, "pure", va("%i", sv_pure->integer ) );
+	Info_SetValueForKey(infostring, "g_needpass", va("%d", Cvar_VariableIntegerValue("g_needpass")));
 	gamedir = Cvar_VariableString( "fs_game" );
-	if ( *gamedir != '\0' ) {
+	if( *gamedir ) {
 		Info_SetValueForKey( infostring, "game", gamedir );
 	}
 
-	NET_OutOfBandPrint( NS_SERVER, from, "infoResponse\n%s", infostring );
+	#ifdef USE_AUTH
+	Info_SetValueForKey(infostring, "auth", Cvar_VariableString("auth"));
+    #endif
+
+    //@Barbatos: if it's a passworded server, let the client know (for the server browser)
+    if(Cvar_VariableValue("g_needpass") == 1)
+        Info_SetValueForKey( infostring, "password", va("%i", 1));
+
+    if( sv_minPing->integer ) {
+        Info_SetValueForKey( infostring, "minPing", va("%i", sv_minPing->integer) );
+    }
+    if( sv_maxPing->integer ) {
+        Info_SetValueForKey( infostring, "maxPing", va("%i", sv_maxPing->integer) );
+    }
+
+    Info_SetValueForKey(infostring, "modversion", Cvar_VariableString("g_modversion"));
+
+    NET_OutOfBandPrint( NS_SERVER, from, "infoResponse\n%s", infostring );
 }
 
 
@@ -805,10 +880,10 @@ static netadr_t redirectAddress; // for rcon return messages
 
 static void SV_FlushRedirect( const char *outputbuf )
 {
-	if ( *outputbuf )
-	{
-		NET_OutOfBandPrint( NS_SERVER, &redirectAddress, "print\n%s", outputbuf );
-	}
+//	if ( *outputbuf )
+//	{
+		NET_OutOfBandPrint( NS_SERVER, &svs.redirectAddress, "print\n%s", outputbuf );
+//	}
 }
 
 
@@ -855,7 +930,8 @@ static void SVC_RemoteCommand( const netadr_t *from ) {
 	}
 
 	// start redirecting all print outputs to the packet
-	redirectAddress = *from;
+//	redirectAddress = *from;
+    svs.redirectAddress = *from;
 	Com_BeginRedirect( sv_outputbuf, sizeof( sv_outputbuf ), SV_FlushRedirect );
 
 	if ( !sv_rconPassword->string[0] && !rconPassword2[0] ) {
@@ -907,6 +983,10 @@ static void SV_ConnectionlessPacket( const netadr_t *from, msg_t *msg ) {
 	const char *s;
 	const char *c;
 
+	#ifdef USE_AUTH
+	netadr_t	authServerIP;
+	#endif
+
 	MSG_BeginReadingOOB( msg );
 	MSG_ReadLong( msg );		// skip the -1 marker
 
@@ -950,11 +1030,29 @@ static void SV_ConnectionlessPacket( const netadr_t *from, msg_t *msg ) {
 	} else if (!Q_stricmp(c, "ipAuthorize")) {
 		// removed from codebase since stateless challenges
 #endif
-	} else if (!Q_stricmp(c, "disconnect")) {
+	}
+
+	else if (!Q_stricmp(c, "disconnect")) {
 		// if a client starts up a local server, we may see some spurious
 		// server disconnect messages when their new server sees our final
 		// sequenced messages to the old client
-	} else {
+	}
+
+#ifdef USE_AUTH
+        // @Barbatos @Kalish
+	else if ((!Q_stricmp(c, "AUTH:SV")))
+	{
+		NET_StringToAdr(sv_authServerIP->string, &authServerIP, NA_IP);
+
+		if (!NET_CompareBaseAdr(from, (const netadr_t* ) &authServerIP)) {
+			Com_Printf("AUTH not from the Auth Server\n");
+			return;
+		}
+		VM_Call(gvm, 0, GAME_AUTHSERVER_PACKET);
+	}
+#endif
+
+	else {
 		if ( com_developer->integer ) {
 			Com_Printf( "bad connectionless packet from %s:\n%s\n",
 				NET_AdrToString( from ), s );
@@ -994,8 +1092,8 @@ void SV_PacketEvent( const netadr_t *from, msg_t *msg ) {
 	qport = MSG_ReadShort( msg ) & 0xffff;
 
 	// find which client the message is from
-	for ( i = 0, cl = svs.clients; i < sv.maxclients; i++, cl++ ) {
-		if ( cl->state == CS_FREE ) {
+	for (i=0, cl=svs.clients ; i < sv_maxclients->integer ; i++,cl++) {
+		if (cl->state == CS_FREE) {
 			continue;
 		}
 		if ( !NET_CompareBaseAdr( from, &cl->netchan.remoteAddress ) ) {
@@ -1003,23 +1101,23 @@ void SV_PacketEvent( const netadr_t *from, msg_t *msg ) {
 		}
 		// it is possible to have multiple clients from a single IP
 		// address, so they are differentiated by the qport variable
-		if ( cl->netchan.qport != qport ) {
+		if (cl->netchan.qport != qport) {
 			continue;
 		}
 
 		// make sure it is a valid, in sequence packet
-		if ( SV_Netchan_Process( cl, msg ) ) {
+		if (SV_Netchan_Process(cl, msg)) {
 			// the IP port can't be used to differentiate clients, because
 			// some address translating routers periodically change UDP
 			// port assignments
-			if ( cl->netchan.remoteAddress.port != from->port ) {
+			if (cl->netchan.remoteAddress.port != from->port) {
 				Com_Printf( "SV_PacketEvent: fixing up a translated port\n" );
 				cl->netchan.remoteAddress.port = from->port;
 			}
 			// zombie clients still need to do the Netchan_Process
 			// to make sure they don't need to retransmit the final
 			// reliable message, but they don't do any other processing
-			if ( cl->state != CS_ZOMBIE ) {
+			if (cl->state != CS_ZOMBIE) {
 				cl->lastPacketTime = svs.time;	// don't timeout
 				SV_ExecuteClientMessage( cl, msg );
 			}
@@ -1043,7 +1141,7 @@ static void SV_CalcPings( void ) {
 	int			delta;
 	playerState_t	*ps;
 
-	for ( i = 0; i < sv.maxclients; i++ ) {
+	for (i=0 ; i < sv_maxclients->integer ; i++) {
 		cl = &svs.clients[i];
 		if ( cl->state != CS_ACTIVE ) {
 			cl->ping = 999;
@@ -1088,7 +1186,7 @@ static void SV_CalcPings( void ) {
 SV_CheckTimeouts
 
 If a packet has not been received from a client for timeout->integer 
-seconds, drop the connection.  Server time is used instead of
+seconds, drop the conneciton.  Server time is used instead of
 realtime to avoid dropping the local client while debugging.
 
 When a client is normally dropped, the client_t goes into a zombie state
@@ -1105,7 +1203,7 @@ static void SV_CheckTimeouts( void ) {
 	droppoint = svs.time - 1000 * sv_timeout->integer;
 	zombiepoint = svs.time - 1000 * sv_zombietime->integer;
 
-	for ( i = 0, cl = svs.clients ; i < sv.maxclients; i++, cl++ ) {
+	for ( i = 0, cl = svs.clients ; i < sv_maxclients->integer ; i++, cl++ ) {
 		if ( cl->state == CS_FREE ) {
 			continue;
 		}
@@ -1116,7 +1214,7 @@ static void SV_CheckTimeouts( void ) {
 
 		if ( cl->state == CS_ZOMBIE && cl->lastPacketTime - zombiepoint < 0 ) {
 			// using the client id cause the cl->name is empty at this point
-			SV_PrintClientStateChange( cl, CS_FREE );
+			Com_DPrintf( "Going from CS_ZOMBIE to CS_FREE for client %d\n", i );
 			cl->state = CS_FREE;	// can now be reused
 			continue;
 		}
@@ -1162,7 +1260,7 @@ static qboolean SV_CheckPaused( void ) {
 
 	// only pause if there is just a single client connected
 	count = 0;
-	for ( i = 0, cl = svs.clients ; i < sv.maxclients; i++, cl++ ) {
+	for (i=0,cl=svs.clients ; i < sv_maxclients->integer ; i++,cl++) {
 		if ( cl->state >= CS_CONNECTED && cl->netchan.remoteAddress.type != NA_BOT ) {
 			count++;
 		}
@@ -1194,13 +1292,24 @@ int SV_FrameMsec( void )
 	if ( sv_fps )
 	{
 		int frameMsec;
-		
+		int timeLeft;
+		int spinMs;
+
 		frameMsec = 1000.0f / sv_fps->value;
-		
+
 		if ( frameMsec < sv.timeResidual )
 			return 0;
-		else
-			return frameMsec - sv.timeResidual;
+
+		timeLeft = frameMsec - sv.timeResidual;
+
+		// If sv_busyWait is set, spin (return 0) for the last N ms before
+		// the frame is due, giving precise wakeup without OS sleep jitter.
+		// Costs ~1 CPU core but eliminates stutter at high sv_fps.
+		spinMs = sv_busyWait ? sv_busyWait->integer : 0;
+		if ( spinMs > 0 && timeLeft <= spinMs )
+			return 0;
+
+		return timeLeft;
 	}
 	else
 		return 1;
@@ -1227,15 +1336,95 @@ void SV_TrackCvarChanges( void )
 		Com_DPrintf( "sv_minRate adjusted to 1000\n" );
 	}
 
-	Cvar_ResetGroup( CVG_SERVER, qfalse );
+	// When sv_gameHz changes at runtime, clamp gameTimeResidual so it doesn't
+	// burst-fire multiple game frames on the next tick
+	// (e.g. 20→60 Hz: a 49ms residual would fire 3 game frames at once).
+	if ( sv_gameHz->modified ) {
+		int _gameHz = (sv_gameHz->integer > 0) ? sv_gameHz->integer : sv_fps->integer;
+		int newGameMsec;
+		if ( _gameHz < 1 )               _gameHz = 1;
+		if ( _gameHz > sv_fps->integer ) _gameHz = sv_fps->integer;
+		newGameMsec = 1000 / _gameHz;
+		if ( sv.gameTimeResidual < 0 )
+			sv.gameTimeResidual = 0;
+		if ( sv.gameTimeResidual >= newGameMsec )
+			sv.gameTimeResidual = newGameMsec - 1;
+		Com_DPrintf( "sv_gameHz changed to %d — gameTimeResidual clamped\n", sv_gameHz->integer );
+	}
 
-	if ( sv.state == SS_DEAD || !svs.clients )
-		return;
-
-	for ( i = 0, cl = svs.clients; i < sv.maxclients; i++, cl++ ) {
-		if ( cl->state >= CS_CONNECTED ) {
-			SV_UserinfoChanged( cl, qfalse, qfalse ); // do not update userinfo, do not run filter
+	// When sv_antiwarp is enabled, force QVM g_antiwarp off to prevent double injection.
+	if ( sv_antiwarp->modified ) {
+		if ( sv_antiwarp->integer ) {
+			Cvar_Set( "g_antiwarp", "0" );
+			Com_Printf( "sv_antiwarp enabled — forcing g_antiwarp 0\n" );
 		}
+		sv_antiwarp->modified = qfalse;
+	}
+	if ( sv_antiwarpTol->modified ) {
+		sv_antiwarpTol->modified = qfalse;
+	}
+	if ( sv_antiwarpExtra->modified ) {
+		sv_antiwarpExtra->modified = qfalse;
+	}
+	if ( sv_antiwarpDecay->modified ) {
+		sv_antiwarpDecay->modified = qfalse;
+	}
+
+	// Flush the position ring buffer whenever any timing-affecting cvar changes.
+	// Old entries were recorded at a different tick rate or delay target and will
+	// produce wrong interpolated positions at the new settings.
+	if ( sv_fps->modified || sv_gameHz->modified || sv_bufferMs->modified || sv_velSmooth->modified ) {
+		SV_SmoothInit();
+		sv_gameHz->modified = qfalse;
+		sv_bufferMs->modified = qfalse;
+		sv_velSmooth->modified = qfalse;
+		Com_DPrintf( "position ring buffer flushed due to timing cvar change\n" );
+	}
+
+	// When sv_fps changes at runtime, clamp the time residual so it doesn't
+	// represent more than one frame at the new rate — prevents double-ticking
+	// or a stall on the first frame after the change.
+	if ( sv_fps->modified || sv_snapshotFps->modified ) {
+		qboolean fpsChanged = sv_fps->modified;
+		int newFrameMsec = 1000 / sv_fps->integer;
+
+		if ( fpsChanged ) {
+			// Clamp residual to just under one frame at the new rate.
+			// Prevents burst-ticking when going from low to high sv_fps
+			// (e.g. 20->125: residual of 49ms would fire 6 frames at once).
+			if ( sv.timeResidual < 0 )
+				sv.timeResidual = 0;
+			if ( sv.timeResidual >= newFrameMsec )
+				sv.timeResidual = newFrameMsec - 1;
+			// When sv_gameHz <= 0 the game frame rate equals sv_fps; clamp
+			// gameTimeResidual here too so the burst-fire protection covers
+			// that mode. When sv_gameHz > 0 the interval is unchanged and
+			// the accumulated progress remains valid — leave it alone.
+			if ( sv_gameHz->integer <= 0 ) {
+				if ( sv.gameTimeResidual < 0 )
+					sv.gameTimeResidual = 0;
+				if ( sv.gameTimeResidual >= newFrameMsec )
+					sv.gameTimeResidual = newFrameMsec - 1;
+			}
+			Com_DPrintf( "sv_fps changed to %d — timeResidual clamped\n", sv_fps->integer );
+		}
+
+		sv_fps->modified = qfalse;
+		sv_snapshotFps->modified = qfalse;
+
+		Cvar_ResetGroup( CVG_SERVER, qfalse );
+
+		if ( sv.state == SS_DEAD || !svs.clients )
+			return;
+
+		// Recalculate snapshotMsec for all clients when fps or snapshot rate changes
+		for ( i = 0, cl = svs.clients; i < sv_maxclients->integer; i++, cl++ ) {
+			if ( cl->state >= CS_CONNECTED ) {
+				SV_UserinfoChanged( cl, qfalse, qfalse );
+			}
+		}
+	} else {
+		Cvar_ResetGroup( CVG_SERVER, qfalse );
 	}
 }
 
@@ -1252,7 +1441,7 @@ static void SV_Restart( const char *reason ) {
 
 	if ( svs.clients ) {
 		// check if we can reset map time without full server shutdown
-		for ( i = 0; i < sv.maxclients; i++ ) {
+		for ( i = 0; i < sv_maxclients->integer; i++ ) {
 			if ( svs.clients[i].state >= CS_CONNECTED ) {
 				sv_shutdown = qtrue;
 				break;
@@ -1261,6 +1450,8 @@ static void SV_Restart( const char *reason ) {
 	}
 
 	sv.time = 0; // force level time reset
+	sv.gameTime = 0;
+	sv.gameTimeResidual = 0;
 	sv.restartTime = 0;
 	
 	Cvar_VariableStringBuffer( "mapname", mapName, sizeof( mapName ) );
@@ -1284,9 +1475,9 @@ happen before SV_Frame is called
 void SV_Frame( int msec ) {
 	int		frameMsec;
 	int		startTime;
-	int		i;
+	int		i, n;
 
-	if ( Cvar_CheckGroup( CVG_SERVER ) )
+	if ( Cvar_CheckGroup( CVG_SERVER ) || sv_fps->modified )
 		SV_TrackCvarChanges(); // update rate settings, etc.
 
 	// the menu kills the server with this cvar
@@ -1325,8 +1516,19 @@ void SV_Frame( int msec ) {
 
 	sv.timeResidual += msec;
 
-	if ( !com_dedicated->integer )
-		SV_BotFrame( sv.time + sv.timeResidual );
+	// Log frame time outliers — helps diagnose OS scheduling issues or
+	// unexpected CPU stalls on dedicated servers.
+	if ( msec > frameMsec + frameMsec / 2 ) {
+		Com_DPrintf( "SV_Frame: late frame %dms (expected %dms)\n", msec, frameMsec );
+	}
+
+	// Safety cap: allow at most 2 ticks of catch-up per Com_Frame so normal OS
+	// scheduling jitter is absorbed gracefully (one late frame → double-tick to
+	// recover). sv_fps change burst protection is handled precisely in
+	// SV_TrackCvarChanges; this is a backstop for extreme lag (debugger pause,
+	// system suspend, etc.) that would otherwise fire dozens of ticks at once.
+	if ( sv.timeResidual > frameMsec * 2 )
+		sv.timeResidual = frameMsec * 2;
 
 	// if time is about to hit the 32nd bit, kick all clients
 	// and clear sv.time, rather
@@ -1340,18 +1542,34 @@ void SV_Frame( int msec ) {
 	// try to do silent restart earlier if possible
 	if ( sv.time > (12*3600*1000) && ( sv_levelTimeReset->integer == 0 || sv.time > 0x40000000 ) ) {
 		if ( svs.clients ) {
-			for ( i = 0; i < sv.maxclients; i++ ) {
+			for ( i = 0; i < sv_maxclients->integer; i++ ) {
 				// FIXME: deal with bots (reconnect?)
 				if ( svs.clients[i].state != CS_FREE && svs.clients[i].netchan.remoteAddress.type != NA_BOT ) {
 					break;
 				}
 			}
-			if ( i == sv.maxclients ) {
+			if ( i == sv_maxclients->integer ) {
 				SV_Restart( "Restarting server" );
 				return;
 			}
 		}
 	}
+
+#ifdef USE_MV
+    if ( svs.nextSnapshotPSF > svs.modSnapshotPSF + svs.numSnapshotPSF ) {
+        svs.nextSnapshotPSF -= svs.modSnapshotPSF;
+        if ( svs.clients ) {
+            for ( i = 0; i < sv_maxclients->integer; i++ ) {
+                if ( svs.clients[ i ].state < CS_CONNECTED )
+                    continue;
+                for ( n = 0; n < PACKET_BACKUP; n++ ) {
+                    if ( svs.clients[ i ].frames[ n ].first_psf > svs.modSnapshotPSF )
+                        svs.clients[ i ].frames[ n ].first_psf -= svs.modSnapshotPSF;
+                }
+            }
+        }
+    }
+#endif
 
 	if ( sv.restartTime && sv.time - sv.restartTime >= 0 ) {
 		sv.restartTime = 0;
@@ -1378,30 +1596,175 @@ void SV_Frame( int msec ) {
 	// update ping based on the all received frames
 	SV_CalcPings();
 
-	if (com_dedicated->integer) SV_BotFrame (sv.time);
 
 	// run the game simulation in chunks
+	// Snapshot dispatch is inside this loop so each engine tick at sv_fps rate produces
+	// its own snapshot send opportunity. Without this, OS scheduler jitter can cause
+	// two ticks to fire in one Com_Frame with only one SV_SendClientMessages call,
+	// creating a double-interval gap visible in the netgraph as late packets.
 	while ( sv.timeResidual >= frameMsec ) {
 		sv.timeResidual -= frameMsec;
 		svs.time += frameMsec;
 		sv.time += frameMsec;
 
-		// let everything in the world think and move
-		VM_Call( gvm, 1, GAME_RUN_FRAME, sv.time );
+		// --- Engine-side shadow antilag recording ---
+		// Record entity positions once per engine tick into the shadow history
+		// ring buffer. Positions only change after GAME_RUN_FRAME / ClientThink,
+		// so recording multiple times per tick with the same svs.time would fill
+		// the ring buffer with duplicate-timestamp entries, wasting slots and
+		// reducing the effective history window (e.g. scale=3 would give only
+		// 1/3 the expected coverage).
+		if ( sv_antilagEnable && sv_antilagEnable->integer ) {
+			SV_Antilag_RecordPositions();
+		}
+
+		// Fire GAME_RUN_FRAME at sv_gameHz rate, independent of sv_fps.
+		// sv_fps = input sampling rate; sv_gameHz = level.time rate.
+		//
+		// sv_gameHz > 0 (e.g. 20): GAME_RUN_FRAME fires every (1000/sv_gameHz) ms.
+		//   sv.gameTime advances slower than sv.time. Between firings the gap
+		//   (sv.time - sv.gameTime) grows and the extrapolation patch in
+		//   SV_BuildCommonSnapshot uses it to correct stale player positions.
+		//   sv_extrapolate and sv_smoothClients are both meaningful in this mode.
+		//
+		// sv_gameHz <= 0 (disabled): effective rate = sv_fps. GAME_RUN_FRAME fires
+		//   every engine tick — sv.gameTime == sv.time always, no gap exists.
+		//   sv_extrapolate still runs: real players get a harmless ps->origin read
+		//   (same value BG_PlayerStateToEntityState wrote); bots get dt=0 (unchanged).
+		//   Critically, sv_bufferMs ring buffer queries still run and apply delayed
+		//   positions when configured. sv_smoothClients TR_LINEAR also runs every tick.
+		{
+			int _gameHz = (sv_gameHz && sv_gameHz->integer > 0) ? sv_gameHz->integer : sv_fps->integer;
+			int _gameMsec;
+			if ( _gameHz < 1 )               _gameHz = 1;
+			if ( _gameHz > sv_fps->integer ) _gameHz = sv_fps->integer;
+			_gameMsec = 1000 / _gameHz;
+			sv.gameTimeResidual += frameMsec;
+#ifdef USE_MV
+			svs.emptyFrame = qtrue; // assume no game frame this sv_fps tick; cleared below if one fires
+#endif
+			while ( sv.gameTimeResidual >= _gameMsec ) {
+				sv.gameTimeResidual -= _gameMsec;
+				sv.gameTime += _gameMsec;
+
+				// --- Engine-side antiwarp: inject blank commands for lagging clients ---
+				// Runs before GAME_RUN_FRAME so the QVM sees fresh ClientThink calls.
+				// Uses gameMsec (actual frame duration) instead of hardcoded 50ms,
+				// making it work at any sv_fps / sv_gameHz combination.
+				//
+				// Mode 1: constant — keep last inputs indefinitely (QVM-style).
+				// Mode 2: decay — extrapolate trajectory for sv_antiwarpExtra ms,
+				//   then linearly decay inputs to zero over sv_antiwarpDecay ms,
+				//   then coast to stop via Pmove friction.
+				if ( sv_antiwarp && sv_antiwarp->integer ) {
+					int awMode = sv_antiwarp->integer;
+					int awTol = ( sv_antiwarpTol && sv_antiwarpTol->integer > 0 )
+						? sv_antiwarpTol->integer : _gameMsec;
+					int awExtraMs = ( sv_antiwarpExtra && sv_antiwarpExtra->integer > 0 )
+						? sv_antiwarpExtra->integer : awTol;
+					int awDecayMs = ( sv_antiwarpDecay && sv_antiwarpDecay->integer > 0 )
+						? sv_antiwarpDecay->integer : 0;
+					int awIdx;
+					client_t *awCl;
+
+					for ( awIdx = 0, awCl = svs.clients; awIdx < sv_maxclients->integer; awIdx++, awCl++ ) {
+						int awGap;
+
+						if ( awCl->state != CS_ACTIVE )
+							continue;
+						if ( awCl->netchan.remoteAddress.type == NA_BOT )
+							continue;
+						if ( awCl->awLastThinkTime == 0 )
+							continue; // never received a real command yet
+
+						awGap = sv.gameTime - awCl->awLastThinkTime;
+						if ( awGap > awTol ) {
+							// Advance serverTime by gameMsec for the blank command.
+							awCl->lastUsercmd.serverTime += _gameMsec;
+
+							// Mode 2: decay movement inputs based on gap duration.
+							// Phase 1 (gap <= tol + extra): full movement — extrapolate trajectory.
+							//   Handles brief jitter transparently. sv_antiwarpExtra controls
+							//   the extrapolation window (0=auto=awTol).
+							// Phase 2 (tol+extra < gap <= tol+extra+decayMs): linear decay to zero.
+							//   Player smoothly decelerates.
+							// Phase 3 (gap > tol+extra+decayMs): inputs zeroed, Pmove friction
+							//   coasts the player to a natural stop.
+							if ( awMode >= 2 ) {
+								int decayStart = awTol + awExtraMs; // decay begins after tol + extra
+								int elapsed = awGap - decayStart;
+
+								if ( elapsed > 0 ) {
+									if ( awDecayMs > 0 && elapsed < awDecayMs ) {
+										// Linear decay: scale = 1.0 → 0.0 over decayMs
+										int scale = 127 - ( 127 * elapsed / awDecayMs );
+										if ( scale < 0 ) scale = 0;
+										awCl->lastUsercmd.forwardmove = (signed char)( (int)awCl->lastUsercmd.forwardmove * scale / 127 );
+										awCl->lastUsercmd.rightmove   = (signed char)( (int)awCl->lastUsercmd.rightmove   * scale / 127 );
+										awCl->lastUsercmd.upmove      = (signed char)( (int)awCl->lastUsercmd.upmove      * scale / 127 );
+									} else {
+										// Past decay window (or decayMs=0): zero inputs, friction only
+										awCl->lastUsercmd.forwardmove = 0;
+										awCl->lastUsercmd.rightmove   = 0;
+										awCl->lastUsercmd.upmove      = 0;
+									}
+								}
+								// else: still in extrapolation phase, keep original inputs
+							}
+
+							VM_Call( gvm, 1, GAME_CLIENT_THINK, awIdx );
+
+							// Update tracking — QVM's ClientThink sets lastCmdTime = level.time
+							// (still the old value before GAME_RUN_FRAME updates it).
+							awCl->awLastThinkTime = sv.gameTime;
+
+							if ( awCl->state != CS_ACTIVE )
+								continue; // client was kicked during think
+						}
+					}
+				}
+
+				// Bot AI ticks in lockstep with GAME_RUN_FRAME at sv_gameHz rate.
+				SV_BotFrame( sv.gameTime );
+				VM_Call( gvm, 1, GAME_RUN_FRAME, sv.gameTime );
+#ifdef USE_MV
+				svs.emptyFrame = qfalse; // game frame fired — allow multiview recorder this tick
+#endif
+			}
+		}
+
+		// Record positions into smooth buffer when either feature is enabled.
+		// sv_bufferMs = position delay, sv_velSmooth = velocity smoothing.
+		// Ring buffer feeds both — record when either is non-zero.
+		if ( ( ( sv_extrapolate && sv_extrapolate->integer ) || ( sv_smoothClients && sv_smoothClients->integer ) )
+				&& ( ( sv_bufferMs && sv_bufferMs->integer != 0 )
+				  || ( sv_velSmooth && sv_velSmooth->integer > 0 ) ) ) {
+			SV_SmoothRecordAll();
+		}
+
+		// Issue and dispatch snapshots once per sv_fps tick, not once per Com_Frame.
+		// This ensures clients receive packets at the true tick rate regardless of
+		// how many ticks fire per real-world Com_Frame call.
+		SV_IssueNewSnapshot();
+		SV_SendClientMessages();
 	}
 
 	if ( com_speeds->integer ) {
 		time_game = Sys_Milliseconds () - startTime;
 	}
 
-	// check timeouts
+	// check timeouts (once per Com_Frame is sufficient)
 	SV_CheckTimeouts();
 
-	// reset current and build new snapshot on first query
-	SV_IssueNewSnapshot();
-
-	// send messages back to the clients
-	SV_SendClientMessages();
+#ifdef USE_MV
+    if ( sv_autoRecord->integer > 0 ) {
+        if ( sv_demoFile == FS_INVALID_HANDLE ) {
+            if ( SV_FindActiveClient( qtrue, -1, sv_autoRecord->integer ) >= 0 ) {
+                Cbuf_AddText( "mvrecord\n" );
+            }
+        }
+    }
+#endif
 
 	// send a heartbeat to the master if needed
 	SV_MasterHeartbeat(HEARTBEAT_FOR_MASTER);

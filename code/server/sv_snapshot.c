@@ -21,6 +21,236 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 */
 
 #include "server.h"
+#include "sv_antilag.h"
+
+
+/*
+=============================================================================
+
+Per-client position ring buffer for smooth interpolation at high sv_fps.
+
+Records position + velocity at every sv_fps tick. Provides:
+- Position delay: look back N ms for more stable snapshot positions (TR_INTERPOLATE)
+- Velocity smoothing: average velocity over buffer window (TR_LINEAR)
+
+=============================================================================
+*/
+
+#define SV_SMOOTH_MAX_SLOTS 32   // covers 256ms at sv_fps 125 (8ms/tick)
+
+typedef struct {
+	vec3_t      origin;
+	vec3_t      velocity;
+	int         serverTime;
+	qboolean    valid;
+} svSmoothPos_t;
+
+typedef struct {
+	svSmoothPos_t slots[SV_SMOOTH_MAX_SLOTS];
+	int           head;
+	int           count;
+} svSmoothHistory_t;
+
+static svSmoothHistory_t sv_smoothHistory[MAX_CLIENTS];
+
+
+/*
+=============
+SV_SmoothInit
+
+Clear all position history buffers. Called on map load/restart.
+=============
+*/
+void SV_SmoothInit( void ) {
+	Com_Memset( sv_smoothHistory, 0, sizeof( sv_smoothHistory ) );
+}
+
+
+/*
+=============
+SV_SmoothRecord
+
+Record a single client's current position + velocity into the ring buffer.
+Bot: raw game-frame position (no extrapolation — bots excluded from prediction).
+Real player: actual ps->origin (updated by Pmove every usercmd).
+=============
+*/
+static void SV_SmoothRecord( int clientNum ) {
+	svSmoothHistory_t *hist;
+	svSmoothPos_t *slot;
+	int idx;
+
+	if ( clientNum < 0 || clientNum >= sv_maxclients->integer )
+		return;
+
+	hist = &sv_smoothHistory[clientNum];
+	idx = ( hist->head % SV_SMOOTH_MAX_SLOTS + SV_SMOOTH_MAX_SLOTS ) % SV_SMOOTH_MAX_SLOTS;
+	slot = &hist->slots[idx];
+
+	if ( svs.clients[clientNum].netchan.remoteAddress.type == NA_BOT ) {
+		// Bot: record raw game-frame position from entity state.
+		// No velocity extrapolation — bots are excluded from prediction
+		// because it creates sawtooth artifacts at direction changes.
+		sharedEntity_t *gent = SV_GentityNum( clientNum );
+		VectorCopy( gent->s.pos.trBase, slot->origin );
+		VectorCopy( gent->s.pos.trDelta, slot->velocity );
+	} else {
+		// Real player: actual Pmove position + current velocity
+		playerState_t *ps = SV_GameClientNum( clientNum );
+		VectorCopy( ps->origin, slot->origin );
+		VectorCopy( ps->velocity, slot->velocity );
+	}
+
+	slot->serverTime = sv.time;
+	slot->valid = qtrue;
+
+	hist->head++;
+	if ( hist->count < SV_SMOOTH_MAX_SLOTS )
+		hist->count++;
+}
+
+
+/*
+=============
+SV_SmoothRecordAll
+
+Record all active clients into the ring buffer. Called once per sv_fps tick.
+=============
+*/
+void SV_SmoothRecordAll( void ) {
+	int i;
+	for ( i = 0; i < sv_maxclients->integer; i++ ) {
+		if ( svs.clients[i].state == CS_ACTIVE ) {
+			SV_SmoothRecord( i );
+		}
+	}
+}
+
+
+/*
+=============
+SV_SmoothGetPosition
+
+Look up a client's position at a target time by interpolating between
+ring buffer entries. Returns qfalse if insufficient data.
+=============
+*/
+static qboolean SV_SmoothGetPosition( int clientNum, int targetTime,
+		vec3_t outOrigin, vec3_t outVelocity ) {
+	svSmoothHistory_t *hist;
+	svSmoothPos_t *before = NULL, *after = NULL;
+	int i, idx;
+	float frac;
+
+	if ( clientNum < 0 || clientNum >= sv_maxclients->integer )
+		return qfalse;
+
+	hist = &sv_smoothHistory[clientNum];
+	if ( hist->count == 0 )
+		return qfalse;
+
+	// Walk the ring buffer to find entries bracketing targetTime
+	for ( i = 0; i < hist->count; i++ ) {
+		idx = ( ( hist->head - 1 - i ) % SV_SMOOTH_MAX_SLOTS + SV_SMOOTH_MAX_SLOTS ) % SV_SMOOTH_MAX_SLOTS;
+
+		if ( !hist->slots[idx].valid )
+			continue;
+
+		if ( hist->slots[idx].serverTime <= targetTime ) {
+			if ( !before || hist->slots[idx].serverTime > before->serverTime )
+				before = &hist->slots[idx];
+		} else {
+			if ( !after || hist->slots[idx].serverTime < after->serverTime )
+				after = &hist->slots[idx];
+		}
+	}
+
+	// Need at least one valid entry
+	if ( !before && !after )
+		return qfalse;
+
+	// Only one side: use it directly
+	if ( !before ) {
+		VectorCopy( after->origin, outOrigin );
+		VectorCopy( after->velocity, outVelocity );
+		return qtrue;
+	}
+	if ( !after ) {
+		VectorCopy( before->origin, outOrigin );
+		VectorCopy( before->velocity, outVelocity );
+		return qtrue;
+	}
+
+	// Interpolate between before and after
+	if ( after->serverTime == before->serverTime ) {
+		frac = 0.0f;
+	} else {
+		frac = (float)( targetTime - before->serverTime )
+			/ (float)( after->serverTime - before->serverTime );
+	}
+	if ( frac < 0.0f ) frac = 0.0f;
+	if ( frac > 1.0f ) frac = 1.0f;
+
+	outOrigin[0] = before->origin[0] + frac * ( after->origin[0] - before->origin[0] );
+	outOrigin[1] = before->origin[1] + frac * ( after->origin[1] - before->origin[1] );
+	outOrigin[2] = before->origin[2] + frac * ( after->origin[2] - before->origin[2] );
+
+	outVelocity[0] = before->velocity[0] + frac * ( after->velocity[0] - before->velocity[0] );
+	outVelocity[1] = before->velocity[1] + frac * ( after->velocity[1] - before->velocity[1] );
+	outVelocity[2] = before->velocity[2] + frac * ( after->velocity[2] - before->velocity[2] );
+
+	return qtrue;
+}
+
+
+/*
+=============
+SV_SmoothGetAverageVelocity
+
+Average all velocity entries within the last windowMs milliseconds.
+Returns qfalse if no valid data exists.
+=============
+*/
+static qboolean SV_SmoothGetAverageVelocity( int clientNum, int windowMs,
+		vec3_t outVelocity ) {
+	svSmoothHistory_t *hist;
+	int i, idx, n;
+	int cutoff;
+
+	if ( clientNum < 0 || clientNum >= sv_maxclients->integer )
+		return qfalse;
+
+	hist = &sv_smoothHistory[clientNum];
+	if ( hist->count == 0 )
+		return qfalse;
+
+	cutoff = sv.time - windowMs;
+	VectorClear( outVelocity );
+	n = 0;
+
+	for ( i = 0; i < hist->count; i++ ) {
+		idx = ( ( hist->head - 1 - i ) % SV_SMOOTH_MAX_SLOTS + SV_SMOOTH_MAX_SLOTS ) % SV_SMOOTH_MAX_SLOTS;
+
+		if ( !hist->slots[idx].valid )
+			continue;
+		if ( hist->slots[idx].serverTime < cutoff )
+			break; // ring buffer is ordered by time, so older entries past cutoff
+
+		outVelocity[0] += hist->slots[idx].velocity[0];
+		outVelocity[1] += hist->slots[idx].velocity[1];
+		outVelocity[2] += hist->slots[idx].velocity[2];
+		n++;
+	}
+
+	if ( n == 0 )
+		return qfalse;
+
+	outVelocity[0] /= n;
+	outVelocity[1] /= n;
+	outVelocity[2] /= n;
+
+	return qtrue;
+}
 
 
 /*
@@ -112,15 +342,169 @@ static void SV_EmitPacketEntities( const clientSnapshot_t *from, const clientSna
 	MSG_WriteBits( msg, (MAX_GENTITIES-1), GENTITYNUM_BITS );	// end of packetentities
 }
 
+#ifdef USE_MV
+static int SV_GetMergeMaskEntities( clientSnapshot_t *snap )
+{
+    const entityState_t *ent;
+    psFrame_t *psf;
+    int skipMask;
+    int i, n;
+
+    n = 0;
+    skipMask = 0;
+    psf = NULL;
+
+    if ( !svs.currFrame )
+        return skipMask;
+
+    for ( i = 0; i < sv_maxclients->integer; i++ ) {
+        ent = svs.currFrame->ents[ i ];
+        if ( ent->number >= sv_maxclients->integer )
+            break;
+        for ( /*n = 0 */; n < snap->num_psf; n++ ) {
+            psf = &svs.snapshotPSF[ ( snap->first_psf + n ) % svs.numSnapshotPSF ];
+            if ( psf->clientSlot == ent->number ) {
+                skipMask |= MSG_PlayerStateToEntityStateXMask( &psf->ps, ent, qtrue );
+            }
+        }
+        //if ( n >= snap->num_psf ) {
+        //	Com_Error( ERR_DROP, "ent[%i] not found in psf array", ent->number );
+        //	break;
+        //}
+    }
+    return skipMask;
+}
+
+
+static void SV_EmitByteMask( msg_t *msg, const byte *mask, const int maxIndex, const int indexBits, qboolean ignoreFirstZero )
+{
+    int firstIndex;
+    int lastIndex;
+
+    for ( firstIndex = 0; firstIndex < maxIndex; firstIndex++ ) {
+        if ( mask[ firstIndex ] ) {
+            lastIndex = firstIndex;
+            while ( lastIndex < maxIndex-1 ) {
+                if ( mask[ lastIndex + 1 ] )
+                    lastIndex++;
+                else if ( ignoreFirstZero && lastIndex < maxIndex-2 && mask[ lastIndex + 2 ] )
+                    lastIndex += 2; // skip single zero block
+                else
+                    break;
+            }
+            //printf( "start: %i end: %i\n", firstIndex, lastIndex );
+            MSG_WriteBits( msg, 1, 1 ); // delta change
+            MSG_WriteBits( msg, firstIndex, indexBits );
+            MSG_WriteBits( msg, lastIndex, indexBits );
+            for ( ; firstIndex < lastIndex + 1 ; firstIndex++ ) {
+                MSG_WriteByte( msg, mask[ firstIndex ] );
+            }
+            firstIndex = lastIndex;
+        }
+    }
+    MSG_WriteBits( msg, 0, 1 ); // no delta
+}
+
+
+static void SV_EmitPlayerStates( int baseClientID, const clientSnapshot_t *from, const clientSnapshot_t *to, msg_t *msg, skip_mask sm )
+{
+    psFrame_t *psf;
+    const psFrame_t *old_psf;
+    const playerState_t *oldPs;
+
+    int i, n;
+    int clientSlot;
+    int oldIndex;
+
+    const byte *oldPsMask;
+    byte oldPsMaskBuf[MAX_CLIENTS/8];
+    byte newPsMask[MAX_CLIENTS/8];
+
+    const byte *oldEntMask;
+    byte oldEntMaskBuf[MAX_GENTITIES/8];
+    byte newEntMask[MAX_GENTITIES/8];
+
+    // generate playerstate mask
+    if ( !from || !from->num_psf ) {
+        Com_Memset( oldPsMaskBuf, 0, sizeof( oldPsMaskBuf ) );
+        oldPsMask = oldPsMaskBuf;
+    } else {
+        oldPsMask = from->psMask;
+    }
+
+#if 1
+    // delta-xor playerstate bitmask
+    for ( i = 0; i < ARRAY_LEN( newPsMask ); i++ ) {
+        newPsMask[ i ] = to->psMask[ i ] ^ oldPsMask[ i ];
+    }
+    SV_EmitByteMask( msg, newPsMask, MAX_CLIENTS/8, 3, qfalse );
+#else
+    MSG_WriteData( msg, to->psMask[ i ], sizeof( to->psMasks ) ); // direct playerstate mask
+#endif
+
+    oldIndex = 0;
+    clientSlot = 0;
+    old_psf = NULL; // silent warning
+
+    for ( i = 0; i < to->num_psf; i++ )
+    {
+        psf = &svs.snapshotPSF[ ( to->first_psf + i ) % svs.numSnapshotPSF ];
+        clientSlot = psf->clientSlot;
+        // check if masked in previous frame:
+        if ( !GET_ABIT( oldPsMask, clientSlot ) ) {
+            if ( from && clientSlot == baseClientID ) // FIXME: ps->clientNum?
+                oldPs = &from->ps; // transition from legacy to multiview mode
+            else
+                oldPs = NULL; // new playerstate
+            // empty entity mask
+            Com_Memset( oldEntMaskBuf, 0, sizeof( oldEntMaskBuf ) );
+            oldEntMask = oldEntMaskBuf;
+        } else {
+            // masked in previous frame so MUST exist
+            old_psf = NULL;
+            // search for client state in old frame
+            for ( ; oldIndex < from->num_psf; oldIndex++ ) {
+                old_psf = &svs.snapshotPSF[ ( from->first_psf + oldIndex ) % svs.numSnapshotPSF ];
+                if ( old_psf->clientSlot == clientSlot )
+                    break;
+            }
+            if ( oldIndex >= from->num_psf ) { // should never happen?
+                Com_Error( ERR_DROP, "oldIndex(%i) >= from->num_psf(%i), from->first_pfs=%i", oldIndex, from->num_psf, from->first_psf );
+                continue;
+            }
+            oldPs = &old_psf->ps;
+            oldEntMask = old_psf->entMask;
+        }
+
+        // areabytes
+        MSG_WriteBits( msg, psf->areabytes, 6 ); // was 8
+        MSG_WriteData( msg, psf->areabits, psf->areabytes );
+
+        // playerstate
+        MSG_WriteDeltaPlayerstate( msg, oldPs, &psf->ps );
+
+#if 1
+        // delta-xor mask
+        for ( n = 0; n < ARRAY_LEN( newEntMask ); n++ ) {
+            newEntMask[ n ] = psf->entMask[ n ] ^ oldEntMask[ n ];
+        }
+        SV_EmitByteMask( msg, newEntMask, sizeof( newEntMask ), 7, qtrue );
+#else
+        // direct mask
+		MSG_WriteData( msg, psf->entMask.mask, sizeof( psf->entMask.mask ) );
+#endif
+    }
+}
+#endif // USE_MV
 
 /*
 ==================
 SV_WriteSnapshotToClient
 ==================
 */
-static void SV_WriteSnapshotToClient( const client_t *client, msg_t *msg ) {
+static void SV_WriteSnapshotToClient( client_t *client, msg_t *msg ) {
 	const clientSnapshot_t	*oldframe;
-	const clientSnapshot_t	*frame;
+	clientSnapshot_t	*frame;
 	int					lastframe;
 	int					i;
 	int					snapFlags;
@@ -142,7 +526,33 @@ static void SV_WriteSnapshotToClient( const client_t *client, msg_t *msg ) {
 		}
 		oldframe = NULL;
 		lastframe = 0;
-	} else {
+	}
+
+#ifdef USE_SERVER_DEMO
+    else if (client->demo_recording && client->demo_deltas <= 0) {
+		// if we're recording this client, force full frames every now and then
+		oldframe = NULL;
+		lastframe = 0;
+		Com_DPrintf("Forced a full frame for %s\n", client->name);
+		// once we reach 1 full frame for every 1024 delta frames we stay there
+		// TODO: these numbers need to be tweaked properly, the current values
+		// just seem to work "fine" for all the tests we ran...
+		if (client->demo_backoff < 1024) {
+			client->demo_backoff *= 2;
+		}
+		client->demo_deltas = client->demo_backoff;
+	}
+#endif
+
+	else {
+#ifdef USE_SERVER_DEMO
+        // count down delta frames to know when we need to send the next full frame
+		if (client->demo_recording) {
+			Com_DPrintf("Counted a delta frame for %s\n", client->name);
+			client->demo_deltas--;
+		}
+#endif
+
 		// we have a valid snapshot to delta from
 		oldframe = &client->frames[ client->deltaMessage & PACKET_MASK ];
 		lastframe = client->netchan.outgoingSequence - client->deltaMessage;
@@ -152,7 +562,28 @@ static void SV_WriteSnapshotToClient( const client_t *client, msg_t *msg ) {
 			oldframe = NULL;
 			lastframe = 0;
 		}
+#ifdef USE_MV
+		else if ( frame->multiview && oldframe->first_psf <= svs.nextSnapshotPSF - svs.numSnapshotPSF ) {
+			Com_DPrintf( "%s: Delta request from out of date playerstate.\n", client->name );
+			oldframe = NULL;
+			lastframe = 0;
+		}
+#endif
 	}
+
+#ifdef USE_SERVER_DEMO
+    // start recording only once there's a non-delta frame to start with
+	if (!oldframe && client->demo_recording && client->demo_waiting) {
+		client->demo_waiting = qfalse;
+		Com_DPrintf("Got non-delta frame, recording %s now\n", client->name);
+	}
+#endif
+
+#ifdef USE_MV
+	if ( frame->multiview )
+		MSG_WriteByte( msg, svc_multiview );
+	else
+#endif
 
 	MSG_WriteByte( msg, svc_snapshot );
 
@@ -187,6 +618,50 @@ static void SV_WriteSnapshotToClient( const client_t *client, msg_t *msg ) {
 
 	MSG_WriteByte (msg, snapFlags);
 
+#ifdef USE_MV
+    if ( frame->multiview ) {
+        int newmask;
+        int oldmask;
+        int	oldversion;
+
+        frame->version = MV_PROTOCOL_VERSION;
+
+        if ( !oldframe || !oldframe->multiview ) {
+            oldversion = 0;
+            oldmask = 0;
+        } else {
+            oldversion = oldframe->version;
+            oldmask = oldframe->mergeMask;
+        }
+
+        // emit protocol version in first message
+        if ( oldversion != frame->version ) {
+            MSG_WriteBits( msg, 1, 1 );
+            MSG_WriteByte( msg, frame->version );
+        } else {
+            MSG_WriteBits( msg, 0, 1 );
+        }
+
+        newmask = SM_ALL & ~SV_GetMergeMaskEntities( frame );
+
+        // emit skip-merge mask
+        if ( oldmask != newmask ) {
+            MSG_WriteBits( msg, 1, 1 );
+            MSG_WriteBits( msg, newmask, SM_BITS );
+        } else {
+            MSG_WriteBits( msg, 0, 1 );
+        }
+
+        frame->mergeMask = newmask;
+
+        SV_EmitPlayerStates( client - svs.clients, oldframe, frame, msg, newmask );
+        MSG_entMergeMask = newmask; // emit packet entities with skipmask
+        SV_EmitPacketEntities( oldframe, frame, msg );
+        MSG_entMergeMask = 0; // don't forget to reset that!
+    } else {
+#endif
+
+
 	// send over the areabits
 	MSG_WriteByte (msg, frame->areabytes);
 	MSG_WriteData (msg, frame->areabits, frame->areabytes);
@@ -211,6 +686,10 @@ static void SV_WriteSnapshotToClient( const client_t *client, msg_t *msg ) {
 	// delta encode the entities
 	SV_EmitPacketEntities (oldframe, frame, msg);
 
+#ifdef USE_MV
+	} // !client->MVProtocol
+#endif
+
 	// padding for rate debugging
 	if ( sv_padPackets->integer ) {
 		for ( i = 0 ; i < sv_padPackets->integer ; i++ ) {
@@ -219,6 +698,70 @@ static void SV_WriteSnapshotToClient( const client_t *client, msg_t *msg ) {
 	}
 }
 
+#if defined( USE_MV ) && defined( USE_MV_ZCMD )
+
+static int SV_GetTextBits( const byte *cmd, int cmdlen ) {
+	int n;
+	for ( n = 0; n < cmdlen; n++ ) {
+		if ( cmd[ n ] > 127 ) {
+			return 8;
+		}
+	}
+	return 7;
+}
+
+
+static int SV_GetCmdSize( int Cmd )
+{
+	if ( (unsigned)Cmd <= 0xFF ) {
+		return 1;
+	} else if ( (unsigned)Cmd <= 0xFFFF ) {
+		return 2;
+	} else if ( (unsigned)Cmd <= 0xFFFFFF ) {
+		return 3;
+	} else {
+		return 4;
+	}
+}
+
+
+static qboolean SV_BuildCompressedBuffer( client_t *client, int reliableSequence )
+{
+	int index;
+	int cmdLen;
+	const char *cmd;
+	lzstream_t *stream;
+
+	index = reliableSequence & (MAX_RELIABLE_COMMANDS-1);
+
+	if ( client->multiview.z.stream[ index ].zcommandNum == reliableSequence )
+		return qfalse; // already compressed
+
+	//Com_DPrintf( S_COLOR_YELLOW "zcmd: compressing %i.%i\n", reliableSequence, client->multiview.z.deltaSeq );
+
+	cmd = client->reliableCommands[ index ];
+	cmdLen = strlen( cmd );
+
+	if ( client->multiview.z.deltaSeq == 0 ) {
+		LZSS_InitContext( &client->multiview.z.ctx );
+	}
+
+	stream = &client->multiview.z.stream[ index ];
+	stream->zdelta = client->multiview.z.deltaSeq;
+	stream->zcommandNum = reliableSequence;
+	stream->zcommandSize = SV_GetCmdSize( reliableSequence );
+	stream->zcharbits = SV_GetTextBits( (byte*)cmd, cmdLen );
+	/* stream->count = */ LZSS_CompressToStream( &client->multiview.z.ctx, stream, (byte*)cmd, cmdLen );
+
+	// don't forget to update delta sequence
+	if ( client->multiview.z.deltaSeq >= 7 )
+		client->multiview.z.deltaSeq = 1;
+	else
+		client->multiview.z.deltaSeq++;
+
+	return qtrue;
+}
+#endif // USE_MV
 
 /*
 ==================
@@ -230,6 +773,61 @@ SV_UpdateServerCommandsToClient
 void SV_UpdateServerCommandsToClient( client_t *client, msg_t *msg ) {
 	int i, n;
 
+#ifdef USE_MV
+    if ( client->multiview.protocol /*&& client->state >= CS_CONNECTED*/ ) {
+
+        if ( client->multiview.recorder ) {
+            // forward target client commands to recorder slot
+            SV_ForwardServerCommands( client ); // TODO: forward all clients?
+        }
+
+        if ( client->reliableAcknowledge >= client->reliableSequence ) {
+#ifdef USE_MV_ZCMD
+            // nothing to send, reset compression sequences
+			for ( i = 0; i < MAX_RELIABLE_COMMANDS; i++ )
+				client->multiview.z.stream[ i ].zcommandNum = -1;
+#endif
+            //client->reliableSent = client->reliableSequence;
+            client->reliableSent = -1;
+            return;
+        }
+
+        // write any unacknowledged serverCommands
+        for ( i = client->reliableAcknowledge + 1 ; i <= client->reliableSequence ; i++ ) {
+#if defined( USE_MV ) && defined( USE_MV_ZCMD )
+            // !!! do not start compression sequence from already sent uncompressed commands
+			// (re)send them uncompressed and only after that initiate compression sequence
+			if ( i <= client->reliableSent ) {
+				MSG_WriteByte( msg, svc_serverCommand );
+				MSG_WriteLong( msg, i );
+				MSG_WriteString( msg, client->reliableCommands[ i & (MAX_RELIABLE_COMMANDS-1) ] );
+			} else{
+				// build new compressed stream or re-send existing
+				SV_BuildCompressedBuffer( client, i );
+				MSG_WriteLZStream( msg, &client->multiview.z.stream[ i & (MAX_RELIABLE_COMMANDS-1) ] );
+				// TODO: indicate compressedSent?
+			}
+#else
+            MSG_WriteByte( msg, svc_serverCommand );
+            MSG_WriteLong( msg, i );
+            MSG_WriteString( msg, client->reliableCommands[ i & (MAX_RELIABLE_COMMANDS-1) ] );
+#endif
+        }
+
+        // recorder operations always success:
+        if ( client->multiview.recorder )
+            client->reliableAcknowledge = client->reliableSequence;
+        client->multiview.lastRecvTime = svs.time;
+        // TODO: indicate compressedSent?
+        //client->reliableSent = client->reliableSequence;
+        return;
+    }
+#ifdef USE_MV_ZCMD
+    // reset on inactive/non-multiview
+	client->multiview.z.deltaSeq = 0;
+#endif
+#endif // USE_MV
+
 	// write any unacknowledged serverCommands
 	n = client->reliableSequence - client->reliableAcknowledge;
 
@@ -239,6 +837,13 @@ void SV_UpdateServerCommandsToClient( client_t *client, msg_t *msg ) {
 		MSG_WriteLong( msg, index );
 		MSG_WriteString( msg, client->reliableCommands[ index & (MAX_RELIABLE_COMMANDS-1) ] );
 	}
+	client->reliableSent = client->reliableSequence;
+
+#ifdef USE_MV
+	if ( client->reliableSequence > client->reliableAcknowledge ) {
+		client->multiview.lastRecvTime = svs.time;
+	}
+#endif
 }
 
 /*
@@ -257,6 +862,20 @@ typedef struct {
 	qboolean unordered;
 } snapshotEntityNumbers_t;
 
+typedef struct clientPVS_s {
+    int		snapshotFrame; // svs.snapshotFrame
+
+    int		clientNum;
+    int		areabytes;
+    byte	areabits[MAX_MAP_AREA_BYTES];		// portalarea visibility bits
+    snapshotEntityNumbers_t	numbers;
+
+    byte	entMask[MAX_GENTITIES/8];
+    qboolean entMaskBuilt;
+
+} clientPVS_t;
+
+static clientPVS_t client_pvs[ MAX_CLIENTS ];
 
 /*
 =============
@@ -277,14 +896,12 @@ static void SV_SortEntityNumbers( entityNum_t *num, const int size ) {
 			d--;
 		}
 	}
-#ifdef _DEBUG
 	// consistency check for delta encoding
-	for ( i = 1 ; i < size; i++ ) {
-		if ( num[i-1] >= num[i] ) {
-			Com_Error( ERR_DROP, "%s: invalid entity number %i", __func__, num[ i ] );
-		}
-	}
-#endif
+//	for ( i = 1 ; i < size; i++ ) {
+//		if ( num[i-1] >= num[i] ) {
+//			Com_Error( ERR_DROP, "%s: invalid entity number %i", __func__, num[ i ] );
+//		}
+//	}
 }
 
 
@@ -312,8 +929,7 @@ static void SV_AddIndexToSnapshot( svEntity_t *svEnt, int index, snapshotEntityN
 SV_AddEntitiesVisibleFromPoint
 ===============
 */
-static void SV_AddEntitiesVisibleFromPoint( const vec3_t origin, clientSnapshot_t *frame,
-									snapshotEntityNumbers_t *eNums, qboolean portal ) {
+static void SV_AddEntitiesVisibleFromPoint(const vec3_t origin, clientPVS_t* pvs, qboolean portal) {
 	int		e, i;
 	sharedEntity_t *ent;
 	svEntity_t	*svEnt;
@@ -336,7 +952,7 @@ static void SV_AddEntitiesVisibleFromPoint( const vec3_t origin, clientSnapshot_
 	clientcluster = CM_LeafCluster (leafnum);
 
 	// calculate the visible areas
-	frame->areabytes = CM_WriteAreaBits( frame->areabits, clientarea );
+    pvs->areabytes = CM_WriteAreaBits( pvs->areabits, clientarea );
 
 	clientpvs = CM_ClusterPVS (clientcluster);
 
@@ -346,21 +962,21 @@ static void SV_AddEntitiesVisibleFromPoint( const vec3_t origin, clientSnapshot_
 
 		// entities can be flagged to be sent to only one client
 		if ( ent->r.svFlags & SVF_SINGLECLIENT ) {
-			if ( ent->r.singleClient != frame->ps.clientNum ) {
+            if ( ent->r.singleClient != pvs->clientNum ) {
 				continue;
 			}
 		}
 		// entities can be flagged to be sent to everyone but one client
 		if ( ent->r.svFlags & SVF_NOTSINGLECLIENT ) {
-			if ( ent->r.singleClient == frame->ps.clientNum ) {
+            if ( ent->r.singleClient == pvs->clientNum ) {
 				continue;
 			}
 		}
 		// entities can be flagged to be sent to a given mask of clients
 		if ( ent->r.svFlags & SVF_CLIENTMASK ) {
-			if (frame->ps.clientNum >= 32)
+            if ( pvs->clientNum >= 32 )
 				Com_Error( ERR_DROP, "SVF_CLIENTMASK: clientNum >= 32" );
-			if (~ent->r.singleClient & (1 << frame->ps.clientNum))
+            if ( ~ent->r.singleClient & (1 << pvs->clientNum) )
 				continue;
 		}
 
@@ -373,7 +989,7 @@ static void SV_AddEntitiesVisibleFromPoint( const vec3_t origin, clientSnapshot_
 
 		// broadcast entities are always sent
 		if ( ent->r.svFlags & SVF_BROADCAST ) {
-			SV_AddIndexToSnapshot( svEnt, e, eNums );
+            SV_AddIndexToSnapshot( svEnt, e, &pvs->numbers );
 			continue;
 		}
 
@@ -419,7 +1035,7 @@ static void SV_AddEntitiesVisibleFromPoint( const vec3_t origin, clientSnapshot_
 		}
 
 		// add it
-		SV_AddIndexToSnapshot( svEnt, e, eNums );
+        SV_AddIndexToSnapshot( svEnt, e, &pvs->numbers );
 
 		// if it's a portal entity, add everything visible from its camera position
 		if ( ent->r.svFlags & SVF_PORTAL && !portal ) {
@@ -430,16 +1046,16 @@ static void SV_AddEntitiesVisibleFromPoint( const vec3_t origin, clientSnapshot_
 					continue;
 				}
 			}
-			eNums->unordered = qtrue;
-			SV_AddEntitiesVisibleFromPoint( ent->s.origin2, frame, eNums, portal );
+            pvs->numbers.unordered = qtrue;
+			SV_AddEntitiesVisibleFromPoint( ent->s.origin2, pvs, portal );
 		}
 	}
 
-	ent = SV_GentityNum( frame->ps.clientNum );
-	// extension: merge second PVS at ent->r.s.origin2
+    ent = SV_GentityNum( pvs->clientNum );
+	// merge second PVS at ent->r.s.origin2
 	if ( ent->r.svFlags & SVF_SELF_PORTAL2 && !portal ) {
-		SV_AddEntitiesVisibleFromPoint( ent->r.s.origin2, frame, eNums, qtrue );
-		eNums->unordered = qtrue;
+        SV_AddEntitiesVisibleFromPoint( ent->r.s.origin2, pvs, qtrue );
+		pvs->numbers.unordered = qtrue;
 	}
 }
 
@@ -461,6 +1077,8 @@ void SV_InitSnapshotStorage( void )
 	svs.lastValidFrame = 0;
 
 	svs.currFrame = NULL;
+
+    Com_Memset( client_pvs, 0, sizeof( client_pvs ) );
 }
 
 
@@ -568,13 +1186,331 @@ static void SV_BuildCommonSnapshot( void )
 
 	// setup start index
 	index = sf->start;
-	for ( i = 0 ; i < count ; i++, index = (index+1) % svs.numSnapshotEntities ) {
-		//index %= svs.numSnapshotEntities;
-		svs.snapshotEntities[ index ] = list[ i ]->s;
-		sf->ents[ i ] = &svs.snapshotEntities[ index ];
+	{
+		// When sv_fps > sv_gameHz, BG_PlayerStateToEntityState only updates ent->s at
+		// sv_gameHz rate (20Hz). Without correction, consecutive 60Hz snapshots contain
+		// identical player positions until the next game frame — visible stutter.
+		//
+		// Two strategies depending on client type:
+		//
+		// REAL PLAYERS: read actual playerState_t position from the game module.
+		// ps->origin has the real post-Pmove position (updated every usercmd before
+		// SV_Frame). This gives every snapshot the true physics position — no prediction
+		// error, no sawtooth from direction changes between game frames.
+		// sv_smoothClients sets TR_LINEAR for cgame-side extrapolation.
+		// sv_bufferMs uses ring buffer for delayed position lookup.
+		//
+		// BOTS: excluded from position prediction entirely. Bot AI only ticks at
+		// sv_gameHz, so their velocity changes at every game frame boundary.
+		// Velocity prediction (linear extrapolation) creates sawtooth artifacts:
+		// drift in stale direction → snap to new direction every 50ms at sv_gameHz 20.
+		// Instead, bots keep their raw BG_PlayerStateToEntityState positions and the
+		// client interpolates between game-frame snapshots (standard Q3 behavior).
+		// At sv_gameHz 0 (disabled), bots update at sv_fps rate — no stale positions.
+		const int gameMsec = 1000 / ( sv_gameHz && sv_gameHz->integer > 0 ? sv_gameHz->integer : sv_fps->integer );
+		float extrapolateMs = (float)( sv.time - sv.gameTime );
+		if ( extrapolateMs > (float)gameMsec )
+			extrapolateMs = (float)gameMsec;
+
+		// Compute effective buffer delay (resolved once, used per-entity)
+		{
+			int bufMs = 0;
+			if ( sv_bufferMs && sv_bufferMs->integer != 0 ) {
+				bufMs = sv_bufferMs->integer;
+				if ( bufMs < 0 ) {
+					// Auto mode: one snapshot interval — minimum for clean ring-buffer interpolation
+					bufMs = 1000 / sv_fps->integer;
+				}
+				if ( bufMs > 100 ) bufMs = 100;
+			}
+
+		for ( i = 0 ; i < count ; i++, index = (index+1) % svs.numSnapshotEntities ) {
+			svs.snapshotEntities[ index ] = list[ i ]->s;
+
+			// Fix up client entity positions between game frames.
+			// Both sv_smoothClients and sv_extrapolate run on every tick — including
+			// game-frame boundary ticks (extrapolateMs == 0) and when sv_gameHz is disabled
+			// (extrapolateMs == 0 on every tick in that mode).
+			// The previous guard `extrapolateMs > 0.0f` on sv_extrapolate was wrong: it
+			// blocked Phase 1 (sv_bufferMs ring buffer query) from running at game-frame
+			// boundaries and entirely when sv_gameHz is disabled — making sv_bufferMs silently
+			// ineffective for sv_extrapolate users in those cases.
+			// At extrapolateMs == 0: real-player ps->origin read is harmless
+			// (same value BG_PlayerStateToEntityState wrote). Bots are skipped in Phase 2.
+			if ( ( sv_smoothClients && sv_smoothClients->integer ) ||
+				( sv_extrapolate && sv_extrapolate->integer ) ) {
+				entityState_t *es = &svs.snapshotEntities[ index ];
+				if ( es->number < sv_maxclients->integer && es->pos.trType == TR_INTERPOLATE ) {
+
+					qboolean usedBuffer = qfalse;
+					qboolean isBot = ( svs.clients[ es->number ].netchan.remoteAddress.type == NA_BOT );
+					vec3_t origin, velocity;
+
+					// --- Phase 1: Resolve position source ---
+					// sv_bufferMs applies to real players only. Bots are excluded
+					// from both the ring buffer and position prediction (Phase 2
+					// skips bots entirely to avoid sawtooth artifacts).
+					if ( bufMs > 0 && !isBot ) {
+						vec3_t delayedOrigin, delayedVelocity;
+						if ( SV_SmoothGetPosition( es->number, sv.time - bufMs, delayedOrigin, delayedVelocity ) ) {
+							VectorCopy( delayedOrigin, origin );
+							VectorCopy( delayedVelocity, velocity );
+							usedBuffer = qtrue;
+						}
+					}
+					if ( !usedBuffer ) {
+						if ( isBot ) {
+							VectorCopy( es->pos.trBase, origin );
+							VectorCopy( es->pos.trDelta, velocity );
+						} else {
+							playerState_t *ps = SV_GameClientNum( es->number );
+							VectorCopy( ps->origin, origin );
+							VectorCopy( ps->velocity, velocity );
+						}
+					}
+
+					// --- Phase 2: Resolve trajectory type ---
+					// Bots excluded: velocity prediction (both TR_LINEAR and trBase +=)
+					// creates sawtooth artifacts at direction changes because bot AI only
+					// ticks at sv_gameHz. Without prediction, bots keep their game-frame
+					// positions — 20fps at sv_gameHz 20 (standard Q3 behavior). Choppy
+					// but stable; cgame lerps between snapshots for smooth visual motion.
+					// At sv_gameHz 0 this is moot (extrapolateMs == 0 always).
+					if ( isBot ) {
+						// Leave bot entity state untouched — no position prediction.
+					} else if ( sv_smoothClients && sv_smoothClients->integer ) {
+						// TR_LINEAR mode: set up trajectory for continuous cgame evaluation.
+						// IMPORTANT: only set TR_LINEAR when actually moving — idle players
+						// must stay TR_INTERPOLATE to prevent extrapolation drift/vibration.
+						int velSmoothMs = ( sv_velSmooth && sv_velSmooth->integer > 0 ) ? sv_velSmooth->integer : 0;
+						vec3_t finalVel;
+						if ( velSmoothMs > 0 ) {
+							vec3_t avgVel;
+							if ( SV_SmoothGetAverageVelocity( es->number, velSmoothMs, avgVel ) ) {
+								VectorCopy( avgVel, finalVel );
+							} else {
+								VectorCopy( velocity, finalVel );
+							}
+						} else {
+							VectorCopy( velocity, finalVel );
+						}
+						if ( DotProduct( finalVel, finalVel ) > 100.0f ) {
+							VectorCopy( origin, es->pos.trBase );
+							VectorCopy( finalVel, es->pos.trDelta );
+							es->pos.trType = TR_LINEAR;
+							es->pos.trTime = sv.time;
+						} else {
+							// Idle: keep TR_INTERPOLATE, but still anchor position from Phase 1
+							// so that sv_bufferMs delayed positions are applied even when idle.
+							VectorCopy( origin, es->pos.trBase );
+							VectorCopy( finalVel, es->pos.trDelta );
+						}
+					} else {
+						// TR_INTERPOLATE mode (real players only — bots excluded above).
+						if ( usedBuffer ) {
+							// Ring buffer position available: use delayed position,
+							// but only if actually moving (dead-zone guard prevents
+							// Pmove ground-snap micro-oscillations from causing jitter).
+							if ( DotProduct( velocity, velocity ) > 100.0f ) {
+								VectorCopy( origin, es->pos.trBase );
+								VectorCopy( velocity, es->pos.trDelta );
+							}
+						} else {
+							// Real player without buffer: always use ps->origin.
+							// No dead-zone needed — TR_INTERPOLATE never switches
+							// trajectory type, so idle micro-oscillations are
+							// imperceptible after cgame lerp. The old dead-zone
+							// caused a position pop at direction changes: velocity
+							// briefly drops below 10 ups and the entity kept the
+							// stale QVM position (up to 50ms old at sv_gameHz 20).
+							VectorCopy( origin, es->pos.trBase );
+							VectorCopy( velocity, es->pos.trDelta );
+						}
+					}
+				}
+			}
+
+			sf->ents[ i ] = &svs.snapshotEntities[ index ];
+		}
+		} // end bufMs scope
 	}
 }
 
+static clientPVS_t *SV_BuildClientPVS( int clientSlot, const playerState_t *ps, qboolean buildEntityMask )
+{
+    svEntity_t	*svEnt;
+    clientPVS_t	*pvs;
+    vec3_t	org;
+    int i;
+
+    pvs = &client_pvs[ clientSlot ];
+
+    if ( pvs->snapshotFrame != svs.snapshotFrame /*|| pvs->clientNum != ps->clientNum*/ ) {
+        pvs->snapshotFrame = svs.snapshotFrame;
+
+        // find the client's viewpoint
+        VectorCopy( ps->origin, org );
+        org[2] += ps->viewheight;
+
+        // bump the counter used to prevent double adding
+        sv.snapshotCounter++;
+
+        // never send client's own entity, because it can
+        // be regenerated from the playerstate
+        svEnt = &sv.svEntities[ ps->clientNum ];
+        svEnt->snapshotCounter = sv.snapshotCounter;
+
+        // add all the entities directly visible to the eye, which
+        // may include portal entities that merge other viewpoints
+        pvs->clientNum = ps->clientNum;
+        pvs->areabytes = 0;
+        memset( pvs->areabits, 0, sizeof ( pvs->areabits ) );
+
+        // empty entities before visibility check
+        pvs->entMaskBuilt = qfalse;
+        pvs->numbers.numSnapshotEntities = 0;
+        pvs->numbers.unordered = qfalse;
+        SV_AddEntitiesVisibleFromPoint( org, pvs, qfalse );
+        // if there were portals visible, there may be out of order entities
+        // in the list which will need to be resorted for the delta compression
+        // to work correctly.  This also catches the error condition
+        // of an entity being included twice.
+        if ( pvs->numbers.unordered ) {
+            SV_SortEntityNumbers( &pvs->numbers.snapshotEntities[0], pvs->numbers.numSnapshotEntities );
+        }
+
+        // now that all viewpoint's areabits have been OR'd together, invert
+        // all of them to make it a mask vector, which is what the renderer wants
+        for ( i = 0 ; i < MAX_MAP_AREA_BYTES/4 ; i++ ) {
+            ((int *)pvs->areabits)[i] = ((int *)pvs->areabits)[i] ^ -1;
+        }
+    }
+
+    if ( buildEntityMask && !pvs->entMaskBuilt ) {
+        pvs->entMaskBuilt = qtrue;
+        memset( pvs->entMask, 0, sizeof ( pvs->entMask ) );
+        for ( i = 0; i < pvs->numbers.numSnapshotEntities ; i++ ) {
+            SET_ABIT( pvs->entMask, svs.currFrame->ents[ pvs->numbers.snapshotEntities[ i ] ]->number );
+        }
+    }
+
+    return pvs;
+}
+
+
+#ifdef USE_MV
+/*
+==================
+SV_FindActiveClient
+
+find first human client we can use as primary/score requester
+bots is not good for that because they may not receive all feedback from game VM
+==================
+*/
+int SV_FindActiveClient( qboolean checkCommands, int skipClientNum, int minActive ) {
+    playerState_t *ps;
+    client_t *clist[ MAX_CLIENTS ];
+    client_t *cl;
+    int	longestInactivity;
+    int	longestSpecInactivity;
+    int bestIndex;
+    int i, nactive;
+
+    nactive = 0;	// number of active clients
+    bestIndex = -1;
+    longestInactivity = INT_MIN;
+    longestSpecInactivity = INT_MIN;
+
+    for ( i = 0, cl = svs.clients; i < sv_maxclients->integer ; i++, cl++ ) {
+
+        if ( cl->state != CS_ACTIVE || cl->gentity == NULL )
+            continue;
+
+        if ( cl->gentity->r.svFlags & SVF_BOT || i == skipClientNum )
+            continue;
+
+        if ( checkCommands ) {
+            // wait a few seconds after any command received/sent
+            // to avoid dropping score request by flood protection
+            // or lagging target client too much
+            if ( cl->multiview.lastRecvTime + 500 > svs.time )
+                continue;
+
+            if ( cl->multiview.lastSentTime + 1500 > svs.time )
+                continue;
+
+            // never send anything to client that has unacknowledged commands
+            if ( cl->reliableSequence > cl->reliableAcknowledge )
+                continue;
+        }
+
+        if ( longestInactivity < svs.time - cl->multiview.scoreQueryTime ) {
+            longestInactivity = svs.time - cl->multiview.scoreQueryTime;
+            bestIndex = cl - svs.clients;
+        }
+
+        clist[ nactive++ ] = cl;
+    }
+
+    if ( nactive < minActive )
+        return -1;
+
+    // count spectators from active
+    for ( i = 0; i < nactive; i++ ) {
+        cl = clist[ i ];
+        ps = SV_GameClientNum( cl - svs.clients );
+        if ( ps->persistant[ PERS_TEAM ] == TEAM_SPECTATOR || ps->pm_flags & PMF_FOLLOW ) {
+            if ( longestSpecInactivity < svs.time - cl->multiview.scoreQueryTime ) {
+                longestSpecInactivity = svs.time - cl->multiview.scoreQueryTime;
+                bestIndex = cl - svs.clients;
+            }
+        }
+    }
+
+    return bestIndex;
+}
+
+
+static void SV_QueryClientScore( client_t *client )
+{
+#define	SCORE_RECORDER 1
+#define	SCORE_CLIENT   2
+#define SCORE_PERIOD   10000
+
+    int clientNum;
+
+    if ( client->multiview.scoreQueryTime == 0 )
+    {
+        // first time init?
+        client->multiview.scoreQueryTime = svs.time + SCORE_PERIOD/3;
+    }
+    else if ( svs.time >= client->multiview.scoreQueryTime )
+    {
+        //} else if ( svs.time > client->multiview.scoreQueryTime + SCORE_PERIOD ) {
+        if ( client->multiview.recorder && sv_demoFlags->integer & SCORE_RECORDER ) {
+
+            clientNum = SV_FindActiveClient( qtrue, -1, 0 ); // count last sent command, ignore noone
+            if ( clientNum != -1 ) {
+                if ( clientNum != sv_demoClientID ) {
+                    //Com_DPrintf( S_COLOR_YELLOW " change score target from %i to %i\n", clientNum, sv_demoClientID );
+                    SV_SetTargetClient( clientNum );
+                }
+
+                SV_ExecuteClientCommand( svs.clients + sv_demoClientID, "score" );
+
+                client->multiview.scoreQueryTime = svs.time + SCORE_PERIOD;
+                svs.clients[ sv_demoClientID ].multiview.scoreQueryTime = svs.time + SCORE_PERIOD;
+
+            } else {
+                //Com_DPrintf( S_COLOR_YELLOW "no active clients available for 'score'\n" ); // debug print
+            }
+        } else if ( sv_demoFlags->integer & SCORE_CLIENT ) {
+            SV_ExecuteClientCommand( client, "score" );
+            client->multiview.scoreQueryTime = svs.time + SCORE_PERIOD;
+        }
+    }
+}
+#endif // USE_MV
 
 /*
 =============
@@ -590,13 +1526,11 @@ For viewing through other player's eyes, clent can be something other than clien
 =============
 */
 static void SV_BuildClientSnapshot( client_t *client ) {
-	vec3_t						org;
 	clientSnapshot_t			*frame;
-	snapshotEntityNumbers_t		entityNumbers;
 	int							i, cl;
-	svEntity_t					*svEnt;
 	int							clientNum;
 	playerState_t				*ps;
+    clientPVS_t					*pvs;
 
 	// this is the frame we are creating
 	frame = &client->frames[ client->netchan.outgoingSequence & PACKET_MASK ];
@@ -609,7 +1543,22 @@ static void SV_BuildClientSnapshot( client_t *client ) {
 	// https://zerowing.idsoftware.com/bugzilla/show_bug.cgi?id=62
 	frame->num_entities = 0;
 	frame->frameNum = svs.currentSnapshotFrame;
-	
+
+#ifdef USE_MV
+    if ( client->multiview.protocol > 0 ) {
+        frame->multiview = qtrue;
+        // select primary client slot
+        if ( client->multiview.recorder ) {
+            cl = sv_demoClientID;
+        }
+    } else {
+        frame->multiview = qfalse;
+    }
+    Com_Memset( frame->psMask, 0, sizeof( frame->psMask ) );
+    frame->first_psf = svs.nextSnapshotPSF;
+    frame->num_psf = 0;
+#endif
+
 	if ( client->state == CS_ZOMBIE )
 		return;
 
@@ -618,14 +1567,18 @@ static void SV_BuildClientSnapshot( client_t *client ) {
 	frame->ps = *ps;
 
 	clientNum = frame->ps.clientNum;
-	if ( clientNum < 0 || clientNum >= MAX_GENTITIES ) {
+    if ( clientNum < 0 || clientNum >= MAX_GENTITIES-1 ) {
 		Com_Error( ERR_DROP, "SV_SvEntityForGentity: bad gEnt" );
 	}
 
 	// we set client->gentity only after sending gamestate
 	// so don't send any packetentities changes until CS_PRIMED
 	// because new gamestate will invalidate them anyway
-	if ( !client->gentity ) {
+#ifdef USE_MV
+	if ( !client->gentity && !client->multiview.recorder ) {
+#else
+    if ( !client->gentity ) {
+#endif
 		return;
 	}
 
@@ -634,47 +1587,85 @@ static void SV_BuildClientSnapshot( client_t *client ) {
 		SV_BuildCommonSnapshot();
 	}
 
-	// bump the counter used to prevent double adding
-	sv.snapshotCounter++;
+    frame->frameNum = svs.currFrame->frameNum;
 
-	// empty entities before visibility check
-	entityNumbers.numSnapshotEntities = 0;
+#ifdef USE_MV
+    if ( frame->multiview ) {
+//        clientPVS_t *pvs;
+        psFrame_t *psf;
+        int slot;
+        for ( slot = 0 ; slot < sv_maxclients->integer; slot++ ) {
+            // record only form primary slot or active clients
+            if ( slot == cl || svs.clients[ slot ].state == CS_ACTIVE ) {
 
-	frame->frameNum = svs.currFrame->frameNum;
+                // get current playerstate
+                ps = SV_GameClientNum( slot );
 
-	// never send client's own entity, because it can
-	// be regenerated from the playerstate
-	svEnt = &sv.svEntities[ clientNum ];
-	svEnt->snapshotCounter = sv.snapshotCounter;
+                // skip bots in spectator state
+                if ( ps->persistant[ PERS_TEAM ] == TEAM_SPECTATOR && svs.clients[ slot ].netchan.remoteAddress.type == NA_BOT ) {
+                    continue;
+                }
 
-	// find the client's viewpoint
-	VectorCopy( ps->origin, org );
-	org[2] += ps->viewheight;
 
-	// add all the entities directly visible to the eye, which
-	// may include portal entities that merge other viewpoints
-	entityNumbers.unordered = qfalse;
-	SV_AddEntitiesVisibleFromPoint( org, frame, &entityNumbers, qfalse );
+                // allocate playerstate frame
+                psf = &svs.snapshotPSF[ svs.nextSnapshotPSF % svs.numSnapshotPSF ];
+                svs.nextSnapshotPSF++;
+                frame->num_psf++;
 
-	// if there were portals visible, there may be out of order entities
-	// in the list which will need to be resorted for the delta compression
-	// to work correctly.  This also catches the error condition
-	// of an entity being included twice.
-	if ( entityNumbers.unordered ) {
-		SV_SortEntityNumbers( &entityNumbers.snapshotEntities[0], 
-			entityNumbers.numSnapshotEntities );
-	}
+                SET_ABIT( frame->psMask, slot );
 
-	// now that all viewpoint's areabits have been OR'd together, invert
-	// all of them to make it a mask vector, which is what the renderer wants
-	for ( i = 0; i < MAX_MAP_AREA_BYTES/sizeof(int); i++ ) {
-		((int *)frame->areabits)[i] = ((int *)frame->areabits)[i] ^ -1;
-	}
+                psf->ps = *ps;
+                psf->clientSlot = slot;
 
-	frame->num_entities = entityNumbers.numSnapshotEntities;
-	// get pointers from common snapshot
-	for ( i = 0 ; i < entityNumbers.numSnapshotEntities ; i++ )	{
-		frame->ents[ i ] = svs.currFrame->ents[ entityNumbers.snapshotEntities[ i ] ];
+                pvs = SV_BuildClientPVS( slot, &psf->ps, qtrue );
+                psf->areabytes = pvs->areabytes;
+                memcpy( psf->areabits, pvs->areabits, sizeof( psf->areabits ) );
+
+                if ( slot == cl ) {
+                    // save for primary client
+                    frame->areabytes = psf->areabytes;
+                    Com_Memcpy( frame->areabits, psf->areabits, sizeof( frame->areabits ) );
+                }
+                // copy generated entity mask
+                memcpy( psf->entMask, pvs->entMask, sizeof( psf->entMask ) );
+            }
+        }
+
+        // get ALL pointers from common snapshot
+        frame->num_entities = svs.currFrame->count;
+        for ( i = 0 ; i < frame->num_entities ; i++ ) {
+            frame->ents[ i ] = svs.currFrame->ents[ i ];
+        }
+
+#ifdef USE_MV_ZCMD
+        // some extras
+		if ( client->deltaMessage <= 0 )
+			client->multiview.z.deltaSeq = 0;
+#endif
+
+        // auto score request
+        if ( sv_demoFlags->integer & ( SCORE_RECORDER | SCORE_CLIENT ) )
+            SV_QueryClientScore( client );
+
+    }
+    else // non-multiview frame
+#endif
+    {
+        pvs = SV_BuildClientPVS( cl, ps, qfalse );
+        // now that all viewpoint's areabits have been OR'd together, invert
+        // all of them to make it a mask vector, which is what the renderer wants
+        for ( i = 0; i < MAX_MAP_AREA_BYTES/sizeof(int); i++ ) {
+            ((int *)frame->areabits)[i] = ((int *)frame->areabits)[i] ^ -1;
+        }
+
+        memcpy( frame->areabits, pvs->areabits, sizeof( frame->areabits ) );
+        frame->areabytes = pvs->areabytes;
+
+        frame->num_entities = pvs->numbers.numSnapshotEntities;
+        // get pointers from common snapshot
+        for ( i = 0 ; i < pvs->numbers.numSnapshotEntities ; i++ )	{
+            frame->ents[ i ] = svs.currFrame->ents[ pvs->numbers.snapshotEntities[ i ] ];
+        }
 	}
 }
 
@@ -688,6 +1679,39 @@ Called by SV_SendClientSnapshot and SV_SendClientGameState
 */
 void SV_SendMessageToClient( msg_t *msg, client_t *client )
 {
+#ifdef USE_SERVER_DEMO
+    if (client->demo_recording && !client->demo_waiting) {
+		SVD_WriteDemoFile(client, msg);
+		Com_DPrintf("Wrote a frame for %s\n", client->name);
+	}
+#endif
+
+#ifdef USE_MV
+    if ( client->multiview.protocol && client->multiview.recorder && sv_demoFile != FS_INVALID_HANDLE ) {
+        int v;
+
+        // finalize packet
+        MSG_WriteByte( msg, svc_EOF );
+
+        // write message sequence
+        v = LittleLong( client->netchan.outgoingSequence );
+        FS_Write( &v, 4, sv_demoFile );
+
+        // write message size
+        v = LittleLong( msg->cursize );
+        FS_Write( &v, 4, sv_demoFile );
+
+        // write data
+        FS_Write( msg->data, msg->cursize, sv_demoFile );
+
+        // update delta sequence
+        client->deltaMessage = client->netchan.outgoingSequence;
+        client->netchan.outgoingSequence++;
+
+        return;
+    }
+#endif // USE_MV
+
 	// record information about the message
 	client->frames[client->netchan.outgoingSequence & PACKET_MASK].messageSize = msg->cursize;
 	client->frames[client->netchan.outgoingSequence & PACKET_MASK].messageSent = svs.msgTime;
@@ -755,22 +1779,32 @@ void SV_SendClientMessages( void )
 
 	svs.msgTime = Sys_Milliseconds();
 
+#ifdef USE_MV
+    if ( sv_demoFile != FS_INVALID_HANDLE )
+    {
+        if ( !svs.emptyFrame ) // we want to record only synced game frames
+        {
+            c = svs.clients + sv_maxclients->integer; // recorder slot
+            if ( c->state >= CS_PRIMED )
+            {
+                SV_SendClientSnapshot( c );
+                c->lastSnapshotTime = svs.time;
+                c->rateDelayed = qfalse;
+            }
+        }
+    }
+#endif // USE_MV
+
 	// send a message to each connected client
-	for ( i = 0; i < sv.maxclients; i++ )
+	for( i = 0; i < sv_maxclients->integer; i++ )
 	{
 		c = &svs.clients[ i ];
-
+		
 		if ( c->state == CS_FREE )
 			continue;		// not connected
 
-		//if ( *c->downloadName )
-		//	continue;		// Client is downloading, don't send snapshots
-
-		if ( c->state == CS_CONNECTED )
+		if ( *c->downloadName )
 			continue;		// Client is downloading, don't send snapshots
-
-		//if ( !c->gamestateAcked )
-		//	continue;		// waiting usercmd/downloading
 
 		// 1. Local clients get snapshots every server frame
 		// 2. Remote clients get snapshots depending from rate and requested number of updates
@@ -783,7 +1817,7 @@ void SV_SendClientMessages( void )
 			c->rateDelayed = qtrue;
 			continue;		// Drop this snapshot if the packet queue is still full or delta compression will break
 		}
-
+	
 		if ( SV_RateMsec( c ) > 0 )
 		{
 			// Not enough time since last packet passed through the line
@@ -794,6 +1828,7 @@ void SV_SendClientMessages( void )
 		// generate and send a new message
 		SV_SendClientSnapshot( c );
 		c->lastSnapshotTime = svs.time;
+		SV_Antilag_NoteSnapshot( c - svs.clients );
 		c->rateDelayed = qfalse;
 	}
 }

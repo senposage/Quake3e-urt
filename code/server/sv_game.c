@@ -22,6 +22,7 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 // sv_game.c -- interface to the game dll
 
 #include "server.h"
+#include "sv_antilag.h"
 
 #include "../botlib/botlib.h"
 
@@ -83,10 +84,10 @@ static void SV_GameSendServerCommand( int clientNum, const char *text ) {
 	if ( clientNum == -1 ) {
 		SV_SendServerCommand( NULL, "%s", text );
 	} else {
-		if ( clientNum < 0 || clientNum >= sv.maxclients ) {
+		if ( clientNum < 0 || clientNum >= sv_maxclients->integer ) {
 			return;
 		}
-		SV_SendServerCommand( svs.clients + clientNum, "%s", text );
+		SV_SendServerCommand( svs.clients + clientNum, "%s", text );	
 	}
 }
 
@@ -99,11 +100,26 @@ Disconnects the client with a message
 ===============
 */
 static void SV_GameDropClient( int clientNum, const char *reason ) {
-	if ( clientNum < 0 || clientNum >= sv.maxclients ) {
+	if ( clientNum < 0 || clientNum >= sv_maxclients->integer ) {
 		return;
 	}
-	SV_DropClient( svs.clients + clientNum, reason );
+	SV_DropClient( svs.clients + clientNum, reason );	
 }
+
+#ifdef USE_AUTH
+/*
+===============
+SV_Auth_GameDropClient
+Disconnects the client with a public reason and private message
+===============
+*/
+void SV_Auth_GameDropClient( int clientNum, const char *reason, const char *message ) {
+	if ( clientNum < 0 || clientNum >= sv_maxclients->integer ) {
+		return;
+	}
+	SV_Auth_DropClient( svs.clients + clientNum, reason, message );
+}
+#endif
 
 
 /*
@@ -217,7 +233,7 @@ static void SV_AdjustAreaPortalState( sharedEntity_t *ent, qboolean open ) {
 SV_EntityContact
 ==================
 */
-static qboolean SV_EntityContact( const vec3_t mins, const vec3_t maxs, const sharedEntity_t *gEnt, const int capsule ) {
+static qboolean SV_EntityContact( const vec3_t mins, const vec3_t maxs, const sharedEntity_t *gEnt, int capsule ) {
 	const float	*origin, *angles;
 	clipHandle_t	ch;
 	trace_t			trace;
@@ -292,7 +308,7 @@ SV_GetUsercmd
 ===============
 */
 static void SV_GetUsercmd( int clientNum, usercmd_t *cmd ) {
-	if ( (unsigned) clientNum < sv.maxclients ) {
+	if ( (unsigned) clientNum < sv_maxclients->integer ) {
 		*cmd = svs.clients[ clientNum ].lastUsercmd;
 	} else {
 		Com_Error( ERR_DROP, "%s(): bad clientNum: %i", __func__, clientNum );
@@ -347,12 +363,6 @@ static qboolean SV_GetValue( char* value, int valueSize, const char* key )
 		return qtrue;
 	}
 
-	if ( !Q_stricmp( key, "trap_Cvar_SetDescription_Q3E" ) )
-	{
-		Com_sprintf( value, valueSize, "%i", G_CVAR_SETDESCRIPTION );
-		return qtrue;
-	}
-
 	return qfalse;
 }
 
@@ -365,16 +375,6 @@ The module is making a system call
 ====================
 */
 static intptr_t SV_GameSystemCalls( intptr_t *args ) {
-
-	// detect infinite loops in QVM code by counting syscalls per VM_Call invocation
-	// the stock id 1.32 qagame.qvm has a bug in ClientSpawn() where a do/while(1) loop
-	// retrying spawn point selection can loop forever if all spawn points have FL_NO_BOTS
-	// set, causing the server to hang at 100% CPU
-	if ( gvm->syscallCount >= 1024 * 1024 ) {
-		Com_Error( ERR_DROP, "game VM syscall overflow - Loss of control in VM" );
-	}
-	++gvm->syscallCount;
-
 	switch( args[0] ) {
 	case G_PRINT:
 		Com_Printf( "%s", (const char*)VMA(1) );
@@ -436,6 +436,13 @@ static intptr_t SV_GameSystemCalls( intptr_t *args ) {
 	case G_DROP_CLIENT:
 		SV_GameDropClient( args[1], VMA(2) );
 		return 0;
+
+#ifdef USE_AUTH
+    case G_AUTH_DROP_CLIENT:
+		SV_Auth_GameDropClient( args[1], VMA(2), VMA(3) );
+		return 0;
+#endif
+
 	case G_SEND_SERVER_COMMAND:
 		SV_GameSendServerCommand( args[1], VMA(2) );
 		return 0;
@@ -453,10 +460,14 @@ static intptr_t SV_GameSystemCalls( intptr_t *args ) {
 	case G_ENTITY_CONTACTCAPSULE:
 		return SV_EntityContact( VMA(1), VMA(2), VMA(3), /*int capsule*/ qtrue );
 	case G_TRACE:
-		SV_Trace( VMA(1), VMA(2), VMA(3), VMA(4), VMA(5), args[6], args[7], /*int capsule*/ qfalse );
+		if ( !SV_Antilag_InterceptTrace( VMA(1), VMA(2), VMA(3), VMA(4), VMA(5), args[6], args[7], qfalse ) ) {
+			SV_Trace( VMA(1), VMA(2), VMA(3), VMA(4), VMA(5), args[6], args[7], qfalse );
+		}
 		return 0;
 	case G_TRACECAPSULE:
-		SV_Trace( VMA(1), VMA(2), VMA(3), VMA(4), VMA(5), args[6], args[7], /*int capsule*/ qtrue );
+		if ( !SV_Antilag_InterceptTrace( VMA(1), VMA(2), VMA(3), VMA(4), VMA(5), args[6], args[7], qtrue ) ) {
+			SV_Trace( VMA(1), VMA(2), VMA(3), VMA(4), VMA(5), args[6], args[7], qtrue );
+		}
 		return 0;
 	case G_POINT_CONTENTS:
 		return SV_PointContents( VMA(1), args[2] );
@@ -503,7 +514,7 @@ static intptr_t SV_GameSystemCalls( intptr_t *args ) {
 		return 0;
 	case G_GET_ENTITY_TOKEN:
 		{
-			char *s = (char*)COM_Parse( &sv.entityParsePoint );
+			const char *s = COM_Parse( &sv.entityParsePoint );
 			VM_CHECKBOUNDS( gvm, args[1], args[2] );
 			//Q_strncpyz( VMA(1), s, args[2] );
 			// we can't use our optimized Q_strncpyz() function
@@ -511,10 +522,8 @@ static intptr_t SV_GameSystemCalls( intptr_t *args ) {
 			{
 				char *dst = (char*)VMA(1);
 				const int size = args[2]-1;
-				if ( size >= 0 ) {
-					Q_strncpy( dst, s, size );
-					dst[size] = '\0';
-				}
+				strncpy( dst, s, size );
+				dst[ size ] = '\0';
 			}
 			if ( !sv.entityParsePoint && s[0] == '\0' ) {
 				return qfalse;
@@ -575,7 +584,7 @@ static intptr_t SV_GameSystemCalls( intptr_t *args ) {
 	case BOTLIB_USER_COMMAND:
 		{
 			unsigned clientNum = args[1];
-			if ( clientNum < sv.maxclients )
+			if ( clientNum < sv_maxclients->integer )
 			{
 				SV_ClientThink( &svs.clients[ clientNum ], VMA(2) );
 			}
@@ -912,6 +921,45 @@ static intptr_t SV_GameSystemCalls( intptr_t *args ) {
 
 	case BOTLIB_AI_GENETIC_PARENTS_AND_CHILD_SELECTION:
 		return botlib_export->ai.GeneticParentsAndChildSelection(args[1], VMA(2), VMA(3), VMA(4), VMA(5));
+    #ifdef USE_AUTH
+    case G_NET_STRINGTOADR:
+		return NET_StringToAdr( VMA(1), VMA(2), NA_IP);
+
+	case G_NET_SENDPACKET:
+		{
+			netadr_t addr;
+			const char * destination = VMA(4);
+
+			NET_StringToAdr( destination, &addr, NA_IP);
+			NET_SendPacket( args[1], args[2], VMA(3), (const netadr_t *) &addr );
+		}
+		return 0;
+
+	//case G_SYS_STARTPROCESS:
+	//	Sys_StartProcess( VMA(1), VMA(2) );
+	//	return 0;
+
+    #endif
+
+#ifdef sc
+    case G_NET_STRINGTOADR:
+		return NET_StringToAdr( VMA(1), VMA(2), NA_IP);
+
+	case G_NET_SENDPACKET:
+		{
+			netadr_t addr;
+			const char * destination = VMA(4);
+
+			NET_StringToAdr( destination, &addr, NA_IP);
+			NET_SendPacket( args[1], args[2], VMA(3), (const netadr_t *) &addr );
+		}
+		return 0;
+
+	//case G_SYS_STARTPROCESS:
+	//	Sys_StartProcess( VMA(1), VMA(2) );
+	//	return 0;
+
+#endif
 
 	// shared syscalls
 
@@ -927,7 +975,7 @@ static intptr_t SV_GameSystemCalls( intptr_t *args ) {
 
 	case TRAP_STRNCPY:
 		VM_CHECKBOUNDS( gvm, args[1], args[3] );
-		Q_strncpy( VMA(1), VMA(2), args[3] );
+		strncpy( VMA(1), VMA(2), args[3] );
 		return args[1];
 
 	case TRAP_SIN:
@@ -965,10 +1013,6 @@ static intptr_t SV_GameSystemCalls( intptr_t *args ) {
 
 	case G_TESTPRINTFLOAT:
 		return sprintf( VMA(1), "%f", VMF(2) );
-
-	case G_CVAR_SETDESCRIPTION:
-		Cvar_SetDescription2( (const char*)VMA(1), (const char*)VMA(2) );
-		return 0;
 
 	case G_TRAP_GETVALUE:
 		VM_CHECKBOUNDS( gvm, args[1], args[2] );
@@ -1040,13 +1084,13 @@ static void SV_InitGameVM( qboolean restart ) {
 	// a previous level
 	// https://zerowing.idsoftware.com/bugzilla/show_bug.cgi?id=522
 	// now done before GAME_INIT call
-	for ( i = 0; i < sv.maxclients; i++ ) {
+	for ( i = 0 ; i < sv_maxclients->integer ; i++ ) {
 		svs.clients[i].gentity = NULL;
 	}
 	
 	// use the current msec count for a random seed
 	// init for this gamestate
-	VM_Call( gvm, 3, GAME_INIT, sv.time, Com_Milliseconds(), restart );
+	VM_Call( gvm, 3, GAME_INIT, sv.gameTime, Com_Milliseconds(), restart );
 }
 
 
