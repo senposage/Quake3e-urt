@@ -152,7 +152,7 @@ void MSG_WriteBits( msg_t *msg, int value, int bits ) {
 }
 
 
-static int MSG_ReadBits( msg_t *msg, int bits ) {
+int MSG_ReadBits( msg_t *msg, int bits ) {
 	int		value;
 	qboolean	sgn;
 	int		i;
@@ -672,11 +672,19 @@ typedef struct {
 	const char	*name;
 	const int	offset;
 	const int	bits;	// 0 = float
+#ifdef USE_MV
+	int			mergeMask;
+#endif
 } netField_t;
+
+#ifdef USE_MV
+int MSG_entMergeMask = 0;
+#endif
 
 // using the stringizing operator to save typing...
 #define	NETF(x) #x,(size_t)&((entityState_t*)0)->x
 
+#ifndef USE_MV
 static const netField_t entityStateFields[] =
 {
 { NETF(pos.trTime), 32 },
@@ -731,6 +739,202 @@ static const netField_t entityStateFields[] =
 { NETF(constantLight), 32 },
 { NETF(frame), 16 }
 };
+#endif
+
+#ifdef USE_MV
+static const netField_t entityStateFields[] =
+{
+{ NETF(pos.trTime), 32, SM_TRTIME },
+{ NETF(pos.trBase[0]), 0, SM_BASE },
+{ NETF(pos.trBase[1]), 0, SM_BASE },
+{ NETF(pos.trDelta[0]), 0, SM_BASE },
+{ NETF(pos.trDelta[1]), 0, SM_BASE },
+{ NETF(pos.trBase[2]), 0, SM_BASE },
+{ NETF(apos.trBase[1]), 0, SM_BASE },
+{ NETF(pos.trDelta[2]), 0, SM_BASE },
+{ NETF(apos.trBase[0]), 0, SM_BASE },
+{ NETF(event), 10 },
+{ NETF(angles2[YAW]), 0, SM_BASE },
+{ NETF(eType), 8, SM_BASE },
+{ NETF(torsoAnim), 8, SM_BASE },
+{ NETF(eventParm), 8 },
+{ NETF(legsAnim), 8, SM_BASE },
+{ NETF(groundEntityNum), GENTITYNUM_BITS, SM_BASE },
+{ NETF(pos.trType), 8, SM_TRTYPE },
+{ NETF(eFlags), 19, SM_EFLAGS },
+{ NETF(otherEntityNum), GENTITYNUM_BITS },
+{ NETF(weapon), 8, SM_BASE },
+{ NETF(clientNum), 8, SM_BASE },
+{ NETF(angles[1]), 0 },
+{ NETF(pos.trDuration), 32 },
+{ NETF(apos.trType), 8, SM_BASE },
+{ NETF(origin[0]), 0 },
+{ NETF(origin[1]), 0 },
+{ NETF(origin[2]), 0 },
+{ NETF(solid), 24 },
+{ NETF(powerups), MAX_POWERUPS, SM_BASE },
+{ NETF(modelindex), 8 },
+{ NETF(otherEntityNum2), GENTITYNUM_BITS },
+{ NETF(loopSound), 8, SM_BASE },
+{ NETF(generic1), 8, SM_BASE },
+{ NETF(origin2[2]), 0 },
+{ NETF(origin2[0]), 0 },
+{ NETF(origin2[1]), 0 },
+{ NETF(modelindex2), 8 },
+{ NETF(angles[0]), 0 },
+{ NETF(time), 32 },
+{ NETF(apos.trTime), 32 },
+{ NETF(apos.trDuration), 32 },
+{ NETF(apos.trBase[2]), 0, SM_BASE },
+{ NETF(apos.trDelta[0]), 0, SM_BASE },
+{ NETF(apos.trDelta[1]), 0, SM_BASE },
+{ NETF(apos.trDelta[2]), 0, SM_BASE },
+{ NETF(time2), 32 },
+{ NETF(angles[2]), 0 },
+{ NETF(angles2[0]), 0 },
+{ NETF(angles2[2]), 0 },
+{ NETF(constantLight), 32 },
+{ NETF(frame), 16 }
+};
+
+#include "../game/bg_public.h"
+
+int MSG_PlayerStateToEntityStateXMask( const playerState_t *ps, const entityState_t *s, qboolean snap ) {
+	int		i;
+	int		tmp;
+	vec3_t	vec3;
+	int		mask;
+
+	mask = 0;
+
+	if ( s->pos.trTime != ps->commandTime )
+		mask |= SM_TRTIME;
+
+	if ( ps->pm_type == PM_INTERMISSION || ps->pm_type == PM_SPECTATOR ) {
+		if ( s->eType != ET_INVISIBLE )
+			mask |= SM_BASE;
+	} else if ( ps->stats[STAT_HEALTH] <= GIB_HEALTH ) {
+		if ( s->eType != ET_INVISIBLE )
+			mask |= SM_BASE;
+	} else {
+		if ( s->eType != ET_PLAYER )
+			mask |= SM_BASE;
+	}
+
+	if ( s->pos.trType != TR_INTERPOLATE )
+		mask |= SM_TRTYPE;
+
+	if ( s->apos.trType != TR_INTERPOLATE )
+		mask |= SM_BASE;
+
+	VectorCopy( ps->origin, vec3 );
+	if ( snap )
+		SnapVector( vec3 );
+	if ( !VectorCompare( vec3, s->pos.trBase ) )
+		mask |= SM_BASE;
+
+	if ( !VectorCompare( ps->velocity, s->pos.trDelta ) ) {
+		VectorCopy( ps->velocity, vec3 );
+		SnapVector( vec3 );
+		if ( !VectorCompare( vec3, s->pos.trDelta ) )
+			mask |= SM_BASE;
+		else
+			mask |= SM_TRDELTA;
+	}
+
+	VectorCopy( ps->viewangles, vec3 );
+	if ( snap )
+		SnapVector( vec3 );
+	if ( !VectorCompare( vec3, s->apos.trBase ) )
+		mask |= SM_BASE;
+
+	if ( s->weapon != ps->weapon || s->groundEntityNum != ps->groundEntityNum )
+		mask |= SM_BASE;
+
+	if ( s->angles2[YAW] != ps->movementDir ||
+		s->legsAnim != ps->legsAnim ||
+		s->torsoAnim != ps->torsoAnim ||
+		s->clientNum != ps->clientNum )
+		mask |= SM_BASE;
+
+	tmp = ps->eFlags;
+	if ( ps->stats[STAT_HEALTH] <= 0 )
+		tmp |= EF_DEAD;
+	else
+		tmp &= ~EF_DEAD;
+	if ( s->eFlags != tmp )
+		mask |= SM_EFLAGS;
+
+	if ( s->loopSound != ps->loopSound || s->generic1 != ps->generic1 )
+		mask |= SM_BASE;
+
+	tmp = 0;
+	for ( i = 0 ; i < MAX_POWERUPS; i++ ) {
+		if ( ps->powerups[ i ] )
+			tmp |= 1 << i;
+	}
+	if ( s->powerups != tmp )
+		mask |= SM_BASE;
+
+	return mask;
+}
+
+
+void MSG_PlayerStateToEntityState( playerState_t *ps, entityState_t *s, qboolean snap, skip_mask sm ) {
+	int		i;
+
+	if ( sm & SM_TRTIME )
+		s->pos.trTime = ps->commandTime;
+
+	if ( sm & SM_TRTYPE )
+		s->pos.trType = TR_INTERPOLATE;
+
+	if ( sm & SM_BASE )
+	{
+		if ( ps->pm_type == PM_INTERMISSION || ps->pm_type == PM_SPECTATOR )
+			s->eType = ET_INVISIBLE;
+		else if ( ps->stats[STAT_HEALTH] <= GIB_HEALTH )
+			s->eType = ET_INVISIBLE;
+		else
+			s->eType = ET_PLAYER;
+
+		s->apos.trType = TR_INTERPOLATE;
+
+		VectorCopy( ps->origin, s->pos.trBase );
+		if ( snap )
+			SnapVector( s->pos.trBase );
+
+		VectorCopy( ps->velocity, s->pos.trDelta );
+
+		if ( sm & SM_TRDELTA )
+			SnapVector( s->pos.trDelta );
+
+		VectorCopy( ps->viewangles, s->apos.trBase );
+		if ( snap )
+			SnapVector( s->apos.trBase );
+
+		s->weapon = ps->weapon;
+		s->groundEntityNum = ps->groundEntityNum;
+
+		s->angles2[YAW] = ps->movementDir;
+		s->legsAnim = ps->legsAnim;
+		s->torsoAnim = ps->torsoAnim;
+		s->clientNum = ps->clientNum;
+
+		s->loopSound = ps->loopSound;
+		s->generic1 = ps->generic1;
+
+		s->powerups = 0;
+		for ( i = 0 ; i < MAX_POWERUPS; i++ ) {
+			if ( ps->powerups[ i ] )
+				s->powerups |= 1 << i;
+		}
+	}
+
+	if ( sm & SM_EFLAGS )
+		s->eFlags = ps->eFlags;
+}
+#endif
 
 
 // if (int)f == f and (int)f + ( 1<<(FLOAT_INT_BITS-1) ) < ( 1 << FLOAT_INT_BITS )
@@ -784,6 +988,10 @@ void MSG_WriteDeltaEntity( msg_t *msg, const entityState_t *from, const entitySt
 	for ( i = 0, field = entityStateFields ; i < numFields ; i++, field++ ) {
 		fromF = (int *)( (byte *)from + field->offset );
 		toF = (int *)( (byte *)to + field->offset );
+#ifdef USE_MV
+		if ( ( field->mergeMask & MSG_entMergeMask ) && to->number < MAX_CLIENTS )
+			continue;
+#endif
 		if ( *fromF != *toF ) {
 			lc = i+1;
 		}
@@ -811,7 +1019,11 @@ void MSG_WriteDeltaEntity( msg_t *msg, const entityState_t *from, const entitySt
 		fromF = (int *)( (byte *)from + field->offset );
 		toF = (int *)( (byte *)to + field->offset );
 
+#ifdef USE_MV
+		if ( *fromF == *toF || ( ( field->mergeMask & MSG_entMergeMask ) && (to->number < MAX_CLIENTS) ) ) {
+#else
 		if ( *fromF == *toF ) {
+#endif
 			MSG_WriteBits( msg, 0, 1 );	// no change
 			continue;
 		}
@@ -1345,5 +1557,333 @@ void MSG_ReadDeltaPlayerstate( msg_t *msg, const playerState_t *from, playerStat
 		Com_Printf( " (%i bits)\n", endBit - startBit  );
 	}
 }
+
+
+#if defined( USE_MV ) && defined( USE_MV_ZCMD )
+
+// command compression/decompression
+
+#define LZ_MOD(a)  ( (a) & (LZ_WINDOW_SIZE - 1) )
+#define DEF_POS 0
+#define NUM_PASSES LZ_WINDOW_SIZE
+#define HASH_BLK LZ_MIN_MATCH
+
+static unsigned int hash_func( const byte *window, int pos )
+{
+	unsigned int h, i;
+	for ( i = 0, h = 0; i < HASH_BLK; i++ )
+		h = h * 101 + window[ pos + i ];
+	return h & (HTAB_SIZE-1);
+}
+
+
+static void hash_update( lzctx_t *ctx, int pos )
+{
+	int hash;
+	hash = hash_func( ctx->window, pos );
+	ctx->hvals[ pos ] = hash;
+	if ( ctx->htable[ hash ] < 0 )
+		ctx->htable[ hash ] = pos;
+	else
+		ctx->hlist[ ctx->htlast[ hash ] ] = pos;
+	ctx->htlast[ hash ] = pos;
+	ctx->hlist[ pos ] = -1;
+}
+
+
+static void hash_delete( lzctx_t *ctx, int pos )
+{
+	int hash;
+	if ( ( hash = ctx->hvals[ pos ] ) < 0 )
+		return;
+	if ( ctx->htable[ hash ] == pos )
+	{
+		ctx->htable[ hash ] = ctx->hlist[ pos ];
+		ctx->hlist[ pos ] = -1;
+		ctx->hvals[ pos ] = -1;
+	}
+}
+
+#define HASH_SEARCH_OPTIMIZE
+
+static int hash_search( const lzctx_t *ctx, int current_pos, int look_ahead, int *match_pos, int steps )
+{
+	int hash;
+	int start;
+	int n, match_len, last_match, s, v;
+	const byte *wcp;
+	const byte *window;
+
+	window = ctx->window;
+	wcp = ctx->window + current_pos;
+
+	hash = hash_func( ctx->window, current_pos );
+	start = ctx->htable[ hash ];
+
+	match_len = HASH_BLK-1;
+	last_match = 0;
+
+	s = HASH_BLK-1;
+
+#ifdef HASH_SEARCH_OPTIMIZE
+	v = wcp[ s ];
+#else
+	v = window[ LZ_MOD( current_pos + s) ];
+#endif
+
+	while ( start >= 0 )
+	{
+#ifdef HASH_SEARCH_OPTIMIZE
+		if ( window[ start + s ] == v )
+#else
+		if ( window[ LZ_MOD(start + s) ] == v )
+#endif
+		{
+			for ( n = 0; n < look_ahead; n++ )
+			{
+#ifdef HASH_SEARCH_OPTIMIZE
+				if ( window[ start + n ] != wcp[ n ] )
+#else
+				if ( window[ LZ_MOD(start + n) ] != window[ LZ_MOD( current_pos + n ) ] )
+#endif
+					break;
+			}
+			if ( n > match_len )
+			{
+				match_len = n;
+				last_match = start;
+				if ( n >= look_ahead )
+					break;
+				s = n;
+#ifdef HASH_SEARCH_OPTIMIZE
+				v = wcp[ n ];
+				if ( ctx->htable[ hash_func( window, current_pos + n - (HASH_BLK-1) ) ] < 0 )
+#else
+				v = window[ LZ_MOD(current_pos + s) ];
+				if ( ctx->htable[ hash_func( window, LZ_MOD(current_pos + n - (HASH_BLK-1)) ) ] < 0 )
+#endif
+					break;
+			}
+		}
+		start = ctx->hlist[ start ];
+	}
+
+	*match_pos = last_match;
+	return match_len;
+}
+
+
+void LZSS_InitContext( lzctx_t *ctx )
+{
+	int i;
+	for ( i = 0; i < DICT_SIZE; i++ )
+	{
+		ctx->hlist[ i ] = -1;
+		ctx->hvals[ i ] = -1;
+	}
+	for ( i = 0; i < HTAB_SIZE; i++ )
+	{
+		ctx->htable[ i ] = -1;
+		ctx->htlast[ i ] = -1;
+	}
+	ctx->current_pos = DEF_POS;
+	memset( ctx->window, '\0', sizeof( ctx->window ) );
+}
+
+
+void LZSS_SeekEOS( msg_t *msg, int charbits ) {
+	int c;
+	for ( ;; ) {
+		if ( MSG_ReadBits( msg, 1 ) ) {
+			c = MSG_ReadBits( msg, charbits );
+			if ( c == '\0' )
+				break;
+		} else {
+			MSG_ReadBits( msg, INDEX_BITS );
+			MSG_ReadBits( msg, LENGTH_BITS );
+		}
+	}
+}
+
+
+int LZSS_Expand( lzctx_t *ctx, msg_t *msg, byte *out, int maxsize, int charbits )
+{
+	int i;
+	int c;
+	int current_pos;
+	int match_len;
+	int match_pos;
+	byte *window;
+	const byte *base;
+	const byte *max;
+
+	window = ctx->window;
+	current_pos = ctx->current_pos;
+
+	base = out;
+	max = out + maxsize - 1;
+
+	for ( ;; ) {
+		if ( MSG_ReadBits( msg, 1 ) ) {
+			c = MSG_ReadBits( msg, charbits );
+			if ( c == '\0' )
+				break;
+			window[ current_pos ] = (byte) c;
+			current_pos = LZ_MOD( current_pos + 1 );
+			if ( out < max )
+				*out++ = c;
+		} else {
+			match_pos = MSG_ReadBits( msg, INDEX_BITS );
+			match_len = MSG_ReadBits( msg, LENGTH_BITS );
+			match_pos = LZ_MOD( current_pos - match_pos );
+			for ( i = 0; i < match_len + LZ_MIN_MATCH; i++ ) {
+				c = window[ LZ_MOD( match_pos + i ) ];
+				window[ current_pos ] = (byte) c;
+				current_pos = LZ_MOD( current_pos + 1 );
+				if ( out < max )
+					*out++ = c;
+			}
+		}
+	}
+
+	*out = '\0';
+	ctx->current_pos = current_pos;
+	return (out - base);
+}
+
+
+int LZSS_CompressToStream( lzctx_t *ctx, lzstream_t *stream, const byte *in, int length )
+{
+	int i, j, c;
+	int look_ahead_bytes;
+	int current_pos;
+	int replace_count;
+	int match_len;
+	int match_pos;
+	const byte *eos;
+	int	count;
+	byte *window;
+	byte *output;
+
+	current_pos = ctx->current_pos;
+	window = ctx->window;
+
+	eos = in + length;
+
+	for ( i = 0; i < LOOK_AHEAD_SIZE; i++ )
+	{
+		if ( in >= eos )
+			break;
+		c = *in++;
+		j = LZ_MOD( current_pos + i );
+		window[ j ] = c;
+#ifdef SEARCH_OPTIMIZE
+		if ( current_pos + i >= LZ_WINDOW_SIZE )
+			window[ current_pos + i ] = c;
+#endif
+		hash_delete( ctx, j );
+	}
+
+	look_ahead_bytes = i;
+
+	Com_Memset( stream->type, 0, ((length + 7)/8) + 1 );
+
+	output = stream->cmd;
+	count = 0;
+
+	if ( stream->zdelta == 0 ) {
+		match_len = 1;
+		match_pos = current_pos;
+	} else {
+		match_len = hash_search( ctx, current_pos, look_ahead_bytes, &match_pos, NUM_PASSES );
+	}
+
+	while ( look_ahead_bytes > 0 )
+	{
+		if ( match_len < LZ_MIN_MATCH )
+		{
+			replace_count = 1;
+			SET_ABIT( stream->type, count );
+			*output++ = window[ current_pos ];
+		}
+		else
+		{
+			i = LZ_MOD( current_pos - match_pos );
+			j = match_len - LZ_MIN_MATCH;
+			*output++ = i;
+			*output++ = ( ( i >> (8 - LENGTH_BITS)) & LENGTH_MASK1 ) | j;
+			replace_count = match_len;
+		}
+
+		count++;
+
+		for ( i = 0; i < replace_count; i++ )
+		{
+			hash_delete( ctx, LZ_MOD( current_pos + LOOK_AHEAD_SIZE ) );
+			if ( in >= eos )
+			{
+				look_ahead_bytes--;
+			}
+			else
+			{
+				c = *in++;
+				window[ LZ_MOD( current_pos + LOOK_AHEAD_SIZE ) ] = c;
+#ifdef SEARCH_OPTIMIZE
+				if ( current_pos + LOOK_AHEAD_SIZE >= LZ_WINDOW_SIZE )
+					window[ current_pos + LOOK_AHEAD_SIZE ] = c;
+#endif
+			}
+
+			if ( look_ahead_bytes >= HASH_BLK )
+				hash_update( ctx, current_pos );
+
+			current_pos = LZ_MOD( current_pos + 1 );
+		}
+
+		match_len = hash_search( ctx, current_pos, look_ahead_bytes, &match_pos, NUM_PASSES );
+	}
+
+	SET_ABIT( stream->type, count );
+	*output++ = '\0';
+	count++;
+
+	ctx->current_pos = current_pos;
+	stream->count = count;
+
+	return count;
+}
+
+
+void MSG_WriteLZStream( msg_t *msg, lzstream_t *stream )
+{
+	int pos;
+	int len;
+	int i;
+	byte *cmd;
+
+	MSG_WriteByte( msg, svc_zcmd );
+	MSG_WriteBits( msg, stream->zdelta, 3 );
+	MSG_WriteBits( msg, stream->zcharbits - 7, 1 );
+	MSG_WriteBits( msg, stream->zcommandSize - 1, 2 );
+	MSG_WriteBits( msg, stream->zcommandNum, stream->zcommandSize * 8 );
+	MSG_WriteBits( msg, 0, 1 );
+
+	cmd = stream->cmd;
+	for ( i = 0; i < stream->count; i++ ) {
+		if ( GET_ABIT( stream->type, i ) ) {
+			MSG_WriteBits( msg, 1, 1 );
+			MSG_WriteBits( msg, *cmd++, stream->zcharbits );
+		} else {
+			pos = *cmd++;
+			len = *cmd++;
+			pos |= ((len & LENGTH_MASK1) << (8 - LENGTH_BITS));
+			len &= LENGTH_MASK;
+			MSG_WriteBits( msg, 0, 1 );
+			MSG_WriteBits( msg, pos, INDEX_BITS );
+			MSG_WriteBits( msg, len, LENGTH_BITS );
+		}
+	}
+}
+#endif // USE_MV && USE_MV_ZCMD
 
 //===========================================================================

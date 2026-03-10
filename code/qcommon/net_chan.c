@@ -675,6 +675,19 @@ void NET_QueuePacket( netsrc_t sock, int length, const void *data, const netadr_
 
 void NET_FlushPacketQueue( int time_diff )
 {
+	// When both delay cvars are 0, force-flush all queued packets immediately.
+	// Without this, packets queued at the old delay keep releasing on their
+	// original schedule, inflating cl.snapshotMsec and breaking time sync.
+	qboolean forceFlush;
+#ifndef DEDICATED
+	forceFlush = ( cl_packetdelay && cl_packetdelay->integer <= 0
+		&& sv_packetdelay && sv_packetdelay->integer <= 0 );
+#else
+	forceFlush = ( sv_packetdelay && sv_packetdelay->integer <= 0 );
+#endif
+	if ( forceFlush )
+		time_diff = 99999;
+
 	packetQueue = list_process( packetQueue, time_diff );
 }
 

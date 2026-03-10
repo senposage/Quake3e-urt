@@ -31,6 +31,91 @@ static cvar_t		*cl_graphheight;
 static cvar_t		*cl_graphscale;
 static cvar_t		*cl_graphshift;
 
+// Net monitor widget cvars
+cvar_t		*cl_netgraph;
+cvar_t		*cl_netgraph_x;
+cvar_t		*cl_netgraph_y;
+cvar_t		*cl_netgraph_scale;
+cvar_t		*cl_netlog;
+cvar_t		*cl_laggotannounce;
+
+// Net monitor rate tracking (updated per second)
+static int	netMonInBytes;
+static int	netMonOutBytes;
+static int	netMonInRate;
+static int	netMonOutRate;
+static int	netMonDropsWindow;
+static int	netMonDropRate;
+static int	netMonLastUpdate;
+
+// Frame-time and snap-jitter tracking (reset each second)
+static int	netMonFtSum;
+static int	netMonFtCount;
+static int	netMonFtMin;
+static int	netMonFtMax;
+static qboolean	netMonFtValid;
+static int	netMonSnapGapSum;
+static int	netMonSnapGapCount;
+static int	netMonSnapGapMax;
+
+// Cap-hit, extrap, choke, and serverTimeDelta range tracking (reset each second)
+static int	netMonCapHits;
+static int	netMonExtrapCount;
+static int	netMonChokeCount;
+static int	netMonDtMin;
+static int	netMonDtMax;
+static qboolean	netMonDtValid;
+
+// Ping jitter tracking (reset each second)
+static int	netMonPingSum;
+static int	netMonPingCount;
+static int	netMonPingMin;
+static int	netMonPingMax;
+static qboolean	netMonPingValid;
+
+// FAST/RESET adjustment counts (reset each second)
+static int	netMonFastCount;
+static int	netMonResetCount;
+// Slow-path net drift (signed: +1 per up-commit, -1 per down-commit; reset each second)
+static int	netMonSlowCount;
+// Per-second abs(netMonSlowCount) snapshot used by the display widget
+static int	netMonSlowRate;
+
+// Per-second display snapshots (survive into widget rendering)
+static int	netMonDispPingMin;
+static int	netMonDispPingMax;
+static int	netMonDispCapHits;
+static int	netMonDispExtrapCnt;
+static int	netMonDispSnapGapAvg;
+static int	netMonDispSnapGapMax;
+static int	netMonDispFtAvg;
+static int	netMonDispFtMax;
+static float	netMonDispFiAvg;
+
+// Per-frame fI accumulator (for 1-second average)
+static float	netMonFiSum;
+static int	netMonFiCount;
+
+// Laggot announce cooldown (realtime of last announcement)
+static int	laggotLastAnnounce;
+
+// 30-second ring buffer for laggot announce (stores per-second snapshots)
+#define LAGGOT_HISTORY 30
+typedef struct {
+	int dropRate;
+	int fastCnt;
+	int snapGapAvg;
+	int snapGapMax;
+	int extrapCnt;
+	int ftAvg;
+	int chokeCnt;
+} laggotSample_t;
+static laggotSample_t	laggotHistory[LAGGOT_HISTORY];
+static int		laggotHistoryIdx;
+
+// Session log file (opened lazily when cl_netlog > 0)
+static fileHandle_t	netLogFile;
+
 /*
 ================
 SCR_DrawNamedPic
@@ -483,6 +568,560 @@ static void SCR_DrawDebugGraph( void )
 }
 
 //=============================================================================
+/*
+===============================================================================
+
+NET MONITOR WIDGET
+
+Displays a live overlay of client network / timing stats.  All data comes
+from the already-available cl / clc structures so there is no extra polling
+overhead beyond computing 1-second byte-rate windows.
+
+CVars
+  cl_netgraph      0 = off, 1 = show widget
+  cl_netgraph_x/y  position in virtual 640x480 coords (default top-right)
+  cl_netgraph_scale  text/box scale multiplier (default 1.0)
+  cl_netlog        0 = off, 1 = log FAST/RESET delta events, 2 = also log periodic stats
+
+Command
+  netgraph_dump    write a full stats snapshot to the session log file
+
+===============================================================================
+*/
+
+/* ----- public hooks called from cl_parse.c / cl_cgame.c / cl_input.c ----- */
+
+void SCR_NetMonitorAddIncoming( int bytes, int drops ) {
+	netMonInBytes     += bytes;
+	netMonDropsWindow += drops;
+}
+
+void SCR_NetMonitorAddOutgoing( int bytes ) {
+	netMonOutBytes += bytes;
+}
+
+void SCR_NetMonitorAddFrametime( int ft ) {
+	netMonFtSum   += ft;
+	netMonFtCount += 1;
+	if ( !netMonFtValid ) {
+		netMonFtMin   = ft;
+		netMonFtMax   = ft;
+		netMonFtValid = qtrue;
+	} else {
+		if ( ft < netMonFtMin ) netMonFtMin = ft;
+		if ( ft > netMonFtMax ) netMonFtMax = ft;
+	}
+	// Accumulate frameInterpolation for 1-second average
+	netMonFiSum   += cl.frameInterpolation;
+	netMonFiCount += 1;
+}
+
+void SCR_NetMonitorAddSnapInterval( int measured, int expected ) {
+	int gap = measured - expected;
+	if ( gap < 0 ) gap = -gap;
+	netMonSnapGapSum += gap;
+	netMonSnapGapCount++;
+	if ( gap > netMonSnapGapMax )
+		netMonSnapGapMax = gap;
+}
+
+void SCR_NetMonitorAddCapHit( void ) {
+	netMonCapHits++;
+}
+
+void SCR_NetMonitorAddExtrap( void ) {
+	netMonExtrapCount++;
+}
+
+void SCR_NetMonitorAddChoke( void ) {
+	netMonChokeCount++;
+}
+
+void SCR_NetMonitorAddTimeDelta( int dT ) {
+	if ( !netMonDtValid ) {
+		netMonDtMin   = dT;
+		netMonDtMax   = dT;
+		netMonDtValid = qtrue;
+	} else {
+		if ( dT < netMonDtMin ) netMonDtMin = dT;
+		if ( dT > netMonDtMax ) netMonDtMax = dT;
+	}
+}
+
+void SCR_NetMonitorAddPing( int ping ) {
+	if ( ping <= 0 || ping >= 999 )
+		return;
+	netMonPingSum += ping;
+	netMonPingCount++;
+	if ( !netMonPingValid ) {
+		netMonPingMin   = ping;
+		netMonPingMax   = ping;
+		netMonPingValid = qtrue;
+	} else {
+		if ( ping < netMonPingMin ) netMonPingMin = ping;
+		if ( ping > netMonPingMax ) netMonPingMax = ping;
+	}
+}
+
+void SCR_NetMonitorAddFastAdjust( void ) {
+	netMonFastCount++;
+}
+
+void SCR_NetMonitorAddResetAdjust( void ) {
+	netMonResetCount++;
+}
+
+void SCR_NetMonitorAddSlowAdjust( int delta ) {
+	netMonSlowCount += delta;
+}
+
+/* ----- session log helpers ----- */
+
+static void SCR_OpenNetLog( void ) {
+	qtime_t t;
+	char    path[MAX_OSPATH];
+	char    header[256];
+
+	if ( netLogFile )
+		return;
+
+	Com_RealTime( &t );
+	Com_sprintf( path, sizeof(path), "netdebug_%04d%02d%02d_%02d%02d%02d.log",
+		1900 + t.tm_year, 1 + t.tm_mon, t.tm_mday,
+		t.tm_hour, t.tm_min, t.tm_sec );
+
+	netLogFile = FS_FOpenFileWrite( path );
+	if ( netLogFile ) {
+		Com_sprintf( header, sizeof(header),
+			"=== Quake3e Net Debug Log  %04d-%02d-%02d %02d:%02d:%02d ===\n"
+			"  cl_netlog=%d  (1=cmds, 2=cmds+periodic stats)\n\n",
+			1900 + t.tm_year, 1 + t.tm_mon, t.tm_mday,
+			t.tm_hour, t.tm_min, t.tm_sec,
+			cl_netlog->integer );
+		FS_Write( header, strlen(header), netLogFile );
+		Com_Printf( "Net debug log opened: %s\n", path );
+	}
+}
+
+static void SCR_WriteLog( const char *line ) {
+	if ( netLogFile )
+		FS_Write( line, strlen(line), netLogFile );
+}
+
+void SCR_LogTimingEvent( const char *tag, int serverTimeDelta, int deltaDelta ) {
+	qtime_t t;
+	char    line[128];
+
+	if ( !cl_netlog || !cl_netlog->integer )
+		return;
+
+	SCR_OpenNetLog();
+	Com_RealTime( &t );
+	Com_sprintf( line, sizeof(line), "[%02d:%02d:%02d] DELTA %s  dT=%dms  dd=%dms\n",
+		t.tm_hour, t.tm_min, t.tm_sec, tag, serverTimeDelta, deltaDelta );
+	SCR_WriteLog( line );
+}
+
+void SCR_LogSnapLate( int measured, int expected ) {
+	qtime_t t;
+	char    line[128];
+
+	if ( !cl_netlog || !cl_netlog->integer )
+		return;
+
+	SCR_OpenNetLog();
+	Com_RealTime( &t );
+	Com_sprintf( line, sizeof(line), "[%02d:%02d:%02d] SNAP LATE  +%dms  (expected %dms  got %dms)\n",
+		t.tm_hour, t.tm_min, t.tm_sec, measured - expected, expected, measured );
+	SCR_WriteLog( line );
+}
+
+void SCR_LogPingJitter( int ping, int prevPing ) {
+	qtime_t t;
+	char    line[128];
+	int     delta = ping - prevPing;
+
+	if ( !cl_netlog || !cl_netlog->integer )
+		return;
+
+	SCR_OpenNetLog();
+	Com_RealTime( &t );
+	Com_sprintf( line, sizeof(line), "[%02d:%02d:%02d] PING JITTER  %dms->%dms  (%+dms)\n",
+		t.tm_hour, t.tm_min, t.tm_sec, prevPing, ping, delta );
+	SCR_WriteLog( line );
+}
+
+void SCR_CloseNetLog( void ) {
+	if ( netLogFile ) {
+		SCR_WriteLog( "=== Session End ===\n" );
+		FS_FCloseFile( netLogFile );
+		netLogFile = 0;
+	}
+}
+
+/* ----- netgraph_dump command ----- */
+
+static void SCR_NetgraphDump_f( void ) {
+	const char *serverInfo;
+	char        key[BIG_INFO_KEY];
+	char        value[BIG_INFO_VALUE];
+	char        line[512];
+	qtime_t     t;
+	int         snapHz;
+
+	if ( cls.state != CA_ACTIVE ) {
+		Com_Printf( "netgraph_dump: not connected to a server.\n" );
+		return;
+	}
+
+	SCR_OpenNetLog();
+	if ( !netLogFile ) {
+		Com_Printf( "netgraph_dump: could not open log file.\n" );
+		return;
+	}
+
+	Com_RealTime( &t );
+	snapHz = ( cl.snapshotMsec > 0 ) ? ( 1000 / cl.snapshotMsec ) : 0;
+
+	Com_sprintf( line, sizeof(line),
+		"\n=== netgraph_dump  %04d-%02d-%02d %02d:%02d:%02d ===\n",
+		1900 + t.tm_year, 1 + t.tm_mon, t.tm_mday,
+		t.tm_hour, t.tm_min, t.tm_sec );
+	SCR_WriteLog( line );
+
+	Com_sprintf( line, sizeof(line), "Snapshot Rate : %d Hz  (%d ms interval EMA)\n", snapHz, cl.snapshotMsec ); SCR_WriteLog( line );
+	Com_sprintf( line, sizeof(line), "Ping          : %d ms\n", cl.snap.ping ); SCR_WriteLog( line );
+	Com_sprintf( line, sizeof(line), "Interp Mode   : fI=%.3f\n", cl.frameInterpolation ); SCR_WriteLog( line );
+	Com_sprintf( line, sizeof(line), "Server Time   : %d  (delta %d ms)\n", cl.snap.serverTime, cl.serverTimeDelta ); SCR_WriteLog( line );
+	Com_sprintf( line, sizeof(line), "Snap Seq      : #%d  (delta from #%d, gap %d)\n", cl.snap.messageNum, cl.snap.deltaNum, cl.snap.messageNum - cl.snap.deltaNum ); SCR_WriteLog( line );
+	Com_sprintf( line, sizeof(line), "Drop Rate     : %d pkt/s\n", netMonDropRate ); SCR_WriteLog( line );
+	Com_sprintf( line, sizeof(line), "In Rate       : %d B/s  (%.2f KB/s)\n", netMonInRate, netMonInRate / 1024.0f ); SCR_WriteLog( line );
+	Com_sprintf( line, sizeof(line), "Out Rate      : %d B/s  (%.2f KB/s)\n", netMonOutRate, netMonOutRate / 1024.0f ); SCR_WriteLog( line );
+
+	SCR_WriteLog( "\n--- CS_SERVERINFO cvars ---\n" );
+	serverInfo = cl.gameState.stringData + cl.gameState.stringOffsets[ CS_SERVERINFO ];
+	while ( serverInfo && *serverInfo ) {
+		serverInfo = Info_NextPair( serverInfo, key, value );
+		if ( key[0] == '\0' )
+			break;
+		Com_sprintf( line, sizeof(line), "  %-28s = %s\n", key, value );
+		SCR_WriteLog( line );
+	}
+
+	SCR_WriteLog( "=== end dump ===\n\n" );
+	Com_Printf( "netgraph_dump written to log file.\n" );
+}
+
+/* ----- widget drawing ----- */
+
+#define NM_PING_HIGH   150
+#define NM_PING_MEDIUM  80
+#define NM_COLS 24
+#define NM_ROWS 10
+
+static void NM_DrawRow( float *tx, float *ty, float bx_pad,
+                        float charW, float charH,
+                        const float *col, const char *str ) {
+	const char *p;
+	re.SetColor( col );
+	for ( p = str; *p; p++ ) {
+		SCR_DrawChar( (int)*tx, (int)*ty, charW, *p );
+		*tx += charW;
+	}
+	*tx  = bx_pad;
+	*ty += charH;
+}
+
+/*
+==============
+SCR_NetMonUpdate
+
+Runs every frame at CA_ACTIVE regardless of cl_netgraph.
+Aggregates 1-second stats.
+==============
+*/
+static void SCR_NetMonUpdate( void ) {
+	if ( cls.state != CA_ACTIVE )
+		return;
+
+	if ( netMonLastUpdate == 0 || cls.realtime - netMonLastUpdate >= 1000 ) {
+		int ftAvg      = ( netMonFtCount > 0 ) ? ( netMonFtSum / netMonFtCount ) : 0;
+		int ftMax      = netMonFtValid   ? netMonFtMax  : 0;
+		int snapGapAvg = ( netMonSnapGapCount > 0 ) ? ( netMonSnapGapSum / netMonSnapGapCount ) : 0;
+		int snapGapMax = netMonSnapGapMax;
+		int capHits    = netMonCapHits;
+		int extrapCnt  = netMonExtrapCount;
+		int pingAvg    = ( netMonPingCount > 0 ) ? ( netMonPingSum / netMonPingCount ) : cl.snap.ping;
+		int pingMin    = netMonPingValid  ? netMonPingMin : cl.snap.ping;
+		int pingMax    = netMonPingValid  ? netMonPingMax : cl.snap.ping;
+		int chokeCnt   = netMonChokeCount;
+		int fastCnt    = netMonFastCount;
+		int resetCnt   = netMonResetCount;
+		int slowCnt    = netMonSlowCount;
+		int ftMin      = netMonFtValid   ? netMonFtMin  : 0;
+		int dtMin      = netMonDtValid   ? netMonDtMin  : cl.serverTimeDelta;
+		int dtMax      = netMonDtValid   ? netMonDtMax  : cl.serverTimeDelta;
+		int snapHz;
+
+		netMonInRate      = netMonInBytes;
+		netMonOutRate     = netMonOutBytes;
+		netMonDropRate    = netMonDropsWindow;
+		netMonInBytes     = 0;
+		netMonOutBytes    = 0;
+		netMonDropsWindow = 0;
+		netMonLastUpdate  = cls.realtime;
+		netMonFtSum       = 0;
+		netMonFtCount     = 0;
+		netMonFtMin       = 0;
+		netMonFtMax       = 0;
+		netMonFtValid     = qfalse;
+		netMonSnapGapSum  = 0;
+		netMonSnapGapCount = 0;
+		netMonSnapGapMax  = 0;
+		netMonCapHits     = 0;
+		netMonExtrapCount = 0;
+		netMonChokeCount  = 0;
+		netMonDtValid     = qfalse;
+		netMonPingSum     = 0;
+		netMonPingCount   = 0;
+		netMonPingValid   = qfalse;
+		netMonFastCount   = 0;
+		netMonResetCount  = 0;
+		netMonSlowRate    = slowCnt < 0 ? -slowCnt : slowCnt;
+		netMonSlowCount   = 0;
+
+		netMonDispPingMin    = pingMin;
+		netMonDispPingMax    = pingMax;
+		netMonDispCapHits    = capHits;
+		netMonDispExtrapCnt  = extrapCnt;
+		netMonDispSnapGapAvg = snapGapAvg;
+		netMonDispSnapGapMax = snapGapMax;
+		netMonDispFtAvg      = ftAvg;
+		netMonDispFtMax      = ftMax;
+		netMonDispFiAvg      = ( netMonFiCount > 0 ) ? ( netMonFiSum / netMonFiCount ) : 0.0f;
+		netMonFiSum          = 0.0f;
+		netMonFiCount        = 0;
+
+		/* record into 30-second ring buffer for laggot announce */
+		if ( cl_netgraph->integer ) {
+			laggotSample_t *s = &laggotHistory[ laggotHistoryIdx % LAGGOT_HISTORY ];
+			s->dropRate   = netMonDropRate;
+			s->fastCnt    = fastCnt;
+			s->snapGapAvg = snapGapAvg;
+			s->snapGapMax = snapGapMax;
+			s->extrapCnt  = extrapCnt;
+			s->ftAvg      = ftAvg;
+			s->chokeCnt   = chokeCnt;
+			laggotHistoryIdx++;
+		}
+
+		/* optional periodic stats line in the log */
+		if ( cl_netlog->integer >= 2 && netLogFile ) {
+			qtime_t t;
+			char    logline[256];
+			Com_RealTime( &t );
+			snapHz = ( cl.snapshotMsec > 0 ) ? ( 1000 / cl.snapshotMsec ) : 0;
+			Com_sprintf( logline, sizeof(logline),
+				"[%02d:%02d:%02d] STATS  snap=%dHz  ping=%d(%d..%d)ms  fI=%.3f"
+				"  dT=%d..%dms  drop=%d/s  in=%dB/s  out=%dB/s"
+				"  ft=%d/%d/%dms  snapgap=%d/%dms  caps=%d  extrap=%d"
+				"  fast=%d  reset=%d  slow=%d\n",
+				t.tm_hour, t.tm_min, t.tm_sec,
+				snapHz, pingAvg, pingMin, pingMax,
+				cl.frameInterpolation,
+				dtMin, dtMax, netMonDropRate,
+				netMonInRate, netMonOutRate,
+				ftMin, ftAvg, ftMax,
+				snapGapAvg, snapGapMax,
+				capHits, extrapCnt,
+				fastCnt, resetCnt, slowCnt );
+			SCR_WriteLog( logline );
+		}
+
+		/* laggot announce: scan 30s ring buffer for worst values */
+		if ( cl_netgraph->integer && cl_laggotannounce->integer && cls.realtime - laggotLastAnnounce >= 30000 ) {
+			int  sHz = ( cl.snapshotMsec > 0 ) ? ( 1000 / cl.snapshotMsec ) : 60;
+			int  extrapThresh = sHz * 3 / 4;
+			int  worstDrop = 0, worstFast = 0, worstSnapGapAvg = 0, worstSnapGapMax = 0;
+			int  worstExtrap = 0, worstFtAvg = 0, worstChoke = 0;
+			int  i, count;
+			char msg[128];
+			int  len = 0;
+			qboolean fire = qfalse;
+
+			count = laggotHistoryIdx < LAGGOT_HISTORY ? laggotHistoryIdx : LAGGOT_HISTORY;
+			for ( i = 0; i < count; i++ ) {
+				laggotSample_t *s = &laggotHistory[ ( laggotHistoryIdx - count + i ) % LAGGOT_HISTORY ];
+				if ( s->dropRate   > worstDrop )       worstDrop       = s->dropRate;
+				if ( s->fastCnt    > worstFast )       worstFast       = s->fastCnt;
+				if ( s->snapGapAvg > worstSnapGapAvg ) worstSnapGapAvg = s->snapGapAvg;
+				if ( s->snapGapMax > worstSnapGapMax ) worstSnapGapMax = s->snapGapMax;
+				if ( s->extrapCnt  > worstExtrap )     worstExtrap     = s->extrapCnt;
+				if ( s->ftAvg      > worstFtAvg )      worstFtAvg      = s->ftAvg;
+				if ( s->chokeCnt   > worstChoke )      worstChoke      = s->chokeCnt;
+			}
+
+			len += Com_sprintf( msg + len, sizeof(msg) - len, "say [NET]" );
+
+			if ( worstDrop > 0 ) {
+				len += Com_sprintf( msg + len, sizeof(msg) - len, " Drop:%d/s", worstDrop );
+				fire = qtrue;
+			}
+			if ( worstFast > 0 ) {
+				len += Com_sprintf( msg + len, sizeof(msg) - len, " FastRst:%d", worstFast );
+				fire = qtrue;
+			}
+			if ( worstSnapGapMax > cl.snapshotMsec ) {
+				len += Com_sprintf( msg + len, sizeof(msg) - len, " SnapJitt:%d/%dms", worstSnapGapAvg, worstSnapGapMax );
+				fire = qtrue;
+			}
+			if ( worstExtrap > extrapThresh ) {
+				len += Com_sprintf( msg + len, sizeof(msg) - len, " Ext:%d/%dHz", worstExtrap, sHz );
+				fire = qtrue;
+			}
+			if ( worstFtAvg > cl.snapshotMsec * 2 ) {
+				len += Com_sprintf( msg + len, sizeof(msg) - len, " LowFPS:%dfps", worstFtAvg > 0 ? 1000 / worstFtAvg : 0 );
+				fire = qtrue;
+			}
+			if ( worstChoke > 0 ) {
+				len += Com_sprintf( msg + len, sizeof(msg) - len, " Choke:%d/s", worstChoke );
+				fire = qtrue;
+			}
+
+			if ( fire ) {
+				CL_AddReliableCommand( msg, qfalse );
+				laggotLastAnnounce = cls.realtime;
+			}
+		}
+	}
+}
+
+/*
+==============
+SCR_DrawNetMonitor
+
+Draws a small always-on-top overlay (virtual 640x480 coords, scaled) showing
+real-time client network/timing diagnostics.  Toggle with cl_netgraph 1.
+==============
+*/
+static void SCR_DrawNetMonitor( void ) {
+	static const float bgColor[4]     = { 0.0f, 0.0f, 0.0f, 0.65f };
+	static const float colorWhite[4]  = { 1.0f, 1.0f, 1.0f, 1.0f  };
+	static const float colorGreen[4]  = { 0.2f, 1.0f, 0.2f, 1.0f  };
+	static const float colorYellow[4] = { 1.0f, 1.0f, 0.2f, 1.0f  };
+	static const float colorRed[4]    = { 1.0f, 0.3f, 0.3f, 1.0f  };
+
+	char         line[48];
+	const float *col;
+	float        scale, charW, charH, pad;
+	float        bw, bh, bx, by, tx, ty;
+	int          snapHz;
+
+	scale = cl_netgraph_scale->value;
+	if ( scale <= 0.0f ) scale = 1.0f;
+
+	charW = 8.0f * scale;
+	charH = 8.0f * scale;
+	pad   = charW * 0.5f;
+
+	bw = NM_COLS * charW + pad * 2.0f;
+	bh = NM_ROWS * charH + pad * 2.0f;
+
+	bx = cl_netgraph_x->value;
+	by = cl_netgraph_y->value;
+
+	if ( bx + bw > SCREEN_WIDTH  - 2 ) bx = SCREEN_WIDTH  - 2 - bw;
+	if ( bx < 2.0f                    ) bx = 2.0f;
+	if ( by + bh > SCREEN_HEIGHT - 2 ) by = SCREEN_HEIGHT - 2 - bh;
+	if ( by < 2.0f                    ) by = 2.0f;
+
+	SCR_FillRect( bx, by, bw, bh, bgColor );
+
+	tx = bx + pad;
+	ty = by + pad;
+
+	snapHz = ( cl.snapshotMsec > 0 ) ? ( 1000 / cl.snapshotMsec ) : 0;
+
+	/* row 1 - title */
+	NM_DrawRow( &tx, &ty, bx + pad, charW, charH, colorWhite,
+		"== NET MONITOR ==" );
+
+	/* row 2 - snapshot rate */
+	Com_sprintf( line, sizeof(line), "Snap: %3dHz %3dms", snapHz, cl.snapshotMsec );
+	NM_DrawRow( &tx, &ty, bx + pad, charW, charH, colorWhite, line );
+
+	/* row 3 - ping with min..max range */
+	col = ( cl.snap.ping >= NM_PING_HIGH   ) ? colorRed    :
+	      ( cl.snap.ping >= NM_PING_MEDIUM ) ? colorYellow : colorGreen;
+	Com_sprintf( line, sizeof(line), "Ping:%d(%d..%d)ms",
+		cl.snap.ping, netMonDispPingMin, netMonDispPingMax );
+	NM_DrawRow( &tx, &ty, bx + pad, charW, charH, col, line );
+
+	/* row 4 - frame interpolation + client frame time */
+	col = ( netMonDispFtMax > cl.snapshotMsec ) ? colorYellow : colorGreen;
+	Com_sprintf( line, sizeof(line), "FrmI:.%02d FrmT:%d/%dms",
+		(int)( netMonDispFiAvg * 100.0f ),
+		netMonDispFtAvg, netMonDispFtMax );
+	NM_DrawRow( &tx, &ty, bx + pad, charW, charH, col, line );
+
+	/* row 5 - server time delta */
+	Com_sprintf( line, sizeof(line), "DeltaT:  %+dms", cl.serverTimeDelta );
+	NM_DrawRow( &tx, &ty, bx + pad, charW, charH, colorWhite, line );
+
+	/* row 6 - drops + extrapolations + caps */
+	{
+		int nmSnapHz = ( cl.snapshotMsec > 0 ) ? ( 1000 / cl.snapshotMsec ) : 60;
+		int extrapYellow = nmSnapHz * 3 / 5;
+		int extrapRed    = nmSnapHz * 3 / 4;
+		col = ( netMonDropRate > 0 ) ? colorRed :
+		      ( netMonDispExtrapCnt > extrapRed ) ? colorRed :
+		      ( netMonDispExtrapCnt > extrapYellow ) ? colorYellow : colorGreen;
+	}
+	Com_sprintf( line, sizeof(line), "Drop:%d Ext:%d Clp:%d",
+		netMonDropRate, netMonDispExtrapCnt, netMonDispCapHits );
+	NM_DrawRow( &tx, &ty, bx + pad, charW, charH, col, line );
+
+	/* row 7 - bandwidth in/out */
+	if ( netMonInRate >= 1024 || netMonOutRate >= 1024 )
+		Com_sprintf( line, sizeof(line), "I:%.0fK O:%.0fK",
+			netMonInRate / 1024.0f, netMonOutRate / 1024.0f );
+	else
+		Com_sprintf( line, sizeof(line), "I:%dB O:%dB",
+			netMonInRate, netMonOutRate );
+	NM_DrawRow( &tx, &ty, bx + pad, charW, charH, colorWhite, line );
+
+	/* row 8 - snap interval jitter */
+	col = ( netMonDispSnapGapMax > cl.snapshotMsec ) ? colorRed :
+	      ( netMonDispSnapGapAvg > cl.snapshotMsec / 2 ) ? colorYellow : colorGreen;
+	Com_sprintf( line, sizeof(line), "SnapJitt:%d/%dms",
+		netMonDispSnapGapAvg, netMonDispSnapGapMax );
+	NM_DrawRow( &tx, &ty, bx + pad, charW, charH, col, line );
+
+	/* row 9 - snapshot sequence / delta compression */
+	Com_sprintf( line, sizeof(line), "Seq:  #%d d:%d",
+		cl.snap.messageNum,
+		cl.snap.messageNum - cl.snap.deltaNum );
+	NM_DrawRow( &tx, &ty, bx + pad, charW, charH, colorWhite, line );
+
+	/* row 10 - slow-path drift + fast resets */
+	{
+		int slowThresh = snapHz / 10;
+		if ( slowThresh < 1 ) slowThresh = 1;
+		col = ( netMonFastCount > 0 ) ? colorRed :
+		      ( netMonSlowRate > slowThresh ) ? colorYellow : colorGreen;
+		Com_sprintf( line, sizeof(line), "Adj: slo=%d fst=%d", netMonSlowRate, netMonFastCount );
+		NM_DrawRow( &tx, &ty, bx + pad, charW, charH, col, line );
+	}
+
+	re.SetColor( NULL );
+}
+
+#undef NM_PING_HIGH
+#undef NM_PING_MEDIUM
+#undef NM_COLS
+#undef NM_ROWS
+
+//=============================================================================
 
 /*
 ==================
@@ -496,6 +1135,37 @@ void SCR_Init( void ) {
 	cl_graphscale = Cvar_Get ("graphscale", "1", CVAR_CHEAT);
 	cl_graphshift = Cvar_Get ("graphshift", "0", CVAR_CHEAT);
 
+	cl_netgraph = Cvar_Get( "cl_netgraph", "0", 0 );
+	Cvar_SetDescription( cl_netgraph,
+		"Show the net monitor overlay.\n"
+		"0 = off, 1 = on\n"
+		"Default: 0" );
+
+	cl_netgraph_x = Cvar_Get( "cl_netgraph_x", "460", 0 );
+	Cvar_SetDescription( cl_netgraph_x, "Net monitor X position in virtual 640x480 coords.\nDefault: 460" );
+
+	cl_netgraph_y = Cvar_Get( "cl_netgraph_y", "4", 0 );
+	Cvar_SetDescription( cl_netgraph_y, "Net monitor Y position in virtual 640x480 coords.\nDefault: 4" );
+
+	cl_netgraph_scale = Cvar_Get( "cl_netgraph_scale", "1.0", 0 );
+	Cvar_SetDescription( cl_netgraph_scale, "Net monitor text/box scale multiplier.\nDefault: 1.0" );
+
+	cl_netlog = Cvar_Get( "cl_netlog", "0", 0 );
+	Cvar_SetDescription( cl_netlog,
+		"Net debug session logging.\n"
+		"0 = off\n"
+		"1 = log FAST/RESET delta events + SNAP LATE + PING JITTER\n"
+		"2 = log level 1 events + periodic per-second stats\n"
+		"Default: 0" );
+
+	cl_laggotannounce = Cvar_Get( "cl_laggotannounce", "1", 0 );
+	Cvar_SetDescription( cl_laggotannounce,
+		"Auto-announce network issues to the server via say.\n"
+		"0 = off, 1 = on\n"
+		"Default: 1" );
+
+	Cmd_AddCommand( "netgraph_dump", SCR_NetgraphDump_f );
+
 	scr_initialized = qtrue;
 }
 
@@ -506,6 +1176,8 @@ SCR_Done
 ==================
 */
 void SCR_Done( void ) {
+	SCR_CloseNetLog();
+	Cmd_RemoveCommand( "netgraph_dump" );
 	scr_initialized = qfalse;
 }
 
@@ -578,6 +1250,9 @@ static void SCR_DrawScreenField( stereoFrame_t stereoFrame ) {
 			// always supply STEREO_CENTER as vieworg offset is now done by the engine.
 			CL_CGameRendering( stereoFrame );
 			SCR_DrawDemoRecording();
+			SCR_NetMonUpdate();
+			if ( cl_netgraph->integer )
+				SCR_DrawNetMonitor();
 #ifdef USE_VOIP
 			SCR_DrawVoipMeter();
 #endif

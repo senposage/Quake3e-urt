@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(grep:*)",
+      "Bash(make PLATFORM=mingw64:*)",
+      "Bash(ls:*)",
+      "Bash(echo PATH: $PATH:*)",
+      "Bash(echo $PATH:*)",
+      "Bash(env:*)"
+    ]
+  }
+}

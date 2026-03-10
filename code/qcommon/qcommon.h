@@ -87,6 +87,7 @@ struct entityState_s;
 struct playerState_s;
 
 void MSG_WriteBits( msg_t *msg, int value, int bits );
+int MSG_ReadBits( msg_t *msg, int bits );
 
 void MSG_WriteChar (msg_t *sb, int c);
 void MSG_WriteByte (msg_t *sb, int c);
@@ -121,6 +122,58 @@ void MSG_ReadDeltaEntity( msg_t *msg, const entityState_t *from, entityState_t *
 
 void MSG_WriteDeltaPlayerstate( msg_t *msg, const playerState_t *from, const playerState_t *to );
 void MSG_ReadDeltaPlayerstate( msg_t *msg, const playerState_t *from, playerState_t *to );
+
+#ifdef USE_MV
+typedef enum {
+	SM_BASE = 1,
+	SM_EFLAGS = 2,
+	SM_TRTIME = 4,
+	SM_TRTYPE = 8,
+	SM_TRDELTA = 16,
+	SM_ALL = SM_BASE | SM_EFLAGS | SM_TRTIME | SM_TRTYPE | SM_TRDELTA,
+	SM_BITS = 5,
+} skip_mask;
+
+int MSG_PlayerStateToEntityStateXMask( const playerState_t *ps, const entityState_t *s, qboolean snap );
+void MSG_PlayerStateToEntityState( playerState_t *ps, entityState_t *s, qboolean snap, skip_mask sm );
+
+// LZSS compression
+#define INDEX_BITS		12
+#define LENGTH_BITS		4
+#define LENGTH_MASK		((1<<LENGTH_BITS)-1)
+#define LENGTH_MASK1	(0xFF & ~LENGTH_MASK)
+#define LZ_WINDOW_SIZE	(1 << INDEX_BITS)
+#define RAW_LOOK_AHEAD_SIZE (1 << LENGTH_BITS)
+#define LZ_MIN_MATCH	3
+#define LOOK_AHEAD_SIZE (RAW_LOOK_AHEAD_SIZE + LZ_MIN_MATCH - 1)
+#define DICT_SIZE		LZ_WINDOW_SIZE
+#define HTAB_SIZE		2048
+
+typedef struct lz_ctx_s {
+	byte	window[ PAD(LZ_WINDOW_SIZE + LOOK_AHEAD_SIZE, 4) ];
+	int		current_pos;
+	short int htable[ HTAB_SIZE ];
+	short int htlast[ HTAB_SIZE ];
+	short int hlist[ DICT_SIZE ];
+	short int hvals[ DICT_SIZE ];
+} lzctx_t;
+
+typedef struct lzstream_s {
+	int		count;
+	byte	type[(MAX_STRING_CHARS/8)+4];
+	byte	cmd[MAX_STRING_CHARS+1];
+	int		zdelta;
+	int		zcharbits;
+	int		zcommandSize;
+	int		zcommandNum;
+} lzstream_t;
+
+void LZSS_InitContext( lzctx_t *ctx );
+void LZSS_SeekEOS( msg_t *msg, int charbits );
+int LZSS_Expand( lzctx_t *ctx, msg_t *msg, byte *out, int maxsize, int charbits );
+int LZSS_CompressToStream( lzctx_t *ctx, lzstream_t *stream, const byte *in, int length );
+void MSG_WriteLZStream( msg_t *msg, lzstream_t *stream );
+#endif
 
 void MSG_ReportChangeVectors_f( void );
 
@@ -298,20 +351,30 @@ PROTOCOL
 // NOTE: that stuff only works with two digits protocols
 extern const int demo_protocols[];
 
-#define	UPDATE_SERVER_NAME	"update.quake3arena.com"
-// override on command line, config files etc.
+#ifdef USE_FTWGL
+#define	UPDATE_SERVER_NAME	"update.urbanterror.info"
 #ifndef MASTER_SERVER_NAME
-#define MASTER_SERVER_NAME	"master.quake3arena.com"
+#define MASTER_SERVER_NAME	"master.urbanterror.info"
 #endif
 #ifndef AUTHORIZE_SERVER_NAME
-#define	AUTHORIZE_SERVER_NAME	"authorize.quake3arena.com"
+#define	AUTHORIZE_SERVER_NAME	"authorize.urbanterror.info"
 #endif
-
-#define	PORT_MASTER			27950
+#define	PORT_MASTER			27900
 #define	PORT_UPDATE			27951
 #ifndef PORT_AUTHORIZE
 #define	PORT_AUTHORIZE		27952
 #endif
+#else
+#define	UPDATE_SERVER_NAME	"update.quake3arena.com"
+#ifndef MASTER_SERVER_NAME
+#define MASTER_SERVER_NAME	"master.quake3arena.com"
+#endif
+#define	PORT_MASTER			27950
+#define	PORT_UPDATE			27951
+#endif
+
+#define URT_PROTOCOL_VERSION	70
+#define URTDEMOEXT				"urtdemo"
 #define	PORT_SERVER			27960
 #define	NUM_SERVER_PORTS	4		// broadcast scan this many ports after
 									// PORT_SERVER so a single machine can
@@ -336,6 +399,13 @@ enum svc_ops_e {
 	// new commands, supported only by ioquake3 protocol but not legacy
 	svc_voipSpeex,     // not wrapped in USE_VOIP, so this value is reserved.
 	svc_voipOpus,      //
+
+#ifdef USE_MV
+	svc_multiview = 16,		// multiview extension
+#ifdef USE_MV_ZCMD
+	svc_zcmd = 17,			// LZ-compressed version of svc_serverCommand
+#endif
+#endif
 };
 
 
@@ -1021,6 +1091,7 @@ extern	cvar_t	*com_viewlog;			// 0 = hidden, 1 = visible, 2 = minimized
 extern	cvar_t	*com_version;
 extern	cvar_t	*com_journal;
 extern	cvar_t	*com_cameraMode;
+extern	cvar_t	*com_blood;
 extern	cvar_t	*com_protocol;
 extern	qboolean com_protocolCompat;
 

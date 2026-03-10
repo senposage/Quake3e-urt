@@ -769,6 +769,15 @@ gotnewcl:
 	// init the netchan queue
 	newcl->netchan_end_queue = &newcl->netchan_start_queue;
 
+#ifdef USE_SERVER_DEMO
+	// clear server-side demo recording
+	newcl->demo_recording = qfalse;
+	newcl->demo_file = -1;
+	newcl->demo_waiting = qfalse;
+	newcl->demo_backoff = 1;
+	newcl->demo_deltas = 0;
+#endif
+
 	// save the userinfo
 	Q_strncpyz( newcl->userinfo, userinfo, sizeof(newcl->userinfo) );
 
@@ -879,6 +888,13 @@ void SV_DropClient( client_t *drop, const char *reason ) {
 		SV_SendServerCommand( NULL, "print \"%s" S_COLOR_WHITE " %s\n\"", name, reason );
 	}
 
+#ifdef USE_SERVER_DEMO
+	if ( drop->demo_recording ) {
+		// stop the server side demo if we were recording this client
+		Cbuf_ExecuteText( EXEC_NOW, va( "stopserverdemo %d", (int)(drop - svs.clients) ) );
+	}
+#endif
+
 	// call the prog function for removing a client
 	// this will remove the body, among other things
 	VM_Call( gvm, 1, GAME_CLIENT_DISCONNECT, drop - svs.clients );
@@ -924,6 +940,70 @@ void SV_DropClient( client_t *drop, const char *reason ) {
 		SV_Heartbeat_f();
 	}
 }
+
+
+#ifdef USE_AUTH
+/*
+=====================
+SV_Auth_DropClient
+
+Called by QVM auth system to drop a client with a separate
+reason (shown to other players) and message (shown to the dropped client).
+=====================
+*/
+void SV_Auth_DropClient( client_t *drop, const char *reason, const char *message ) {
+	int		i;
+	const qboolean isBot = drop->netchan.remoteAddress.type == NA_BOT;
+
+	if ( drop->state == CS_ZOMBIE ) {
+		return;		// already dropped
+	}
+
+	// tell everyone why they got dropped
+	if ( reason != NULL && strlen( reason ) > 0 )
+		SV_SendServerCommand( NULL, "print \"%s" S_COLOR_WHITE " %s\n\"", drop->name, reason );
+
+#ifdef USE_SERVER_DEMO
+	if ( drop->demo_recording ) {
+		Cbuf_ExecuteText( EXEC_NOW, va( "stopserverdemo %d", (int)(drop - svs.clients) ) );
+	}
+#endif
+
+	// call the prog function for removing a client
+	// this will remove the body, among other things
+	VM_Call( gvm, 1, GAME_CLIENT_DISCONNECT, drop - svs.clients );
+
+	// add the disconnect command
+	SV_SendServerCommand( drop, "disconnect \"%s\"", message );
+
+	if ( isBot ) {
+		SV_BotFreeClient( drop - svs.clients );
+	}
+
+	// nuke user info
+	SV_SetUserinfo( drop - svs.clients, "" );
+
+	if ( isBot ) {
+		// bots shouldn't go zombie, as there's no real net connection.
+		drop->state = CS_FREE;
+	} else {
+		Com_DPrintf( "Going to CS_ZOMBIE for %s\n", drop->name );
+		drop->state = CS_ZOMBIE;		// become free in a few seconds
+	}
+
+	// if this was the last client on the server, send a heartbeat
+	// to the master so it is known the server is empty
+	// send a heartbeat now so the master will get up to date info
+	for ( i = 0; i < sv.maxclients; i++ ) {
+		if ( svs.clients[i].state >= CS_CONNECTED ) {
+			break;
+		}
+	}
+	if ( i == sv.maxclients ) {
+		SV_Heartbeat_f();
+	}
+}
+#endif
 
 
 /*
@@ -1959,6 +2039,55 @@ typedef struct {
 	void (*func)( client_t *cl );
 } ucmd_t;
 
+#ifdef USE_MV
+static void SV_MultiView_f( client_t *cl ) {
+	int i, n;
+
+	if ( Q_stricmp( Cmd_Argv( 0 ), "mvjoin" ) == 0 ) {
+		if ( cl->multiview.protocol > 0 ) {
+			SV_SendServerCommand( cl, "print \"You are already in multiview state.\n\"" );
+			return;
+		}
+
+		for ( i = 0, n = 0; i < sv.maxclients; i++ ) {
+			if ( svs.clients[ i ].multiview.protocol > 0 )
+				n++;
+		}
+
+		if ( n >= sv_mvClients->integer ) {
+			SV_SendServerCommand( cl, "print \""S_COLOR_YELLOW"No free multiview slots.\n\"" );
+			return;
+		}
+
+		if ( sv_mvPassword->string[0] != '\0' ) {
+			if ( Cmd_Argc() < 2 || strcmp( sv_mvPassword->string, Cmd_Argv( 1 ) ) ) {
+				SV_SendServerCommand( cl, "print \""S_COLOR_YELLOW"Invalid password.\n\"" );
+				return;
+			}
+		}
+
+		cl->multiview.protocol = MV_PROTOCOL_VERSION;
+		cl->multiview.scoreQueryTime = 0;
+#ifdef USE_MV_ZCMD
+		cl->multiview.z.deltaSeq = 0;
+#endif
+		SV_SendServerCommand( cl, "print \"%s "S_COLOR_WHITE"joined multiview.\n\"", cl->name );
+
+	} else { // mvleave
+		if ( cl->multiview.protocol == 0 ) {
+			SV_SendServerCommand( cl, "print \"You are not in multiview state.\n\"" );
+		} else {
+			SV_SendServerCommand( cl, "print \"%s "S_COLOR_WHITE"left multiview.\n\"", cl->name );
+			cl->multiview.protocol = 0;
+			cl->multiview.scoreQueryTime = 0;
+#ifdef USE_MV_ZCMD
+			cl->multiview.z.deltaSeq = 0;
+#endif
+		}
+	}
+}
+#endif
+
 static const ucmd_t ucmds[] = {
 	{"userinfo", SV_UpdateUserinfo_f},
 	{"disconnect", SV_Disconnect_f},
@@ -1969,6 +2098,10 @@ static const ucmd_t ucmds[] = {
 	{"stopdl", SV_StopDownload_f},
 	{"donedl", SV_DoneDownload_f},
 	{"locations", SV_PrintLocations_f},
+#ifdef USE_MV
+	{"mvjoin", SV_MultiView_f},
+	{"mvleave", SV_MultiView_f},
+#endif
 
 	{NULL, NULL}
 };
@@ -2112,6 +2245,58 @@ void SV_ClientThink (client_t *cl, usercmd_t *cmd) {
 		return;		// may have been kicked during the last usercmd
 	}
 
+	// Track last real think time for engine-side antiwarp
+	cl->awLastThinkTime = sv.gameTime;
+
+	// Multi-step pmove: break large usercmd deltas into steps of sv_pmoveMsec
+	// so physics never exceeds the max step size. Bots excluded — they use
+	// fixed-rate steps from level.time.
+	if ( sv_pmoveMsec && sv_pmoveMsec->integer > 0
+		&& cl->netchan.remoteAddress.type != NA_BOT ) {
+		int clNum    = cl - svs.clients;
+		int maxStep  = sv_pmoveMsec->integer;
+		int realTime = cl->lastUsercmd.serverTime;
+		int cmdTime  = SV_GameClientNum( clNum )->commandTime;
+		int delta    = realTime - cmdTime;
+
+		if ( delta > maxStep ) {
+			int prevCmdTime;
+
+			// First step: test whether QVM will actually run Pmove.
+			// If commandTime doesn't advance (intermission, pause, etc.),
+			// fall through to single call to avoid blocking the server.
+			prevCmdTime = cmdTime;
+			cl->lastUsercmd.serverTime = cmdTime + maxStep;
+			VM_Call( gvm, 1, GAME_CLIENT_THINK, clNum );
+			if ( cl->state != CS_ACTIVE )
+				return;
+			if ( SV_GameClientNum( clNum )->commandTime == prevCmdTime ) {
+				// QVM didn't consume the command — no-Pmove state
+				cl->lastUsercmd.serverTime = realTime;
+				goto single_call;
+			}
+
+			// Subsequent steps until remaining delta <= maxStep
+			while ( realTime - SV_GameClientNum( clNum )->commandTime > maxStep ) {
+				prevCmdTime = SV_GameClientNum( clNum )->commandTime;
+				cl->lastUsercmd.serverTime = prevCmdTime + maxStep;
+				VM_Call( gvm, 1, GAME_CLIENT_THINK, clNum );
+				if ( cl->state != CS_ACTIVE )
+					return;
+				if ( SV_GameClientNum( clNum )->commandTime == prevCmdTime ) {
+					cl->lastUsercmd.serverTime = realTime;
+					goto single_call;
+				}
+			}
+
+			// Final step: consume remainder to reach realTime
+			cl->lastUsercmd.serverTime = realTime;
+			VM_Call( gvm, 1, GAME_CLIENT_THINK, clNum );
+			return;
+		}
+	}
+
+single_call:
 	VM_Call( gvm, 1, GAME_CLIENT_THINK, cl - svs.clients );
 }
 

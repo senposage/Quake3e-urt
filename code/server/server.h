@@ -89,6 +89,9 @@ typedef struct {
 	int				restartTime;
 	int				time;
 
+	int				gameTime;			// QVM-facing level.time; advances at sv_gameHz rate (or sv_fps when sv_gameHz <= 0)
+	int				gameTimeResidual;	// accumulator for gameTime sub-tick
+
 	byte			baselineUsed[ MAX_GENTITIES ];
 } server_t;
 
@@ -109,6 +112,14 @@ typedef struct {
 	int				frameNum;			// from snapshot storage to compare with last valid
 	entityState_t	*ents[ MAX_SNAPSHOT_ENTITIES ];
 
+#ifdef USE_MV
+	qboolean		multiview;
+	int				version;
+	int				mergeMask;
+	int				first_psf;
+	int				num_psf;
+	byte			psMask[MAX_CLIENTS/8];
+#endif
 } clientSnapshot_t;
 
 typedef enum {
@@ -119,6 +130,16 @@ typedef enum {
 	CS_PRIMED,		// gamestate has been sent, but client hasn't sent a usercmd
 	CS_ACTIVE		// client is fully in game
 } clientState_t;
+
+#ifdef USE_MV
+typedef struct {
+	byte			areabits[MAX_MAP_AREA_BYTES];
+	int				areabytes;
+	playerState_t	ps;
+	byte			entMask[ MAX_GENTITIES / 8 ];
+	int				clientSlot;
+} psFrame_t;
+#endif
 
 typedef struct netchan_buffer_s {
 	msg_t           msg;
@@ -216,6 +237,8 @@ typedef struct client_s {
 	qboolean		csUpdated[MAX_CONFIGSTRINGS];
 	qboolean		compat;
 
+	int				awLastThinkTime;	// sv.gameTime of last real GAME_CLIENT_THINK (engine antiwarp)
+
 	// flood protection
 	rateLimit_t		cmd_rate;
 	rateLimit_t		info_rate;
@@ -228,6 +251,35 @@ typedef struct client_s {
 
 	char			tld[3]; // "XX\0"
 	const char		*country;
+
+#ifdef USE_AUTH
+	char			auth[MAX_NAME_LENGTH];
+#endif
+
+#ifdef USE_SERVER_DEMO
+	qboolean	demo_recording;	// are we currently recording this client?
+	fileHandle_t	demo_file;	// the file we are writing the demo to
+	qboolean	demo_waiting;	// are we still waiting for the first non-delta frame?
+	int		demo_backoff;	// how many packets (-1 actually) between non-delta frames?
+	int		demo_deltas;	// how many delta frames did we let through so far?
+#endif
+
+#ifdef USE_MV
+	struct {
+		int				protocol;
+		int				scoreQueryTime;
+		int				lastRecvTime;
+		int				lastSentTime;
+#ifdef USE_MV_ZCMD
+		struct {
+			int			deltaSeq;
+			lzctx_t		ctx;
+			lzstream_t	stream[ MAX_RELIABLE_COMMANDS ];
+		} z;
+#endif
+		qboolean		recorder;
+	} multiview;
+#endif
 
 } client_t;
 
@@ -260,6 +312,13 @@ typedef struct {
 	snapshotFrame_t	snapFrames[ NUM_SNAPSHOT_FRAMES ];
 	snapshotFrame_t	*currFrame; // current frame that clients can refer
 
+#ifdef USE_MV
+	int			numSnapshotPSF;
+	int			nextSnapshotPSF;
+	int			modSnapshotPSF;
+	psFrame_t	*snapshotPSF;
+#endif
+
 } serverStatic_t;
 
 #ifdef USE_BANS
@@ -282,6 +341,18 @@ extern	server_t		sv;					// cleared each map
 extern	vm_t			*gvm;				// game virtual machine
 
 extern	cvar_t	*sv_fps;
+extern	cvar_t	*sv_gameHz;
+extern	cvar_t	*sv_snapshotFps;
+extern	cvar_t	*sv_busyWait;
+extern	cvar_t	*sv_pmoveMsec;
+extern	cvar_t	*sv_smoothClients;
+extern	cvar_t	*sv_antiwarp;
+extern	cvar_t	*sv_antiwarpTol;
+extern	cvar_t	*sv_antiwarpExtra;
+extern	cvar_t	*sv_antiwarpDecay;
+extern	cvar_t	*sv_bufferMs;
+extern	cvar_t	*sv_velSmooth;
+extern	cvar_t	*sv_extrapolate;
 extern	cvar_t	*sv_timeout;
 extern	cvar_t	*sv_zombietime;
 extern	cvar_t	*sv_rconPassword;
@@ -311,6 +382,21 @@ extern	cvar_t	*sv_lanForceRate;
 
 extern	cvar_t *sv_levelTimeReset;
 extern	cvar_t *sv_filter;
+
+#ifdef USE_AUTH
+extern	cvar_t	*sv_authServerIP;
+extern	cvar_t	*sv_auth_engine;
+#endif
+
+#ifdef USE_SERVER_DEMO
+extern	cvar_t	*sv_demonotice;
+extern	cvar_t	*sv_demofolder;
+#endif
+
+#ifdef USE_MV
+extern	cvar_t	*sv_mvClients;
+extern	cvar_t	*sv_mvPassword;
+#endif
 
 #ifdef USE_BANS
 extern	cvar_t	*sv_banFile;
@@ -368,6 +454,14 @@ void SV_ClientEnterWorld( client_t *client );
 void SV_FreeClient( client_t *client );
 void SV_DropClient( client_t *drop, const char *reason );
 
+#ifdef USE_AUTH
+void SV_Auth_DropClient( client_t *drop, const char *reason, const char *message );
+#endif
+
+#ifdef USE_SERVER_DEMO
+void SVD_WriteDemoFile( const client_t *client, const msg_t *msg );
+#endif
+
 qboolean SV_ExecuteClientCommand( client_t *cl, const char *s );
 void SV_ClientThink( client_t *cl, usercmd_t *cmd );
 
@@ -395,6 +489,8 @@ void SV_SendClientSnapshot( client_t *client );
 
 void SV_InitSnapshotStorage( void );
 void SV_IssueNewSnapshot( void );
+void SV_SmoothInit( void );
+void SV_SmoothRecordAll( void );
 
 int SV_RemainingGameState( void );
 

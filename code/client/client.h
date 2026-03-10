@@ -62,6 +62,19 @@ typedef struct {
 
 	int				serverCommandNum;		// execute all commands up to this before
 											// making the snapshot current
+#ifdef USE_MV
+	struct {
+		int				areabytes;
+		byte			areamask[MAX_MAP_AREA_BYTES];
+		byte			entMask[MAX_GENTITIES/8];
+		playerState_t	ps;
+		qboolean		valid;
+	} clps[ MAX_CLIENTS ];
+	qboolean		multiview;
+	int				version;
+	int				mergeMask;
+	byte			clientMask[MAX_CLIENTS/8];
+#endif
 } clSnapshot_t;
 
 
@@ -84,7 +97,11 @@ typedef struct {
 // the parseEntities array must be large enough to hold PACKET_BACKUP frames of
 // entities, so that when a delta compressed message arives from the server
 // it can be un-deltad from the original 
+#ifdef USE_MV
+#define	MAX_PARSE_ENTITIES	( PACKET_BACKUP * MAX_GENTITIES )
+#else
 #define	MAX_PARSE_ENTITIES	( PACKET_BACKUP * MAX_SNAPSHOT_ENTITIES )
+#endif
 
 extern int g_console_field_width;
 
@@ -102,6 +119,9 @@ typedef struct {
 	qboolean	extrapolatedSnapshot;	// set if any cgame frame has been forced to extrapolate
 									// cleared when CL_AdjustTimeDelta looks at it
 	qboolean	newSnapshots;		// set on parse of any valid packet
+
+	int			snapshotMsec;		// EMA of snapshot intervals, clamped [8,100]
+	float		frameInterpolation;	// current interpolation fraction for cgame
 
 	gameState_t	gameState;			// configstrings
 	char		mapname[MAX_QPATH];	// extracted from CS_SERVERINFO
@@ -164,6 +184,10 @@ demo through a file.
 typedef struct {
 
 	int			clientNum;
+#ifdef USE_MV
+	int			clientView;					// currently viewed client in multiview
+	int			zexpectDeltaSeq;			// for compressed server commands
+#endif
 	int			lastPacketSentTime;			// for retransmits during connection
 	int			lastPacketTime;				// for timeouts
 
@@ -217,6 +241,9 @@ typedef struct {
 #endif /* USE_CURL */
 
 	// demo information
+#ifdef USE_URT_DEMO
+	int			demoprotocol;
+#endif
 	char		demoName[MAX_OSPATH];
 	char		recordName[MAX_OSPATH]; // without extension
 	qboolean	explicitRecordName;
@@ -279,12 +306,18 @@ typedef struct {
 	int			netType;
 	int			gameType;
 	int		  	clients;
+	int			bots;
 	int		  	maxClients;
 	int			minPing;
 	int			maxPing;
 	int			ping;
 	qboolean	visible;
 	int			punkbuster;
+#ifdef USE_AUTH
+	int			auth;
+	int			password;
+	char		modversion[MAX_NAME_LENGTH];
+#endif
 	int			g_humanplayers;
 	int			g_needpass;
 } serverInfo_t;
@@ -392,6 +425,7 @@ extern	cvar_t	*cl_shownet;
 extern	cvar_t	*cl_autoNudge;
 extern	cvar_t	*cl_timeNudge;
 extern	cvar_t	*cl_showTimeDelta;
+extern	cvar_t	*cl_adaptiveTiming;
 
 extern	cvar_t	*com_timedemo;
 extern	cvar_t	*cl_aviFrameRate;
@@ -412,6 +446,13 @@ extern	cvar_t	*cl_inGameVideo;
 extern	cvar_t	*cl_lanForcePackets;
 extern	cvar_t	*cl_autoRecordDemo;
 extern	cvar_t	*cl_drawRecording;
+
+#ifdef USE_AUTH
+extern	cvar_t	*cl_auth_engine;
+extern	cvar_t	*cl_auth;
+extern	cvar_t	*authc;
+extern	cvar_t	*authl;
+#endif
 
 extern	cvar_t	*com_maxfps;
 
@@ -541,6 +582,29 @@ void	SCR_DrawStringExt( int x, int y, float size, const char *string, const floa
 void	SCR_DrawSmallStringExt( int x, int y, const char *string, const float *setColor, qboolean forceColor, qboolean noColorEscape );
 void	SCR_DrawSmallChar( int x, int y, int ch );
 void	SCR_DrawSmallString( int x, int y, const char *s, int len );
+
+// net monitor hooks
+void	SCR_NetMonitorAddIncoming( int bytes, int drops );
+void	SCR_NetMonitorAddOutgoing( int bytes );
+void	SCR_NetMonitorAddFrametime( int ft );
+void	SCR_NetMonitorAddSnapInterval( int measured, int expected );
+void	SCR_NetMonitorAddCapHit( void );
+void	SCR_NetMonitorAddExtrap( void );
+void	SCR_NetMonitorAddChoke( void );
+void	SCR_NetMonitorAddTimeDelta( int dT );
+void	SCR_NetMonitorAddPing( int ping );
+void	SCR_NetMonitorAddFastAdjust( void );
+void	SCR_NetMonitorAddResetAdjust( void );
+void	SCR_NetMonitorAddSlowAdjust( int delta );
+void	SCR_LogTimingEvent( const char *tag, int serverTimeDelta, int deltaDelta );
+void	SCR_LogSnapLate( int measured, int expected );
+void	SCR_LogPingJitter( int ping, int prevPing );
+void	SCR_CloseNetLog( void );
+
+// net monitor cvars
+extern cvar_t	*cl_netgraph;
+extern cvar_t	*cl_netlog;
+extern cvar_t	*cl_laggotannounce;
 
 //
 // cl_cin.c

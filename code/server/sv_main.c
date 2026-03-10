@@ -21,12 +21,25 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 */
 
 #include "server.h"
+#include "sv_antilag.h"
 
 serverStatic_t	svs;				// persistant server info
 server_t		sv;					// local server
 vm_t			*gvm = NULL;		// game virtual machine
 
 cvar_t	*sv_fps;				// time rate for running non-clients
+cvar_t	*sv_gameHz;				// rate at which level.time advances, independent of sv_fps
+cvar_t	*sv_snapshotFps;		// max snapshot send rate, independent of sv_fps
+cvar_t	*sv_busyWait;			// spin last N ms before frame instead of sleeping, for precise timing at high sv_fps
+cvar_t	*sv_pmoveMsec;			// max physics step size, enforces consistent movement regardless of client framerate
+cvar_t	*sv_smoothClients;		// TR_LINEAR trajectory trick for smoother client rendering
+cvar_t	*sv_antiwarp;			// engine-side antiwarp (replaces QVM g_antiwarp)
+cvar_t	*sv_antiwarpTol;		// antiwarp tolerance in ms (0=auto)
+cvar_t	*sv_antiwarpExtra;		// extrapolation window for mode 2 (ms, 0=auto=awTol)
+cvar_t	*sv_antiwarpDecay;		// decay duration for mode 2 (ms)
+cvar_t	*sv_bufferMs;			// position delay via ring buffer (ms, 0=off, <0=auto)
+cvar_t	*sv_velSmooth;			// velocity smoothing window (ms, 0=off)
+cvar_t	*sv_extrapolate;		// legacy position prediction (0=off)
 cvar_t	*sv_timeout;			// seconds without any message
 cvar_t	*sv_zombietime;			// seconds to sink messages after disconnect
 cvar_t	*sv_rconPassword;		// password for remote server commands
@@ -56,6 +69,21 @@ cvar_t	*sv_lanForceRate; // dedicated 1 (LAN) server forces local client rates t
 
 cvar_t *sv_levelTimeReset;
 cvar_t *sv_filter;
+
+#ifdef USE_AUTH
+cvar_t	*sv_authServerIP;
+cvar_t	*sv_auth_engine;
+#endif
+
+#ifdef USE_SERVER_DEMO
+cvar_t	*sv_demonotice;
+cvar_t	*sv_demofolder;
+#endif
+
+#ifdef USE_MV
+cvar_t	*sv_mvClients;
+cvar_t	*sv_mvPassword;
+#endif
 
 #ifdef USE_BANS
 cvar_t	*sv_banFile;
@@ -255,6 +283,10 @@ static void SV_MasterHeartbeat( const char *message )
 
 	svs.nextHeartbeatTime = svs.time + HEARTBEAT_MSEC;
 
+#ifdef USE_AUTH
+	VM_Call( gvm, 0, GAME_AUTHSERVER_HEARTBEAT );
+#endif
+
 	// send to group masters
 	for (i = 0; i < MAX_MASTER_SERVERS; i++)
 	{
@@ -342,6 +374,10 @@ void SV_MasterShutdown( void )
 
 	// when the master tries to poll the server, it won't respond, so
 	// it will be removed from the list
+
+#ifdef USE_AUTH
+	VM_Call( gvm, 0, GAME_AUTHSERVER_SHUTDOWN );
+#endif
 }
 
 
@@ -792,6 +828,13 @@ static void SVC_Info( const netadr_t *from ) {
 		Info_SetValueForKey( infostring, "game", gamedir );
 	}
 
+#ifdef USE_AUTH
+	Info_SetValueForKey( infostring, "auth", Cvar_VariableString( "auth" ) );
+#endif
+
+	if ( Cvar_VariableValue( "g_needpass" ) == 1 )
+		Info_SetValueForKey( infostring, "password", "1" );
+
 	NET_OutOfBandPrint( NS_SERVER, from, "infoResponse\n%s", infostring );
 }
 
@@ -954,6 +997,16 @@ static void SV_ConnectionlessPacket( const netadr_t *from, msg_t *msg ) {
 		// if a client starts up a local server, we may see some spurious
 		// server disconnect messages when their new server sees our final
 		// sequenced messages to the old client
+#ifdef USE_AUTH
+	} else if (!Q_stricmp(c, "AUTH:SV")) {
+		netadr_t authServerIP;
+		NET_StringToAdr( sv_authServerIP->string, &authServerIP, NA_IP );
+		if ( !NET_CompareBaseAdr( from, &authServerIP ) ) {
+			Com_Printf( "AUTH:SV not from the Auth Server\n" );
+			return;
+		}
+		VM_Call( gvm, 0, GAME_AUTHSERVER_PACKET );
+#endif
 	} else {
 		if ( com_developer->integer ) {
 			Com_Printf( "bad connectionless packet from %s:\n%s\n",
@@ -1194,13 +1247,24 @@ int SV_FrameMsec( void )
 	if ( sv_fps )
 	{
 		int frameMsec;
-		
+		int timeLeft;
+		int spinMs;
+
 		frameMsec = 1000.0f / sv_fps->value;
-		
+
 		if ( frameMsec < sv.timeResidual )
 			return 0;
-		else
-			return frameMsec - sv.timeResidual;
+
+		timeLeft = frameMsec - sv.timeResidual;
+
+		// If sv_busyWait is set, spin (return 0) for the last N ms before
+		// the frame is due, giving precise wakeup without OS sleep jitter.
+		// Costs ~1 CPU core but eliminates stutter at high sv_fps.
+		spinMs = sv_busyWait ? sv_busyWait->integer : 0;
+		if ( spinMs > 0 && timeLeft <= spinMs )
+			return 0;
+
+		return timeLeft;
 	}
 	else
 		return 1;
@@ -1225,6 +1289,62 @@ void SV_TrackCvarChanges( void )
 	if ( sv_minRate->integer && sv_minRate->integer < 1000 ) {
 		Cvar_Set( "sv_minRate", "1000" );
 		Com_DPrintf( "sv_minRate adjusted to 1000\n" );
+	}
+
+	// When sv_gameHz changes at runtime, clamp gameTimeResidual so it doesn't
+	// burst-fire multiple game frames on the next tick
+	if ( sv_gameHz->modified ) {
+		int _gameHz = (sv_gameHz->integer > 0) ? sv_gameHz->integer : sv_fps->integer;
+		int newGameMsec;
+		if ( _gameHz < 1 )               _gameHz = 1;
+		if ( _gameHz > sv_fps->integer ) _gameHz = sv_fps->integer;
+		newGameMsec = 1000 / _gameHz;
+		if ( sv.gameTimeResidual < 0 )
+			sv.gameTimeResidual = 0;
+		if ( sv.gameTimeResidual >= newGameMsec )
+			sv.gameTimeResidual = newGameMsec - 1;
+		sv_gameHz->modified = qfalse;
+		Com_DPrintf( "sv_gameHz changed to %d — gameTimeResidual clamped\n", sv_gameHz->integer );
+	}
+
+	// When sv_antiwarp is enabled, force QVM g_antiwarp off to prevent double injection.
+	if ( sv_antiwarp->modified ) {
+		if ( sv_antiwarp->integer ) {
+			Cvar_Set( "g_antiwarp", "0" );
+			Com_Printf( "sv_antiwarp enabled — forcing g_antiwarp 0\n" );
+		}
+		sv_antiwarp->modified = qfalse;
+	}
+	if ( sv_antiwarpTol->modified )
+		sv_antiwarpTol->modified = qfalse;
+	if ( sv_antiwarpExtra->modified )
+		sv_antiwarpExtra->modified = qfalse;
+	if ( sv_antiwarpDecay->modified )
+		sv_antiwarpDecay->modified = qfalse;
+
+	// When sv_fps changes at runtime, clamp the time residual so it doesn't
+	// represent more than one frame at the new rate
+	if ( sv_fps->modified || sv_snapshotFps->modified ) {
+		qboolean fpsChanged = sv_fps->modified;
+		int newFrameMsec = 1000 / sv_fps->integer;
+
+		if ( fpsChanged ) {
+			if ( sv.timeResidual < 0 )
+				sv.timeResidual = 0;
+			if ( sv.timeResidual >= newFrameMsec )
+				sv.timeResidual = newFrameMsec - 1;
+			// When sv_gameHz <= 0 the game frame rate equals sv_fps
+			if ( sv_gameHz->integer <= 0 ) {
+				if ( sv.gameTimeResidual < 0 )
+					sv.gameTimeResidual = 0;
+				if ( sv.gameTimeResidual >= newFrameMsec )
+					sv.gameTimeResidual = newFrameMsec - 1;
+			}
+			Com_DPrintf( "sv_fps changed to %d — timeResidual clamped\n", sv_fps->integer );
+		}
+
+		sv_fps->modified = qfalse;
+		sv_snapshotFps->modified = qfalse;
 	}
 
 	Cvar_ResetGroup( CVG_SERVER, qfalse );
@@ -1261,6 +1381,8 @@ static void SV_Restart( const char *reason ) {
 	}
 
 	sv.time = 0; // force level time reset
+	sv.gameTime = 0;
+	sv.gameTimeResidual = 0;
 	sv.restartTime = 0;
 	
 	Cvar_VariableStringBuffer( "mapname", mapName, sizeof( mapName ) );
@@ -1286,7 +1408,7 @@ void SV_Frame( int msec ) {
 	int		startTime;
 	int		i;
 
-	if ( Cvar_CheckGroup( CVG_SERVER ) )
+	if ( Cvar_CheckGroup( CVG_SERVER ) || sv_fps->modified )
 		SV_TrackCvarChanges(); // update rate settings, etc.
 
 	// the menu kills the server with this cvar
@@ -1378,30 +1500,123 @@ void SV_Frame( int msec ) {
 	// update ping based on the all received frames
 	SV_CalcPings();
 
-	if (com_dedicated->integer) SV_BotFrame (sv.time);
-
 	// run the game simulation in chunks
+	// Snapshot dispatch is inside this loop so each engine tick at sv_fps rate produces
+	// its own snapshot send opportunity, preventing double-interval gaps.
 	while ( sv.timeResidual >= frameMsec ) {
 		sv.timeResidual -= frameMsec;
 		svs.time += frameMsec;
 		sv.time += frameMsec;
 
-		// let everything in the world think and move
-		VM_Call( gvm, 1, GAME_RUN_FRAME, sv.time );
+		// Record shadow positions for antilag (once per engine tick, before game frame)
+		if ( sv_antilag && sv_antilag->integer )
+			SV_Antilag_RecordPositions();
+
+		// Fire GAME_RUN_FRAME at sv_gameHz rate, independent of sv_fps.
+		// sv_fps = input sampling rate; sv_gameHz = level.time rate.
+		//
+		// sv_gameHz > 0 (e.g. 20): GAME_RUN_FRAME fires every (1000/sv_gameHz) ms.
+		// sv_gameHz <= 0 (disabled): effective rate = sv_fps. GAME_RUN_FRAME fires
+		//   every engine tick — sv.gameTime == sv.time always.
+		{
+			int _gameHz = (sv_gameHz && sv_gameHz->integer > 0) ? sv_gameHz->integer : sv_fps->integer;
+			int _gameMsec;
+			if ( _gameHz < 1 )               _gameHz = 1;
+			if ( _gameHz > sv_fps->integer ) _gameHz = sv_fps->integer;
+			_gameMsec = 1000 / _gameHz;
+			sv.gameTimeResidual += frameMsec;
+
+			while ( sv.gameTimeResidual >= _gameMsec ) {
+				sv.gameTimeResidual -= _gameMsec;
+				sv.gameTime += _gameMsec;
+
+				// --- Engine-side antiwarp: inject blank commands for lagging clients ---
+				// Runs before GAME_RUN_FRAME so the QVM sees fresh ClientThink calls.
+				// Uses gameMsec instead of hardcoded 50ms, works at any sv_fps / sv_gameHz.
+				//
+				// Mode 1: constant — keep last inputs indefinitely (QVM-style).
+				// Mode 2: decay — extrapolate for sv_antiwarpExtra ms,
+				//   then linearly decay inputs over sv_antiwarpDecay ms,
+				//   then coast to stop via Pmove friction.
+				if ( sv_antiwarp && sv_antiwarp->integer ) {
+					int awMode = sv_antiwarp->integer;
+					int awTol = ( sv_antiwarpTol && sv_antiwarpTol->integer > 0 )
+						? sv_antiwarpTol->integer : _gameMsec;
+					int awExtraMs = ( sv_antiwarpExtra && sv_antiwarpExtra->integer > 0 )
+						? sv_antiwarpExtra->integer : awTol;
+					int awDecayMs = ( sv_antiwarpDecay && sv_antiwarpDecay->integer > 0 )
+						? sv_antiwarpDecay->integer : 0;
+					int awIdx;
+					client_t *awCl;
+
+					for ( awIdx = 0, awCl = svs.clients; awIdx < sv.maxclients; awIdx++, awCl++ ) {
+						int awGap;
+
+						if ( awCl->state != CS_ACTIVE )
+							continue;
+						if ( awCl->netchan.remoteAddress.type == NA_BOT )
+							continue;
+						if ( awCl->awLastThinkTime == 0 )
+							continue; // never received a real command yet
+
+						awGap = sv.gameTime - awCl->awLastThinkTime;
+						if ( awGap > awTol ) {
+							awCl->lastUsercmd.serverTime += _gameMsec;
+
+							if ( awMode >= 2 ) {
+								int decayStart = awTol + awExtraMs;
+								int elapsed = awGap - decayStart;
+
+								if ( elapsed > 0 ) {
+									if ( awDecayMs > 0 && elapsed < awDecayMs ) {
+										int scale = 127 - ( 127 * elapsed / awDecayMs );
+										if ( scale < 0 ) scale = 0;
+										awCl->lastUsercmd.forwardmove = (signed char)( (int)awCl->lastUsercmd.forwardmove * scale / 127 );
+										awCl->lastUsercmd.rightmove   = (signed char)( (int)awCl->lastUsercmd.rightmove   * scale / 127 );
+										awCl->lastUsercmd.upmove      = (signed char)( (int)awCl->lastUsercmd.upmove      * scale / 127 );
+									} else {
+										awCl->lastUsercmd.forwardmove = 0;
+										awCl->lastUsercmd.rightmove   = 0;
+										awCl->lastUsercmd.upmove      = 0;
+									}
+								}
+							}
+
+							VM_Call( gvm, 1, GAME_CLIENT_THINK, awIdx );
+							awCl->awLastThinkTime = sv.gameTime;
+
+							if ( awCl->state != CS_ACTIVE )
+								continue; // client was kicked during think
+						}
+					}
+				}
+
+				// Bot AI ticks in lockstep with GAME_RUN_FRAME at sv_gameHz rate.
+				if ( com_dedicated->integer )
+					SV_BotFrame( sv.gameTime );
+				VM_Call( gvm, 1, GAME_RUN_FRAME, sv.gameTime );
+			}
+		}
+
+		// Record positions into smooth buffer when either feature is enabled.
+		// Ring buffer feeds both sv_bufferMs (position delay) and sv_velSmooth (velocity smoothing).
+		if ( ( ( sv_extrapolate && sv_extrapolate->integer ) || ( sv_smoothClients && sv_smoothClients->integer ) )
+				&& ( ( sv_bufferMs && sv_bufferMs->integer != 0 )
+				  || ( sv_velSmooth && sv_velSmooth->integer > 0 ) ) ) {
+			SV_SmoothRecordAll();
+		}
+
+		// Issue and dispatch snapshots once per sv_fps tick, not once per Com_Frame.
+		SV_IssueNewSnapshot();
+		SV_SendClientMessages();
 	}
 
 	if ( com_speeds->integer ) {
 		time_game = Sys_Milliseconds () - startTime;
 	}
 
-	// check timeouts
+	// check timeouts (once per Com_Frame is sufficient)
 	SV_CheckTimeouts();
-
-	// reset current and build new snapshot on first query
-	SV_IssueNewSnapshot();
-
-	// send messages back to the clients
-	SV_SendClientMessages();
 
 	// send a heartbeat to the master if needed
 	SV_MasterHeartbeat(HEARTBEAT_FOR_MASTER);

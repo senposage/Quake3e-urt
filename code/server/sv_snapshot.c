@@ -26,6 +26,184 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 /*
 =============================================================================
 
+Per-client position ring buffer for sv_bufferMs / sv_velSmooth
+
+=============================================================================
+*/
+
+#define SV_SMOOTH_MAX_SLOTS 32
+
+typedef struct {
+	vec3_t      origin;
+	vec3_t      velocity;
+	int         serverTime;
+	qboolean    valid;
+} svSmoothPos_t;
+
+typedef struct {
+	svSmoothPos_t slots[SV_SMOOTH_MAX_SLOTS];
+	int           head;
+	int           count;
+} svSmoothHistory_t;
+
+static svSmoothHistory_t sv_smoothHistory[MAX_CLIENTS];
+
+
+void SV_SmoothInit( void ) {
+	Com_Memset( sv_smoothHistory, 0, sizeof( sv_smoothHistory ) );
+}
+
+
+static void SV_SmoothRecord( int clientNum ) {
+	svSmoothHistory_t *hist;
+	svSmoothPos_t *slot;
+	int idx;
+
+	if ( clientNum < 0 || clientNum >= sv.maxclients )
+		return;
+
+	hist = &sv_smoothHistory[clientNum];
+	idx = ( hist->head % SV_SMOOTH_MAX_SLOTS + SV_SMOOTH_MAX_SLOTS ) % SV_SMOOTH_MAX_SLOTS;
+	slot = &hist->slots[idx];
+
+	if ( svs.clients[clientNum].netchan.remoteAddress.type == NA_BOT ) {
+		sharedEntity_t *gent = SV_GentityNum( clientNum );
+		VectorCopy( gent->s.pos.trBase, slot->origin );
+		VectorCopy( gent->s.pos.trDelta, slot->velocity );
+	} else {
+		playerState_t *ps = SV_GameClientNum( clientNum );
+		VectorCopy( ps->origin, slot->origin );
+		VectorCopy( ps->velocity, slot->velocity );
+	}
+
+	slot->serverTime = sv.time;
+	slot->valid = qtrue;
+
+	hist->head++;
+	if ( hist->count < SV_SMOOTH_MAX_SLOTS )
+		hist->count++;
+}
+
+
+void SV_SmoothRecordAll( void ) {
+	int i;
+	for ( i = 0; i < sv.maxclients; i++ ) {
+		if ( svs.clients[i].state == CS_ACTIVE ) {
+			SV_SmoothRecord( i );
+		}
+	}
+}
+
+
+static qboolean SV_SmoothGetPosition( int clientNum, int targetTime,
+		vec3_t outOrigin, vec3_t outVelocity ) {
+	svSmoothHistory_t *hist;
+	svSmoothPos_t *before = NULL, *after = NULL;
+	int i, idx;
+	float frac;
+
+	if ( clientNum < 0 || clientNum >= sv.maxclients )
+		return qfalse;
+
+	hist = &sv_smoothHistory[clientNum];
+	if ( hist->count == 0 )
+		return qfalse;
+
+	for ( i = 0; i < hist->count; i++ ) {
+		idx = ( ( hist->head - 1 - i ) % SV_SMOOTH_MAX_SLOTS + SV_SMOOTH_MAX_SLOTS ) % SV_SMOOTH_MAX_SLOTS;
+
+		if ( !hist->slots[idx].valid )
+			continue;
+
+		if ( hist->slots[idx].serverTime <= targetTime ) {
+			if ( !before || hist->slots[idx].serverTime > before->serverTime )
+				before = &hist->slots[idx];
+		} else {
+			if ( !after || hist->slots[idx].serverTime < after->serverTime )
+				after = &hist->slots[idx];
+		}
+	}
+
+	if ( !before && !after )
+		return qfalse;
+
+	if ( !before ) {
+		VectorCopy( after->origin, outOrigin );
+		VectorCopy( after->velocity, outVelocity );
+		return qtrue;
+	}
+	if ( !after ) {
+		VectorCopy( before->origin, outOrigin );
+		VectorCopy( before->velocity, outVelocity );
+		return qtrue;
+	}
+
+	if ( after->serverTime == before->serverTime ) {
+		frac = 0.0f;
+	} else {
+		frac = (float)( targetTime - before->serverTime )
+			/ (float)( after->serverTime - before->serverTime );
+	}
+	if ( frac < 0.0f ) frac = 0.0f;
+	if ( frac > 1.0f ) frac = 1.0f;
+
+	outOrigin[0] = before->origin[0] + frac * ( after->origin[0] - before->origin[0] );
+	outOrigin[1] = before->origin[1] + frac * ( after->origin[1] - before->origin[1] );
+	outOrigin[2] = before->origin[2] + frac * ( after->origin[2] - before->origin[2] );
+
+	outVelocity[0] = before->velocity[0] + frac * ( after->velocity[0] - before->velocity[0] );
+	outVelocity[1] = before->velocity[1] + frac * ( after->velocity[1] - before->velocity[1] );
+	outVelocity[2] = before->velocity[2] + frac * ( after->velocity[2] - before->velocity[2] );
+
+	return qtrue;
+}
+
+
+static qboolean SV_SmoothGetAverageVelocity( int clientNum, int windowMs,
+		vec3_t outVelocity ) {
+	svSmoothHistory_t *hist;
+	int i, idx, n;
+	int cutoff;
+
+	if ( clientNum < 0 || clientNum >= sv.maxclients )
+		return qfalse;
+
+	hist = &sv_smoothHistory[clientNum];
+	if ( hist->count == 0 )
+		return qfalse;
+
+	cutoff = sv.time - windowMs;
+	VectorClear( outVelocity );
+	n = 0;
+
+	for ( i = 0; i < hist->count; i++ ) {
+		idx = ( ( hist->head - 1 - i ) % SV_SMOOTH_MAX_SLOTS + SV_SMOOTH_MAX_SLOTS ) % SV_SMOOTH_MAX_SLOTS;
+
+		if ( !hist->slots[idx].valid )
+			continue;
+		if ( hist->slots[idx].serverTime < cutoff )
+			break;
+
+		outVelocity[0] += hist->slots[idx].velocity[0];
+		outVelocity[1] += hist->slots[idx].velocity[1];
+		outVelocity[2] += hist->slots[idx].velocity[2];
+		n++;
+	}
+
+	if ( n == 0 )
+		return qfalse;
+
+	outVelocity[0] /= n;
+	outVelocity[1] /= n;
+	outVelocity[2] /= n;
+
+	return qtrue;
+}
+
+
+/*
+=============================================================================
+
 Delta encode a client frame onto the network channel
 
 A normal server packet will look like:
@@ -142,7 +320,25 @@ static void SV_WriteSnapshotToClient( const client_t *client, msg_t *msg ) {
 		}
 		oldframe = NULL;
 		lastframe = 0;
-	} else {
+	}
+#ifdef USE_SERVER_DEMO
+	else if ( client->demo_recording && client->demo_deltas <= 0 ) {
+		// if we're recording this client, force full frames every now and then
+		client_t *cl = (client_t *)client;
+		oldframe = NULL;
+		lastframe = 0;
+		if ( cl->demo_backoff < 1024 ) {
+			cl->demo_backoff *= 2;
+		}
+		cl->demo_deltas = cl->demo_backoff;
+	}
+#endif
+	else {
+#ifdef USE_SERVER_DEMO
+		if ( client->demo_recording ) {
+			((client_t *)client)->demo_deltas--;
+		}
+#endif
 		// we have a valid snapshot to delta from
 		oldframe = &client->frames[ client->deltaMessage & PACKET_MASK ];
 		lastframe = client->netchan.outgoingSequence - client->deltaMessage;
@@ -153,6 +349,13 @@ static void SV_WriteSnapshotToClient( const client_t *client, msg_t *msg ) {
 			lastframe = 0;
 		}
 	}
+
+#ifdef USE_SERVER_DEMO
+	// start recording only once there's a non-delta frame to start with
+	if ( !oldframe && client->demo_recording && client->demo_waiting ) {
+		((client_t *)client)->demo_waiting = qfalse;
+	}
+#endif
 
 	MSG_WriteByte( msg, svc_snapshot );
 
@@ -568,10 +771,95 @@ static void SV_BuildCommonSnapshot( void )
 
 	// setup start index
 	index = sf->start;
-	for ( i = 0 ; i < count ; i++, index = (index+1) % svs.numSnapshotEntities ) {
-		//index %= svs.numSnapshotEntities;
-		svs.snapshotEntities[ index ] = list[ i ]->s;
-		sf->ents[ i ] = &svs.snapshotEntities[ index ];
+	{
+		int bufMs = 0;
+		if ( sv_bufferMs && sv_bufferMs->integer != 0 ) {
+			bufMs = sv_bufferMs->integer;
+			if ( bufMs < 0 ) {
+				// Auto mode: one snapshot interval
+				bufMs = 1000 / sv_fps->integer;
+			}
+			if ( bufMs > 100 ) bufMs = 100;
+		}
+
+		for ( i = 0 ; i < count ; i++, index = (index+1) % svs.numSnapshotEntities ) {
+			svs.snapshotEntities[ index ] = list[ i ]->s;
+
+			// Fix up client entity positions between game frames
+			if ( ( sv_smoothClients && sv_smoothClients->integer ) ||
+				( sv_extrapolate && sv_extrapolate->integer ) ) {
+				entityState_t *es = &svs.snapshotEntities[ index ];
+				if ( es->number < sv.maxclients && es->pos.trType == TR_INTERPOLATE ) {
+
+					qboolean usedBuffer = qfalse;
+					qboolean isBot = ( svs.clients[ es->number ].netchan.remoteAddress.type == NA_BOT );
+					vec3_t origin, velocity;
+
+					// Phase 1: resolve position source
+					if ( bufMs > 0 && !isBot ) {
+						vec3_t delayedOrigin, delayedVelocity;
+						if ( SV_SmoothGetPosition( es->number, sv.time - bufMs, delayedOrigin, delayedVelocity ) ) {
+							VectorCopy( delayedOrigin, origin );
+							VectorCopy( delayedVelocity, velocity );
+							usedBuffer = qtrue;
+						}
+					}
+					if ( !usedBuffer ) {
+						if ( isBot ) {
+							VectorCopy( es->pos.trBase, origin );
+							VectorCopy( es->pos.trDelta, velocity );
+						} else {
+							playerState_t *ps = SV_GameClientNum( es->number );
+							VectorCopy( ps->origin, origin );
+							VectorCopy( ps->velocity, velocity );
+						}
+					}
+
+					// Phase 2: resolve trajectory type
+					// Bots excluded from velocity prediction to avoid sawtooth artifacts
+					if ( isBot ) {
+						// Leave bot entity state untouched
+					} else if ( sv_smoothClients && sv_smoothClients->integer ) {
+						// TR_LINEAR mode
+						int velSmoothMs = ( sv_velSmooth && sv_velSmooth->integer > 0 ) ? sv_velSmooth->integer : 0;
+						vec3_t finalVel;
+						if ( velSmoothMs > 0 ) {
+							vec3_t avgVel;
+							if ( SV_SmoothGetAverageVelocity( es->number, velSmoothMs, avgVel ) ) {
+								VectorCopy( avgVel, finalVel );
+							} else {
+								VectorCopy( velocity, finalVel );
+							}
+						} else {
+							VectorCopy( velocity, finalVel );
+						}
+						if ( DotProduct( finalVel, finalVel ) > 100.0f ) {
+							VectorCopy( origin, es->pos.trBase );
+							VectorCopy( finalVel, es->pos.trDelta );
+							es->pos.trType = TR_LINEAR;
+							es->pos.trTime = sv.time;
+						} else {
+							// Idle: keep TR_INTERPOLATE but anchor position
+							VectorCopy( origin, es->pos.trBase );
+							VectorCopy( finalVel, es->pos.trDelta );
+						}
+					} else {
+						// TR_INTERPOLATE mode (real players, sv_extrapolate path)
+						if ( usedBuffer ) {
+							if ( DotProduct( velocity, velocity ) > 100.0f ) {
+								VectorCopy( origin, es->pos.trBase );
+								VectorCopy( velocity, es->pos.trDelta );
+							}
+						} else {
+							VectorCopy( origin, es->pos.trBase );
+							VectorCopy( velocity, es->pos.trDelta );
+						}
+					}
+				}
+			}
+
+			sf->ents[ i ] = &svs.snapshotEntities[ index ];
+		}
 	}
 }
 
@@ -688,6 +976,12 @@ Called by SV_SendClientSnapshot and SV_SendClientGameState
 */
 void SV_SendMessageToClient( msg_t *msg, client_t *client )
 {
+#ifdef USE_SERVER_DEMO
+	if ( client->demo_recording && !client->demo_waiting ) {
+		SVD_WriteDemoFile( client, msg );
+	}
+#endif
+
 	// record information about the message
 	client->frames[client->netchan.outgoingSequence & PACKET_MASK].messageSize = msg->cursize;
 	client->frames[client->netchan.outgoingSequence & PACKET_MASK].messageSent = svs.msgTime;

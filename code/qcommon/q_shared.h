@@ -26,17 +26,17 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 // q_shared.h -- included first by ALL program modules.
 // A user mod should never modify this file
 
-#define Q3_VERSION            "Q3 1.32e"
+#define Q3_VERSION            "FTWGL"
 #ifndef SVN_VERSION
   #define SVN_VERSION Q3_VERSION
 #endif
-#define CLIENT_WINDOW_TITLE   "Quake 3: Arena"
-#define CONSOLE_WINDOW_TITLE  "Quake 3 Console"
+#define CLIENT_WINDOW_TITLE   "FTWGL: Urban Terror"
+#define CONSOLE_WINDOW_TITLE  "FTWGL: UrT"
 // 1.32 released 7-10-2002
 
 //#define DEFAULT_GAME			"edawn"
 
-#define BASEGAME				"baseq3"
+#define BASEGAME				"q3ut4"
 #define BASEDEMO				"demoq3"
 #define BASETA					"missionpack"
 #define STEAMPATH_NAME			"Quake 3 Arena"
@@ -1119,6 +1119,21 @@ typedef enum {
 #define	SNAPFLAG_RATE_DELAYED	1
 #define	SNAPFLAG_NOT_ACTIVE		2	// snapshot used during connection and for zombies
 #define SNAPFLAG_SERVERCOUNT	4	// toggled every map_restart so transitions can be detected
+#ifdef USE_MV
+#define SNAPFLAG_MULTIVIEW		8	// this snapshot built from multiview stream
+#endif
+
+#ifdef USE_FTWGL
+#define USE_MV
+#define USE_MV_ZCMD
+#define MV_PROTOCOL_VERSION		1
+#endif
+
+#define GET_ABIT( byteArray, bitIndex ) ((byteArray)[ (bitIndex) / 8 ] & ( 1 << ( (bitIndex) & 7 ) ))
+#define SET_ABIT( byteArray, bitIndex ) (byteArray)[ (bitIndex) / 8 ] |= ( 1 << ( (bitIndex) & 7 ) )
+#ifndef PAD
+#define PAD(base, alignment)	(((base)+(alignment)-1) & ~((alignment)-1))
+#endif
 
 //
 // per-level limits

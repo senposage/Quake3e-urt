@@ -5,3 +5,8 @@ output/
 *.user
 cmake-*
 .idea
+UrbanTerror42_Source/
+.claud
+.git
+build/
+tmp/

@@ -22,6 +22,7 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 // sv_game.c -- interface to the game dll
 
 #include "server.h"
+#include "sv_antilag.h"
 
 #include "../botlib/botlib.h"
 
@@ -453,10 +454,12 @@ static intptr_t SV_GameSystemCalls( intptr_t *args ) {
 	case G_ENTITY_CONTACTCAPSULE:
 		return SV_EntityContact( VMA(1), VMA(2), VMA(3), /*int capsule*/ qtrue );
 	case G_TRACE:
-		SV_Trace( VMA(1), VMA(2), VMA(3), VMA(4), VMA(5), args[6], args[7], /*int capsule*/ qfalse );
+		if ( !SV_Antilag_InterceptTrace( VMA(1), VMA(2), VMA(3), VMA(4), VMA(5), args[6], args[7], qfalse ) )
+			SV_Trace( VMA(1), VMA(2), VMA(3), VMA(4), VMA(5), args[6], args[7], /*int capsule*/ qfalse );
 		return 0;
 	case G_TRACECAPSULE:
-		SV_Trace( VMA(1), VMA(2), VMA(3), VMA(4), VMA(5), args[6], args[7], /*int capsule*/ qtrue );
+		if ( !SV_Antilag_InterceptTrace( VMA(1), VMA(2), VMA(3), VMA(4), VMA(5), args[6], args[7], qtrue ) )
+			SV_Trace( VMA(1), VMA(2), VMA(3), VMA(4), VMA(5), args[6], args[7], /*int capsule*/ qtrue );
 		return 0;
 	case G_POINT_CONTENTS:
 		return SV_PointContents( VMA(1), args[2] );
@@ -973,6 +976,20 @@ static intptr_t SV_GameSystemCalls( intptr_t *args ) {
 	case G_TRAP_GETVALUE:
 		VM_CHECKBOUNDS( gvm, args[1], args[2] );
 		return SV_GetValue( VMA(1), args[2], VMA(3) );
+
+#ifdef USE_AUTH
+	case G_NET_STRINGTOADR:
+		return NET_StringToAdr( VMA(1), VMA(2), NA_IP );
+
+	case G_NET_SENDPACKET:
+		{
+			netadr_t addr;
+			const char *destination = VMA(4);
+			NET_StringToAdr( destination, &addr, NA_IP );
+			NET_SendPacket( args[1], args[2], VMA(3), &addr );
+		}
+		return 0;
+#endif
 
 	default:
 		Com_Error( ERR_DROP, "Bad game system trap: %ld", (long int) args[0] );

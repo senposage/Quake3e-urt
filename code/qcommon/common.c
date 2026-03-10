@@ -37,7 +37,11 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 
 #include "../client/keys.h"
 
+#ifdef USE_URT_DEMO
+const int demo_protocols[] = { 66, 67, OLD_PROTOCOL_VERSION, URT_PROTOCOL_VERSION, NEW_PROTOCOL_VERSION, 0 };
+#else
 const int demo_protocols[] = { 66, 67, OLD_PROTOCOL_VERSION, NEW_PROTOCOL_VERSION, 0 };
+#endif
 
 #define USE_MULTI_SEGMENT // allocate additional zone segments on demand
 
@@ -100,6 +104,7 @@ cvar_t  *sv_packetdelay;
 cvar_t	*com_sv_running;
 
 cvar_t	*com_cameraMode;
+cvar_t	*com_blood;
 #if defined(_WIN32) && defined(_DEBUG)
 cvar_t	*com_noErrorInterrupt;
 #endif
@@ -3052,6 +3057,17 @@ void Com_GameRestart( int checksumFeed, qboolean clientRestart )
 		Com_ExecuteCfg();
 
 #ifndef DEDICATED
+		// Re-acquire and sanitize dedicated cvar after config reload.
+		// Config may contain "seta dedicated 1" which would set
+		// latchedString and modified, causing Com_Frame to switch
+		// to dedicated mode and call CL_Shutdown.
+		com_dedicated = Cvar_Get( "dedicated", "0", CVAR_LATCH );
+		com_dedicated->flags &= ~( CVAR_USER_CREATED | CVAR_ARCHIVE );
+		Cvar_Set( "dedicated", "0" );
+		com_dedicated->modified = qfalse;
+#endif
+
+#ifndef DEDICATED
 		if ( clientRestart )
 			CL_StartHunkUsers();
 #endif
@@ -3848,11 +3864,20 @@ void Com_Init( char *commandLine ) {
 
 	// get dedicated here for proper hunk megs initialization
 #ifdef DEDICATED
-	com_dedicated = Cvar_Get( "dedicated", "1", CVAR_INIT );
+	com_dedicated = Cvar_Get( "dedicated", "1", CVAR_LATCH );
 	Cvar_CheckRange( com_dedicated, "1", "2", CV_INTEGER );
 #else
 	com_dedicated = Cvar_Get( "dedicated", "0", CVAR_LATCH );
 	Cvar_CheckRange( com_dedicated, "0", "2", CV_INTEGER );
+	// sanitize: config may have created this via "seta dedicated 1" before
+	// Cvar_Get, giving it CVAR_USER_CREATED (Cvar_Restart would unset it,
+	// leaving com_dedicated dangling) and CVAR_ARCHIVE (perpetual config
+	// pollution). Also fix resetString so Cvar_Restart resets to "0".
+	com_dedicated->flags &= ~( CVAR_USER_CREATED | CVAR_ARCHIVE );
+	if ( strcmp( com_dedicated->resetString, "0" ) != 0 ) {
+		Z_Free( com_dedicated->resetString );
+		com_dedicated->resetString = CopyString( "0" );
+	}
 #endif
 	Cvar_SetDescription( com_dedicated, "Enables dedicated server mode.\n 0: Listen server\n 1: Unlisted dedicated server \n 2: Listed dedicated server" );
 	// allocate the stack based hunk allocator
@@ -3866,10 +3891,10 @@ void Com_Init( char *commandLine ) {
 	// init commands and vars
 	//
 #ifndef DEDICATED
-	com_maxfps = Cvar_Get( "com_maxfps", "125", 0 ); // try to force that in some light way
+	com_maxfps = Cvar_Get( "com_maxfps", "125", CVAR_PROTECTED ); // try to force that in some light way
 	Cvar_CheckRange( com_maxfps, "0", "1000", CV_INTEGER );
 	Cvar_SetDescription( com_maxfps, "Sets maximum frames per second." );
-	com_maxfpsUnfocused = Cvar_Get( "com_maxfpsUnfocused", "60", CVAR_ARCHIVE_ND );
+	com_maxfpsUnfocused = Cvar_Get( "com_maxfpsUnfocused", "0", CVAR_ARCHIVE_ND );
 	Cvar_CheckRange( com_maxfpsUnfocused, "0", "1000", CV_INTEGER );
 	Cvar_SetDescription( com_maxfpsUnfocused, "Sets maximum frames per second in unfocused game window." );
 	com_yieldCPU = Cvar_Get( "com_yieldCPU", "1", CVAR_ARCHIVE_ND );
@@ -3883,7 +3908,7 @@ void Com_Init( char *commandLine ) {
 	com_affinityMask->modified = qfalse;
 #endif
 
-	// com_blood = Cvar_Get( "com_blood", "1", CVAR_ARCHIVE_ND );
+	com_blood = Cvar_Get( "com_blood", "1", CVAR_ARCHIVE_ND );
 
 	com_timescale = Cvar_Get( "timescale", "1", CVAR_CHEAT | CVAR_SYSTEMINFO );
 	Cvar_CheckRange( com_timescale, "0", NULL, CV_FLOAT );
@@ -3904,14 +3929,14 @@ void Com_Init( char *commandLine ) {
 	Cvar_SetDescription( com_timedemo, "When set to '1' times a demo and returns frames per second like a benchmark." );
 	cl_paused = Cvar_Get( "cl_paused", "0", CVAR_ROM );
 	Cvar_SetDescription( cl_paused, "Read-only CVAR to toggle functionality of paused games (the variable holds the status of the paused flag on the client side)." );
-	cl_packetdelay = Cvar_Get( "cl_packetdelay", "0", CVAR_CHEAT );
+	cl_packetdelay = Cvar_Get( "cl_packetdelay", "0", CVAR_TEMP );
 	Cvar_SetDescription( cl_packetdelay, "Artificially set the client's latency. Simulates packet delay, which can lead to packet loss." );
 	com_cl_running = Cvar_Get( "cl_running", "0", CVAR_ROM | CVAR_NOTABCOMPLETE );
 	Cvar_SetDescription( com_cl_running, "Can be used to check the status of the client game." );
 #endif
 
 	sv_paused = Cvar_Get( "sv_paused", "0", CVAR_ROM );
-	sv_packetdelay = Cvar_Get( "sv_packetdelay", "0", CVAR_CHEAT );
+	sv_packetdelay = Cvar_Get( "sv_packetdelay", "0", CVAR_TEMP );
 	Cvar_SetDescription( sv_packetdelay, "Simulates packet delay, which can lead to packet loss. Server side." );
 	com_sv_running = Cvar_Get( "sv_running", "0", CVAR_ROM | CVAR_NOTABCOMPLETE );
 	Cvar_SetDescription( com_sv_running, "Communicates to game modules if there is a server currently running." );
@@ -3988,6 +4013,11 @@ void Com_Init( char *commandLine ) {
 	SV_Init();
 
 	com_dedicated->modified = qfalse;
+#ifndef DEDICATED
+	// clear any latched "dedicated 1" from polluted config
+	Cvar_Set( "dedicated", "0" );
+	com_dedicated->modified = qfalse;
+#endif
 
 #ifndef DEDICATED
 	if ( !com_dedicated->integer ) {

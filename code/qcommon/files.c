@@ -4731,13 +4731,9 @@ static void FS_Startup( void ) {
 	fs_homepath = Cvar_Get( "fs_homepath", homePath, CVAR_INIT | CVAR_PROTECTED | CVAR_PRIVATE );
 	Cvar_SetDescription( fs_homepath, "Directory to store user configuration and downloaded files." );
 
-	fs_gamedirvar = Cvar_Get( "fs_game", "", CVAR_INIT | CVAR_SYSTEMINFO );
+	fs_gamedirvar = Cvar_Get( "fs_game", BASEGAME, CVAR_INIT | CVAR_SYSTEMINFO );
 	Cvar_CheckRange( fs_gamedirvar, NULL, NULL, CV_FSPATH );
 	Cvar_SetDescription( fs_gamedirvar, "Specify an alternate mod directory and run the game with this mod." );
-
-	if ( FS_IsBaseGame( fs_gamedirvar->string ) ) {
-		Cvar_ForceReset( "fs_game" );
-	}
 
 	fs_excludeReference = Cvar_Get( "fs_excludeReference", "", CVAR_ARCHIVE_ND | CVAR_LATCH );
 	Cvar_SetDescription( fs_excludeReference,
@@ -4837,9 +4833,11 @@ static void FS_Startup( void ) {
 	fs_gamedirvar->modified = qfalse; // We just loaded, it's not modified
 
 	// check original q3a files
+#if !defined(USE_FTWGL)
 	if ( FS_IsBaseGame( BASEGAME ) || FS_IsBaseGame( BASEDEMO ) ) {
 		FS_CheckIdPaks();
 	}
+#endif
 
 #ifdef FS_MISSING
 	if (missingFiles == NULL) {

@@ -60,6 +60,9 @@ typedef struct sfx_s {
 	char 			soundName[MAX_QPATH];
 	int				lastTimeUsed;
 	struct sfx_s	*next;
+#ifndef NO_DMAHD
+	qboolean		weaponsound;
+#endif
 } sfx_t;
 
 typedef struct {
@@ -93,14 +96,38 @@ typedef struct loopSound_s {
 	int			framenum;
 } loopSound_t;
 
+#ifndef NO_DMAHD
+typedef struct
+{
+	int			vol;			// Must be first member due to union (see channel_t)
+	int			offset;
+	int			bassvol;
+	int			bassoffset;
+	int			reverbvol;
+	int			reverboffset;
+} ch_side_t;
+#endif
+
 typedef struct
 {
 	int			allocTime;
 	int			startSample;	// START_SAMPLE_IMMEDIATE = set immediately on next mix
 	int			entnum;			// to allow overriding a specific sound
 	int			entchannel;		// to allow overriding a specific sound
+#ifndef NO_DMAHD
+	union {
+		int		leftvol;		// 0-255 volume after spatialization
+		ch_side_t l;
+	};
+	union {
+		int		rightvol;		// 0-255 volume after spatialization
+		ch_side_t r;
+	};
+	vec3_t		sodrot;
+#else
 	int			leftvol;		// 0-255 volume after spatialization
 	int			rightvol;		// 0-255 volume after spatialization
+#endif
 	int			master_vol;		// 0-255 volume before spatialization
 	float		dopplerScale;
 	float		oldDopplerScale;

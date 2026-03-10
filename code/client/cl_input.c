@@ -690,9 +690,12 @@ static qboolean CL_ReadyToSendPacket( void ) {
 		return qfalse;
 	}
 
-	// If we are downloading, we send no less than 50ms between packets
-	if ( *clc.downloadTempName && cls.realtime - clc.lastPacketSentTime < 50 ) {
-		return qfalse;
+	// If we are downloading, throttle packet rate to avoid flooding
+	{
+		int throttleMs = ( cl_adaptiveTiming->integer && cl.snapshotMsec > 0 ) ? cl.snapshotMsec : 50;
+		if ( *clc.downloadTempName && cls.realtime - clc.lastPacketSentTime < throttleMs ) {
+			return qfalse;
+		}
 	}
 
 	// if we don't have a valid gamestate yet, only send
@@ -857,6 +860,8 @@ void CL_WritePacket( int repeat ) {
 		CL_Netchan_Enqueue( &clc.netchan, &buf, repeat + 1 );
 		NET_FlushPacketQueue( 0 );
 	}
+
+	SCR_NetMonitorAddOutgoing( buf.cursize );
 }
 
 

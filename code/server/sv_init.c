@@ -21,6 +21,7 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 */
 
 #include "server.h"
+#include "sv_antilag.h"
 
 
 /*
@@ -468,6 +469,7 @@ void SV_SpawnServer( const char *mapname, qboolean killBots ) {
 
 	// initialize snapshot storage
 	SV_InitSnapshotStorage();
+	SV_SmoothInit();
 
 	// toggle the server bit so clients can detect that a
 	// server has changed
@@ -487,6 +489,8 @@ void SV_SpawnServer( const char *mapname, qboolean killBots ) {
 		}
 		if ( i == sv.maxclients ) {
 			sv.time = 0;
+			sv.gameTime = 0;
+			sv.gameTimeResidual = 0;
 		}
 	}
 
@@ -560,12 +564,19 @@ void SV_SpawnServer( const char *mapname, qboolean killBots ) {
 	for ( i = 0; i < 3; i++ ) {
 		Cbuf_Wait();
 		sv.time += 100;
-		VM_Call( gvm, 1, GAME_RUN_FRAME, sv.time );
-		SV_BotFrame( sv.time );
+		sv.gameTime += 100;
+		VM_Call( gvm, 1, GAME_RUN_FRAME, sv.gameTime );
+		SV_BotFrame( sv.gameTime );
 	}
 
 	// create a baseline for more efficient communications
 	SV_CreateBaseline();
+
+#ifdef USE_SERVER_DEMO
+	// stop server-side demo (if any)
+	if ( com_dedicated->integer )
+		Cbuf_ExecuteText( EXEC_NOW, "stopserverdemo all" );
+#endif
 
 	for ( i = 0; i < sv.maxclients; i++ ) {
 		// send the new gamestate to all connected clients
@@ -606,8 +617,9 @@ void SV_SpawnServer( const char *mapname, qboolean killBots ) {
 	// run another frame to allow things to look at all the players
 	Cbuf_Wait();
 	sv.time += 100;
-	VM_Call( gvm, 1, GAME_RUN_FRAME, sv.time );
-	SV_BotFrame( sv.time );
+	sv.gameTime += 100;
+	VM_Call( gvm, 1, GAME_RUN_FRAME, sv.gameTime );
+	SV_BotFrame( sv.gameTime );
 	svs.time += 100;
 
 	// we need to touch the cgame and ui qvm because they could be in
@@ -733,8 +745,8 @@ void SV_Init( void )
 	Cvar_CheckRange( sv_clientTLD, NULL, NULL, CV_INTEGER );
 	Cvar_SetDescription( sv_clientTLD, "Client country detection code." );
 
-	sv_minRate = Cvar_Get( "sv_minRate", "0", CVAR_ARCHIVE_ND | CVAR_SERVERINFO );
-	Cvar_SetDescription( sv_minRate, "Minimum server bandwidth (in bit per second) a client can use." );
+	sv_minRate = Cvar_Get( "sv_minRate", "500000", CVAR_ARCHIVE_ND | CVAR_SERVERINFO | CVAR_PROTECTED );
+	Cvar_SetDescription( sv_minRate, "Minimum server bandwidth (bps). Overrides QVM rate clamp." );
 	sv_maxRate = Cvar_Get( "sv_maxRate", "0", CVAR_ARCHIVE_ND | CVAR_SERVERINFO );
 	Cvar_SetDescription( sv_maxRate, "Maximum server bandwidth (in bit per second) a client can use." );
 	sv_dlRate = Cvar_Get( "sv_dlRate", "100", CVAR_ARCHIVE | CVAR_SERVERINFO );
@@ -759,9 +771,47 @@ void SV_Init( void )
 	Cvar_SetDescription( sv_rconPassword, "Password for remote server commands." );
 	sv_privatePassword = Cvar_Get ("sv_privatePassword", "", CVAR_TEMP );
 	Cvar_SetDescription( sv_privatePassword, "Set password for private clients to login with." );
-	sv_fps = Cvar_Get ("sv_fps", "20", CVAR_TEMP );
+	sv_fps = Cvar_Get ("sv_fps", "60", CVAR_TEMP | CVAR_PROTECTED | CVAR_SERVERINFO );
 	Cvar_CheckRange( sv_fps, "10", "125", CV_INTEGER );
-	Cvar_SetDescription( sv_fps, "Set the max frames per second the server sends the client." );
+	Cvar_SetDescription( sv_fps, "Engine tick rate (input sampling + snapshot dispatch rate)." );
+
+	sv_gameHz = Cvar_Get ("sv_gameHz", "0", CVAR_ARCHIVE | CVAR_SERVERINFO );
+	Cvar_SetDescription( sv_gameHz, "QVM GAME_RUN_FRAME rate. 0=match sv_fps. 20=legacy UT 4.0-4.2 mode." );
+
+	sv_snapshotFps = Cvar_Get ("sv_snapshotFps", "-1", CVAR_ARCHIVE | CVAR_SERVERINFO );
+	Cvar_SetDescription( sv_snapshotFps, "Max snapshot send rate. -1=match sv_fps." );
+
+	sv_busyWait = Cvar_Get ("sv_busyWait", "0", CVAR_ARCHIVE );
+	Cvar_SetDescription( sv_busyWait, "Spin last N ms before frame for precise timing at high sv_fps. Costs CPU." );
+
+	sv_pmoveMsec = Cvar_Get ("sv_pmoveMsec", "8", CVAR_ARCHIVE | CVAR_SERVERINFO );
+	Cvar_CheckRange( sv_pmoveMsec, "1", "33", CV_INTEGER );
+	Cvar_SetDescription( sv_pmoveMsec, "Max physics step size (ms). Enforces consistent movement." );
+
+	sv_smoothClients = Cvar_Get ("sv_smoothClients", "1", CVAR_ARCHIVE );
+	Cvar_SetDescription( sv_smoothClients, "TR_LINEAR trajectory for smoother client rendering between snapshots." );
+
+	sv_antiwarp = Cvar_Get ("sv_antiwarp", "0", CVAR_ARCHIVE );
+	Cvar_SetDescription( sv_antiwarp, "Engine-side antiwarp. 0=off, 1=constant (QVM-style), 2=decay (recommended)." );
+
+	sv_antiwarpTol = Cvar_Get ("sv_antiwarpTol", "0", CVAR_ARCHIVE );
+	Cvar_SetDescription( sv_antiwarpTol, "Antiwarp tolerance (ms) before injection starts. 0=auto=gameMsec." );
+
+	sv_antiwarpExtra = Cvar_Get ("sv_antiwarpExtra", "0", CVAR_ARCHIVE );
+	Cvar_SetDescription( sv_antiwarpExtra, "Extrapolation window (ms) for mode 2 before decay. 0=auto=awTol." );
+
+	sv_antiwarpDecay = Cvar_Get ("sv_antiwarpDecay", "150", CVAR_ARCHIVE );
+	Cvar_SetDescription( sv_antiwarpDecay, "Decay duration (ms) for mode 2. Inputs linearly fade to zero." );
+
+	sv_bufferMs = Cvar_Get ("sv_bufferMs", "0", CVAR_ARCHIVE );
+	Cvar_SetDescription( sv_bufferMs, "Position delay (ms) via ring buffer. 0=off, <0=auto (one snapshot interval)." );
+
+	sv_velSmooth = Cvar_Get ("sv_velSmooth", "32", CVAR_ARCHIVE );
+	Cvar_SetDescription( sv_velSmooth, "Velocity smoothing window (ms). Averages velocity over this window for TR_LINEAR. 0=off." );
+
+	sv_extrapolate = Cvar_Get ("sv_extrapolate", "0", CVAR_ARCHIVE );
+	Cvar_SetDescription( sv_extrapolate, "Legacy position prediction. 0=off." );
+
 	sv_timeout = Cvar_Get( "sv_timeout", "200", CVAR_TEMP );
 	Cvar_CheckRange( sv_timeout, "4", NULL, CV_INTEGER );
 	Cvar_SetDescription( sv_timeout, "Seconds without any message before automatic client disconnect." );
@@ -795,6 +845,21 @@ void SV_Init( void )
 	sv_lanForceRate = Cvar_Get( "sv_lanForceRate", "1", CVAR_ARCHIVE_ND );
 	Cvar_SetDescription( sv_lanForceRate, "Forces LAN clients to the maximum rate instead of accepting client setting." );
 
+#ifdef USE_AUTH
+	sv_authServerIP = Cvar_Get( "sv_authServerIP", "", CVAR_TEMP | CVAR_ROM );
+	sv_auth_engine = Cvar_Get( "sv_auth_engine", "1", CVAR_ROM );
+#endif
+
+#ifdef USE_SERVER_DEMO
+	sv_demonotice = Cvar_Get( "sv_demonotice", "", CVAR_ARCHIVE );
+	sv_demofolder = Cvar_Get( "sv_demofolder", "serverdemos", CVAR_ARCHIVE );
+#endif
+
+#ifdef USE_MV
+	sv_mvClients = Cvar_Get( "sv_mvClients", "0", 0 );
+	sv_mvPassword = Cvar_Get( "sv_mvPassword", "", 0 );
+#endif
+
 #ifdef USE_BANS
 	sv_banFile = Cvar_Get("sv_banFile", "serverbans.dat", CVAR_ARCHIVE);
 	Cvar_SetDescription( sv_banFile, "Name of the file that is used for storing the server bans." );
@@ -822,9 +887,21 @@ void SV_Init( void )
 	Cvar_SetGroup( sv_minRate, CVG_SERVER );
 	Cvar_SetGroup( sv_maxRate, CVG_SERVER );
 	Cvar_SetGroup( sv_fps, CVG_SERVER );
+	Cvar_SetGroup( sv_gameHz, CVG_SERVER );
+	Cvar_SetGroup( sv_snapshotFps, CVG_SERVER );
+	Cvar_SetGroup( sv_antiwarp, CVG_SERVER );
+	Cvar_SetGroup( sv_antiwarpTol, CVG_SERVER );
+	Cvar_SetGroup( sv_antiwarpExtra, CVG_SERVER );
+	Cvar_SetGroup( sv_antiwarpDecay, CVG_SERVER );
+	Cvar_SetGroup( sv_smoothClients, CVG_SERVER );
+	Cvar_SetGroup( sv_bufferMs, CVG_SERVER );
+	Cvar_SetGroup( sv_velSmooth, CVG_SERVER );
+	Cvar_SetGroup( sv_extrapolate, CVG_SERVER );
 
 	// force initial check
 	SV_TrackCvarChanges();
+
+	SV_Antilag_Init();
 
 	SV_InitChallenger();
 }
@@ -879,6 +956,11 @@ void SV_Shutdown( const char *finalmsg ) {
 	}
 
 	Com_Printf( "----- Server Shutdown (%s) -----\n", finalmsg );
+
+#ifdef USE_SERVER_DEMO
+	if ( com_dedicated->integer )
+		Cbuf_ExecuteText( EXEC_NOW, "stopserverdemo all" );
+#endif
 
 #ifdef USE_IPV6
 	NET_LeaveMulticast6();

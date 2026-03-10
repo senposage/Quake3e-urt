@@ -35,6 +35,13 @@ static const char *svc_strings[] = {
 	"svc_EOF",
 	"svc_voipSpeex", // ioq3 extension
 	"svc_voipOpus",  // ioq3 extension
+#ifdef USE_MV
+	NULL, NULL, NULL, NULL, NULL,
+	"svc_multiview",
+#ifdef USE_MV_ZCMD
+	"svc_zcmd",
+#endif
+#endif
 };
 
 static void SHOWNET( msg_t *msg, const char *s ) {
@@ -300,6 +307,28 @@ static void CL_ParseSnapshot( msg_t *msg ) {
 		cl.snapshots[ ( oldMessageNum + i ) & PACKET_MASK ].valid = qfalse;
 	}
 
+	// measure snapshot interval for adaptive time management (before overwriting cl.snap)
+	if ( cl.snap.valid && newSnap.serverTime > cl.snap.serverTime ) {
+		int measured = newSnap.serverTime - cl.snap.serverTime;
+		int maxMeasured = cl.snapshotMsec > 0 ? cl.snapshotMsec * 4 : 200;
+		if ( measured >= 1 && measured <= maxMeasured ) {
+			if ( cl.snapshotMsec == 0 ) {
+				cl.snapshotMsec = measured;
+			} else {
+				cl.snapshotMsec = ( cl.snapshotMsec * 3 + measured ) >> 2; // EMA 75/25
+			}
+			if ( cl.snapshotMsec < 8 ) cl.snapshotMsec = 8;
+			if ( cl.snapshotMsec > 100 ) cl.snapshotMsec = 100;
+		}
+		if ( cl.snapshotMsec > 0 ) {
+			SCR_NetMonitorAddSnapInterval( measured, cl.snapshotMsec );
+			if ( measured > cl.snapshotMsec + cl.snapshotMsec / 2 )
+				SCR_LogSnapLate( measured, cl.snapshotMsec );
+		}
+	}
+	if ( cl.snapshotMsec == 0 )
+		cl.snapshotMsec = 50; // default to 20Hz until first measurement
+
 	// copy to the current good spot
 	cl.snap = newSnap;
 	cl.snap.ping = 999;
@@ -313,6 +342,34 @@ static void CL_ParseSnapshot( msg_t *msg ) {
 	}
 	// save the frame off in the backup array for later delta comparisons
 	cl.snapshots[cl.snap.messageNum & PACKET_MASK] = cl.snap;
+
+	SCR_NetMonitorAddPing( cl.snap.ping );
+
+	if ( cl.snap.snapFlags & SNAPFLAG_RATE_DELAYED )
+		SCR_NetMonitorAddChoke();
+
+	// Log a PING JITTER event when an alternating +N/-N pattern is confirmed
+	if ( cl.snap.ping < 999 ) {
+		static int prevPing       = -1;
+		static int prevJitterDir  = 0;
+		static int prevJitterMsgNum = 0;
+		if ( prevPing > 0 ) {
+			int delta    = cl.snap.ping - prevPing;
+			int absDelta = delta < 0 ? -delta : delta;
+			int thresh   = cl.snapshotMsec / 2;
+			if ( thresh < 10 ) thresh = 10;
+			if ( absDelta >= thresh ) {
+				int dir = ( delta > 0 ) ? 1 : -1;
+				if ( prevJitterDir != 0 && dir != prevJitterDir
+				     && ( cl.snap.messageNum - prevJitterMsgNum ) <= 3 ) {
+					SCR_LogPingJitter( cl.snap.ping, prevPing );
+				}
+				prevJitterDir    = dir;
+				prevJitterMsgNum = cl.snap.messageNum;
+			}
+		}
+		prevPing = cl.snap.ping;
+	}
 
 	if (cl_shownet->integer == 3) {
 		Com_Printf( "   snapshot:%i  delta:%i  ping:%i\n", cl.snap.messageNum,
@@ -489,6 +546,20 @@ static void CL_ParseServerInfo( void )
 	len = strlen( clc.sv_dlURL );
 	if ( len > 0 &&  clc.sv_dlURL[len-1] == '/' )
 		clc.sv_dlURL[len-1] = '\0';
+
+	// Pre-seed cl.snapshotMsec from server's sv_fps (via SERVERINFO)
+	// so adaptive timing thresholds are reasonable before the first EMA
+	{
+		const char *svFpsStr = Info_ValueForKey( serverInfo, "sv_fps" );
+		if ( svFpsStr[0] ) {
+			int svFps = atoi( svFpsStr );
+			if ( svFps >= 10 && svFps <= 125 ) {
+				cl.snapshotMsec = 1000 / svFps;
+				if ( cl.snapshotMsec < 8 ) cl.snapshotMsec = 8;
+				if ( cl.snapshotMsec > 100 ) cl.snapshotMsec = 100;
+			}
+		}
+	}
 }
 
 
@@ -827,6 +898,61 @@ static void CL_ParseCommandString( msg_t *msg ) {
 }
 
 
+#if defined( USE_MV ) && defined( USE_MV_ZCMD )
+/*
+=====================
+CL_ParseZCommandString
+=====================
+*/
+static void CL_ParseZCommandString( msg_t *msg ) {
+	static lzctx_t ctx;
+	int		deltaSeq;
+	int		textbits;
+	int		seq_size;
+	int		seq;
+
+	deltaSeq = MSG_ReadBits( msg, 3 );
+	textbits = MSG_ReadBits( msg, 1 ) + 7;
+	seq_size = MSG_ReadBits( msg, 2 ) + 1;
+	seq = MSG_ReadBits( msg, seq_size * 8 );
+
+	if ( MSG_ReadBits( msg, 1 ) != 0 ) {
+		Com_Error( ERR_DROP, "zcmd: bad control bit" );
+	}
+
+	if ( seq <= clc.serverCommandSequence ) {
+		if ( deltaSeq == 0 && clc.zexpectDeltaSeq == 0 ) {
+			Com_Error( ERR_DROP, "zcmd: already stored uncompressed %i", seq );
+		}
+		LZSS_SeekEOS( msg, textbits );
+		return;
+	}
+
+	if ( deltaSeq == 0 ) {
+		LZSS_InitContext( &ctx );
+		clc.zexpectDeltaSeq = 1;
+	} else {
+		if ( deltaSeq != clc.zexpectDeltaSeq ) {
+			LZSS_SeekEOS( msg, textbits );
+			return;
+		}
+		if ( seq != clc.serverCommandSequence + 1 ) {
+			LZSS_SeekEOS( msg, textbits );
+			return;
+		}
+		if ( clc.zexpectDeltaSeq >= 7 )
+			clc.zexpectDeltaSeq = 1;
+		else
+			clc.zexpectDeltaSeq++;
+	}
+
+	LZSS_Expand( &ctx, msg, (byte *)clc.serverCommands[ seq & (MAX_RELIABLE_COMMANDS-1) ], MAX_STRING_CHARS, textbits );
+	clc.serverCommandSequence = seq;
+	clc.eventMask |= EM_COMMAND;
+}
+#endif
+
+
 /*
 =====================
 CL_ParseServerMessage
@@ -834,6 +960,9 @@ CL_ParseServerMessage
 */
 void CL_ParseServerMessage( msg_t *msg ) {
 	int cmd;
+
+	/* track raw incoming bytes and any dropped packets for the net monitor */
+	SCR_NetMonitorAddIncoming( msg->cursize, clc.netchan.dropped );
 
 	if ( cl_shownet->integer == 1 ) {
 		Com_Printf( "%i ",msg->cursize );
@@ -903,6 +1032,16 @@ void CL_ParseServerMessage( msg_t *msg ) {
 				return;
 			CL_ParseDownload( msg );
 			break;
+#ifdef USE_MV
+		case svc_multiview:
+			CL_ParseSnapshot( msg );
+			break;
+#if defined( USE_MV_ZCMD )
+		case svc_zcmd:
+			CL_ParseZCommandString( msg );
+			break;
+#endif
+#endif
 		case svc_voipSpeex: // ioq3 extension
 			clc.dm68compat = qfalse;
 #ifdef USE_VOIP

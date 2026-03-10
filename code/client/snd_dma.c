@@ -32,9 +32,10 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 #include "snd_local.h"
 #include "snd_codec.h"
 #include "client.h"
+#include "snd_dmahd.h"
 
 static void S_Update_( int msec );
-static void S_UpdateBackgroundTrack( void );
+void S_UpdateBackgroundTrack( void );
 static void S_Base_StopAllSounds( void );
 static void S_Base_StopBackgroundTrack( void );
 static void S_memoryLoad( sfx_t *sfx );
@@ -63,12 +64,12 @@ channel_t   s_channels[MAX_CHANNELS];
 channel_t   loop_channels[MAX_CHANNELS];
 int			numLoopChannels;
 
-static		qboolean	s_soundStarted;
-static		qboolean	s_soundMuted;
+qboolean	s_soundStarted;
+qboolean	s_soundMuted;
 
 dma_t		dma;
 
-static int			listener_number;
+int			listener_number;
 static vec3_t		listener_origin;
 static vec3_t		listener_axis[3];
 
@@ -78,8 +79,8 @@ int   		s_paintedtime; 		// sample PAIRS
 // MAX_SFX may be larger than MAX_SOUNDS because
 // of custom player sounds
 #define MAX_SFX			4096
-static sfx_t s_knownSfx[MAX_SFX];
-static int s_numSfx = 0;
+sfx_t		s_knownSfx[MAX_SFX];
+int			s_numSfx = 0;
 
 #define LOOP_HASH		128
 static sfx_t *sfxHash[LOOP_HASH];
@@ -87,13 +88,13 @@ static sfx_t *sfxHash[LOOP_HASH];
 cvar_t		*s_testsound;
 cvar_t		*s_khz;
 cvar_t		*s_show;
-static cvar_t *s_mixahead;
+cvar_t		*s_mixahead;
 static cvar_t *s_mixOffset;
 #if defined(__linux__) && !defined(USE_SDL)
 cvar_t		*s_device;
 #endif
 
-static loopSound_t	loopSounds[MAX_GENTITIES];
+loopSound_t	loopSounds[MAX_GENTITIES];
 static	channel_t	*freelist = NULL;
 
 int			s_rawend;
@@ -1067,7 +1068,7 @@ S_ScanChannelStarts
 Returns qtrue if any new sounds were started since the last mix
 ========================
 */
-static qboolean S_ScanChannelStarts( void ) {
+qboolean S_ScanChannelStarts( void ) {
 	channel_t		*ch;
 	int				i;
 	qboolean		newSamples;
@@ -1136,7 +1137,7 @@ static void S_Base_Update( int msec ) {
 }
 
 
-static void S_GetSoundtime( void )
+void S_GetSoundtime( void )
 {
 	int		samplepos;
 	static	int		buffers;
@@ -1328,7 +1329,7 @@ static void S_Base_StartBackgroundTrack( const char *intro, const char *loop ){
 S_UpdateBackgroundTrack
 ======================
 */
-static void S_UpdateBackgroundTrack( void ) {
+void S_UpdateBackgroundTrack( void ) {
 	int		bufferSamples;
 	int		fileSamples;
 	byte	raw[30000];		// just enough to fit in a mac stack frame
@@ -1481,7 +1482,11 @@ qboolean S_Base_Init( soundInterface_t *si ) {
 		return qfalse;
 	}
 
+#ifndef NO_DMAHD
+	s_khz = Cvar_Get( "s_khz", "44", CVAR_ARCHIVE_ND | CVAR_LATCH );
+#else
 	s_khz = Cvar_Get( "s_khz", "22", CVAR_ARCHIVE_ND | CVAR_LATCH );
+#endif
 	Cvar_CheckRange( s_khz, "0", "48", CV_INTEGER );
 	Cvar_SetDescription( s_khz, "Specifies the sound sampling rate, (8, 11, 22, 44, 48) in kHz. Default value is 22." );
 
@@ -1564,6 +1569,11 @@ qboolean S_Base_Init( soundInterface_t *si ) {
 	si->ClearSoundBuffer = S_Base_ClearSoundBuffer;
 	si->SoundInfo = S_Base_SoundInfo;
 	si->SoundList = S_Base_SoundList;
+
+#ifndef NO_DMAHD
+	if ( dmaHD_Enabled() )
+		return dmaHD_Init( si );
+#endif
 
 	return qtrue;
 }
