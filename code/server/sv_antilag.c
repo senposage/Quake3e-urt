@@ -87,6 +87,20 @@ static void SV_Antilag_ComputeConfig( void ) {
 
     if ( fps < 1 ) fps = 1;
 
+    // Shadow tick rate equals sv_fps — not sv_fps * sv_physicsScale.
+    //
+    // SV_Antilag_RecordPositions() is called exactly once per engine tick,
+    // so positions are captured at sv_fps Hz regardless of how many pmove
+    // sub-steps sv_physicsScale adds within that tick.  Clients also only
+    // receive snapshots at sv_fps Hz, meaning the finest position granularity
+    // a shooter ever saw is one sv_fps frame.
+    //
+    // Configuring sv_shadowTickMs as (1000 / (fps * physicsScale)) would
+    // make the interpolation logic assume entries are spaced closer together
+    // than they actually are, producing wrong rewind positions.  At sv_fps 60
+    // (16.7 ms/tick) or sv_fps 125 (8 ms/tick) the sampling is already fine
+    // enough that interpolation error is well under one frame — there is no
+    // tangible benefit to going finer.
     sv_shadowTickMs = 1000 / fps;
     if ( sv_shadowTickMs < 1 ) sv_shadowTickMs = 1;
 
@@ -344,9 +358,8 @@ void SV_Antilag_RecordPositions( void ) {
         int currentFps = sv_fps ? sv_fps->integer : 40;
         qboolean fpsChanged = ( currentFps != sv_antilag_lastFpsValue );
 
-        if ( sv_physicsScale->modified || sv_antilagMaxMs->modified || fpsChanged ) {
+        if ( sv_antilagMaxMs->modified || fpsChanged ) {
             SV_Antilag_ComputeConfig();
-            sv_physicsScale->modified = qfalse;
             sv_antilagMaxMs->modified = qfalse;
             sv_antilag_lastFpsValue = currentFps;
             Com_Memset( sv_shadowHistory, 0, sizeof( sv_shadowHistory ) );
