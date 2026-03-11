@@ -14,7 +14,7 @@
 7. [sv_game.c — QVM Game Interface](#sv_gamec--qvm-game-interface)
 8. [sv_world.c — Entity Spatial Index](#sv_worldc--entity-spatial-index)
 9. [sv_ccmds.c — Server Console Commands [CUSTOM]](#sv_ccmdsc--server-console-commands-custom)
-9a. [FTWGL Server Additions [CUSTOM/FTWGL]](#ftwgl-server-additions-customftwgl)
+9a. [URT Server Additions [CUSTOM/URT]](#urt-server-additions-customurt)
 10. [sv_bot.c — Bot Integration](#sv_botc--bot-integration)
 11. [sv_net_chan.c — Server Netchan](#sv_net_chanc--server-netchan)
 12. [sv_filter.c — IP Filter/Ban System](#sv_filterc--ip-filterban-system)
@@ -22,7 +22,7 @@
 14. [Key Data Structures (server.h)](#key-data-structures-serverh)
 15. [All Server Cvars](#all-server-cvars)
 16. [Complete Call Graph — Server Tick](#complete-call-graph--server-tick)
-17. [Auth and Demo Cvars [FTWGL]](#auth-and-demo-cvars-ftwgl)
+17. [Auth and Demo Cvars [URT]](#auth-and-demo-cvars-urt)
 
 ---
 
@@ -720,7 +720,7 @@ SV_RestartGameProgs();
 
 ---
 
-## FTWGL Server Additions [CUSTOM/FTWGL]
+## URT Server Additions [CUSTOM/URT]
 
 These additions are all guarded by compile-time flags and integrate UrbanTerror-specific server functionality.
 
@@ -822,7 +822,7 @@ Sends `clientScreenshot [filename]` as a reliable server command to the specifie
 | `stopserverdemo [client\|all]` | `SV_StopServerDemo_f()` | Stop server-side demo recording |
 | `clientScreenshot <clientNum>` | `SV_ClientScreenshot_f()` | Request screenshot from client |
 
-### Auth and Demo Cvars [FTWGL]
+### Auth and Demo Cvars [URT]
 
 #### Auth Cvars (sv_init.c, USE_AUTH)
 
@@ -991,7 +991,7 @@ typedef struct client_s {
     netchan_t      netchan;          // netchan.remoteAddress.type == NA_BOT for bots
     clientSnapshot_t frames[PACKET_BACKUP]; // snapshot history for delta
     // ... download state, flood protection ...
-    // FTWGL additions:
+    // URT additions:
     // #ifdef USE_AUTH:    auth[MAX_NAME_LENGTH]
     // #ifdef USE_SERVER_DEMO: demo_recording, demo_file, demo_waiting, demo_backoff, demo_deltas
 } client_t;

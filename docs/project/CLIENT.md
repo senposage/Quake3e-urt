@@ -64,7 +64,7 @@ CL_Init:
   Cmd_AddCommand()          ← connect, disconnect, demo, record, etc.
 ```
 
-  [FTWGL cvar defaults]:
+  [URT cvar defaults]:
     rate          "90000"        (upstream: 25000)
     snaps         "60" + CVAR_PROTECTED  (upstream: 40, unprotected)
     cl_timeNudge  CVAR_PROTECTED (upstream: CVAR_TEMP)
@@ -439,7 +439,7 @@ if (*clc.downloadTempName && cls.realtime - clc.lastPacketSentTime < throttleMs)
 
 ---
 
-## FTWGL Client Additions [CUSTOM/FTWGL]
+## URT Client Additions [CUSTOM/URT]
 
 ### Auth System (cl_main.c, client.h) [USE_AUTH]
 
@@ -814,7 +814,7 @@ typedef struct {
 } clientConnection_t;
 ```
 
-#### FTWGL client.h additions
+#### URT client.h additions
 
 ```c
 // USE_AUTH additions to serverInfo_t:

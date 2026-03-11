@@ -1,10 +1,10 @@
-# FTWGL Engine — Full Engine Overview
+# Quake3e-urt — Full Engine Overview
 
 > **How to use this documentation:** Start here to find which file owns any piece of functionality, then follow the link to the relevant section doc for detailed function listings, data structures, and interaction notes.
 >
 > **Custom changes** made in this fork are marked **[CUSTOM]**. Everything else is stock Quake3e / ioquake3.
 >
-> **FTWGL-specific changes** (UrbanTerror integration features) are marked **[FTWGL]** and guarded by compile-time flags: `USE_AUTH`, `USE_FTWGL`, `USE_SERVER_DEMO`, `USE_URT_DEMO`, `NO_DMAHD`.
+> **UrbanTerror integration features** (partially derived from FTWGL) are marked **[URT]** and guarded by compile-time flags: `USE_AUTH`, `USE_FTWGL`, `USE_SERVER_DEMO`, `USE_URT_DEMO`, `NO_DMAHD`.
 
 ---
 
@@ -29,37 +29,37 @@ code/
 │   ├── cm_trace.c    ← Ray/box/capsule trace engine
 │   ├── cm_patch.c    ← Curved-surface patch collision
 │   ├── cm_test.c     ← Point-in-solid tests, area portals
-│   ├── q_shared.c/h  ← [FTWGL] Shared types: FTWGL version string, BASEGAME, window titles
+│   ├── q_shared.c/h  ← [URT] Shared types: FTWGL version string, BASEGAME, window titles
 │   ├── q_math.c      ← Trigonometry, vector ops, matrix ops
-│   ├── qcommon.h     ← [FTWGL] URT_PROTOCOL_VERSION=70, URTDEMOEXT, cvar defaults
+│   ├── qcommon.h     ← [URT] URT_PROTOCOL_VERSION=70, URTDEMOEXT, cvar defaults
 │   ├── huffman.c     ← Huffman compression for network packets
 │   ├── md4.c/md5.c   ← Hash functions (pak checksums, auth)
 │   └── unzip.c       ← Zlib/deflate for PK3 file reading
 │
 ├── server/           ← Dedicated / listen server
 │   ├── sv_main.c     ← [CUSTOM] Frame loop, sv_fps/sv_gameHz decoupling
-│   ├── sv_init.c     ← [CUSTOM][FTWGL] Cvar registration (subtick + auth cvars)
-│   ├── sv_client.c   ← [CUSTOM][FTWGL] Usercmd handling, multi-step Pmove, auth drop
+│   ├── sv_init.c     ← [CUSTOM][URT] Cvar registration (subtick + auth cvars)
+│   ├── sv_client.c   ← [CUSTOM][URT] Usercmd handling, multi-step Pmove, auth drop
 │   ├── sv_snapshot.c ← [CUSTOM] Snapshot building, position extrapolation
 │   ├── sv_antilag.c  ← [CUSTOM] Engine-side shadow antilag (new file)
 │   ├── sv_antilag.h  ← [CUSTOM] Antilag public API (new file)
 │   ├── sv_game.c     ← QVM game syscall handler (G_TRACE intercept)
 │   ├── sv_world.c    ← Entity world sectors, SV_Trace, SV_LinkEntity
-│   ├── sv_ccmds.c    ← [CUSTOM][FTWGL] Server console commands, server demo, clientScreenshot
+│   ├── sv_ccmds.c    ← [CUSTOM][URT] Server console commands, server demo, clientScreenshot
 │   ├── sv_bot.c      ← Bot integration with server
 │   ├── sv_net_chan.c ← Server-side netchan encode/decode
 │   ├── sv_filter.c   ← IP ban/filter system
 │   ├── sv_rankings.c ← Rankings / statistics tracking
-│   └── server.h      ← [CUSTOM][FTWGL] Server-internal types: auth field, demo fields
+│   └── server.h      ← [CUSTOM][URT] Server-internal types: auth field, demo fields
 │
 ├── client/           ← Client (renders, input, network, sound)
-│   ├── cl_main.c     ← [FTWGL] Connection, URT demo recording, auth, cvar defaults
+│   ├── cl_main.c     ← [URT] Connection, URT demo recording, auth, cvar defaults
 │   ├── cl_input.c    ← [CUSTOM] Key→usercmd, mouse, download pacing
-│   ├── cl_cgame.c    ← [CUSTOM][FTWGL] cgame QVM interface, time sync, cvar intercept, screenshot
+│   ├── cl_cgame.c    ← [CUSTOM][URT] cgame QVM interface, time sync, cvar intercept, screenshot
 │   ├── cl_parse.c    ← [CUSTOM] Network message parser, snapshot interval EMA
 │   ├── cl_console.c  ← In-game console rendering and history
 │   ├── cl_keys.c     ← Key binding management
-│   ├── cl_scrn.c     ← [FTWGL] Screen layout, net monitor widget (cl_netgraph)
+│   ├── cl_scrn.c     ← [URT] Screen layout, net monitor widget (cl_netgraph)
 │   ├── cl_ui.c       ← UI QVM interface
 │   ├── cl_cin.c      ← Cinematic video (RoQ decoder)
 │   ├── cl_jpeg.c     ← JPEG screenshot writer
@@ -67,17 +67,17 @@ code/
 │   ├── cl_net_chan.c  ← Client-side netchan (decode, demo filtering)
 │   ├── cl_curl.c/h   ← HTTP download support (libcurl integration)
 │   ├── snd_main.c    ← Sound system dispatcher (picks DMA or HD backend)
-│   ├── snd_dma.c     ← [FTWGL] Base PCM DMA sound backend (dmaHD integration hooks)
-│   ├── snd_dmahd.c   ← [FTWGL] HRTF/spatial HD sound backend (new file, guarded by NO_DMAHD)
-│   ├── snd_dmahd.h   ← [FTWGL] dmaHD public API (new file)
-│   ├── snd_local.h   ← [FTWGL] ch_side_t struct, channel_t union, sfx_t weaponsound
-│   ├── snd_mem.c     ← [FTWGL] Sound data loading (dmaHD memory + intercept)
+│   ├── snd_dma.c     ← [URT] Base PCM DMA sound backend (dmaHD integration hooks)
+│   ├── snd_dmahd.c   ← [URT] HRTF/spatial HD sound backend (new file, guarded by NO_DMAHD)
+│   ├── snd_dmahd.h   ← [URT] dmaHD public API (new file)
+│   ├── snd_local.h   ← [URT] ch_side_t struct, channel_t union, sfx_t weaponsound
+│   ├── snd_mem.c     ← [URT] Sound data loading (dmaHD memory + intercept)
 │   ├── snd_mix.c     ← Audio sample mixing
 │   ├── snd_adpcm.c   ← ADPCM codec
 │   ├── snd_codec.c   ← Sound codec dispatcher
 │   ├── snd_codec_wav.c ← WAV file codec
 │   ├── snd_wavelet.c ← Wavelet codec (Quake 3 .wav format variant)
-│   └── client.h      ← [CUSTOM][FTWGL] clientActive_t: snapshotMsec, auth cvars, demoprotocol
+│   └── client.h      ← [CUSTOM][URT] clientActive_t: snapshotMsec, auth cvars, demoprotocol
 │
 ├── renderer/         ← OpenGL renderer (legacy/fallback)
 │   └── ... (unchanged from stock Quake3e)
@@ -97,10 +97,10 @@ code/
 │   └── cg_public.h   ← Engine→cgame (CG_* syscall IDs, cgame entry points)
 │
 ├── ui/
-│   └── ui_public.h   ← [FTWGL] Engine→UI module: UI_AUTHSERVER_PACKET added
+│   └── ui_public.h   ← [URT] Engine→UI module: UI_AUTHSERVER_PACKET added
 │
 ├── unix/             ← Linux/Unix platform layer
-├── win32/            ← [FTWGL] Windows platform layer: win_snd.c WASAPI/dmaHD compat
+├── win32/            ← [URT] Windows platform layer: win_snd.c WASAPI/dmaHD compat
 └── sdl/              ← SDL2 platform layer (input, window, audio)
 ```
 
@@ -108,7 +108,7 @@ code/
 
 ## Compile-Time Feature Flags
 
-The FTWGL branch adds several opt-in feature flags:
+The re-impla branch adds several opt-in feature flags:
 
 | Flag | Default | Enables |
 |------|---------|---------|
@@ -159,14 +159,14 @@ main() → Com_Init(commandLine)
   Com_InitHunkMemory()     ← hunk allocator
   Cvar_Init()              ← cvar hash table
   Cmd_Init()               ← command table, built-in commands
-  FS_InitFilesystem()      ← PAK/PK3 search paths (BASEGAME="q3ut4") [FTWGL]
+  FS_InitFilesystem()      ← PAK/PK3 search paths (BASEGAME="q3ut4") [URT]
   NET_Init()               ← sockets
   Netchan_Init()           ← channel layer
   VM_Init()                ← QVM dispatch setup
   SV_Init()                ← server cvars, antilag init [CUSTOM]
-                           ← auth cvars if USE_AUTH [FTWGL]
+                           ← auth cvars if USE_AUTH [URT]
   CL_Init()                ← client cvars, renderer, sound, UI
-                           ← auth cvars, net monitor cvars if USE_FTWGL [FTWGL]
+                           ← auth cvars, net monitor cvars if USE_FTWGL [URT]
 
 Com_Frame() loop (called by Sys_ConsoleInputEvent / main loop)
   CL_Frame(msec)           ← input, time sync, cgame, renderer
@@ -232,7 +232,7 @@ All engine changes relative to stock Quake3e, organized by phase:
 | `client/cl_input.c` | Download pacing uses snapshotMsec instead of hardcoded 50ms |
 | `qcommon/net_ip.c` | net_dropsim changed CVAR_TEMP → CVAR_CHEAT |
 
-### FTWGL / Urban Terror Integration (Phases 11–17)
+### URT / Urban Terror Integration (Phases 11–17)
 
 | File | Change | Guard |
 |------|--------|-------|
