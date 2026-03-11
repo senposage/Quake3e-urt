@@ -190,6 +190,7 @@ Com_Frame() loop (called by Sys_ConsoleInputEvent / main loop)
 | `BOTLIB.md` | AAS pathfinding, AI behaviors, elementary actions |
 | `GAME_INTERFACES.md` | QVM syscall tables: g_public.h, cg_public.h, bg_public.h |
 | `SV_GAMEHZ.md` | sv_gameHz reference: legacy compatibility, position correction |
+| `SV_ANTIWARP.md` | sv_antiwarp deep-dive: modes 1/2, decay timeline, cvars, interaction with antilag |
 
 ---
 

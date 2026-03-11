@@ -1035,6 +1035,8 @@ typedef struct client_s {
 | `sv_antiwarpExtra` | 0 | Mode 2 extrapolation window ms (0=auto=awTol) |
 | `sv_antiwarpDecay` | 150 | Mode 2 decay duration ms |
 
+> **Full antiwarp documentation:** See [`SV_ANTIWARP.md`](SV_ANTIWARP.md) for mode details, decay timeline, interaction with sv_antilag, and configuration profiles.
+
 ### Antilag Cvars [CUSTOM] (sv_antilag.c)
 
 | Cvar | Default | Notes |
