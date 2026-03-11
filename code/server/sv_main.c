@@ -1504,6 +1504,7 @@ void SV_Frame( int msec ) {
 	// Snapshot dispatch is inside this loop so each engine tick at sv_fps rate produces
 	// its own snapshot send opportunity, preventing double-interval gaps.
 	while ( sv.timeResidual >= frameMsec ) {
+		qboolean _gameFrameRan = qfalse;
 		sv.timeResidual -= frameMsec;
 		svs.time += frameMsec;
 		sv.time += frameMsec;
@@ -1525,6 +1526,7 @@ void SV_Frame( int msec ) {
 			while ( sv.gameTimeResidual >= _gameMsec ) {
 				sv.gameTimeResidual -= _gameMsec;
 				sv.gameTime += _gameMsec;
+				_gameFrameRan = qtrue;
 
 				// --- Engine-side antiwarp: inject blank commands for lagging clients ---
 				// Runs before GAME_RUN_FRAME so the QVM sees fresh ClientThink calls.
@@ -1604,11 +1606,12 @@ void SV_Frame( int msec ) {
 
 		// Record antilag shadow positions AFTER the game frame so that
 		// shadow[T] == snapshot[T] (both capture post-game-frame entity state).
-		// Recording before the game frame made shadow[T] hold pre-game positions
-		// while the snapshot sent at T carried post-game positions — a one-tick
-		// mismatch that caused SV_Antilag_GetClientFireTime to look up the wrong
-		// shadow slot even with a perfect ping estimate.
-		if ( sv_antilag && sv_antilag->integer )
+		// Guarded by _gameFrameRan: when sv_gameHz > 0 the inner loop may not fire
+		// every sv_fps tick (gameTimeResidual < gameMsec). Recording on a no-game-frame
+		// tick would add a duplicate shadow entry (stale positions, new sv.time tag)
+		// that does not correspond to any real entity state change. Only record when
+		// the game actually advanced this tick.
+		if ( sv_antilag && sv_antilag->integer && _gameFrameRan )
 			SV_Antilag_RecordPositions();
 
 		// Issue and dispatch snapshots once per sv_fps tick, not once per Com_Frame.

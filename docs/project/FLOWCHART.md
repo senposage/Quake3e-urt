@@ -59,6 +59,9 @@
   |  |  | per-client ring buffer at sv_fps Hz.             |  | |
   |  |  | Runs AFTER the game frame so shadow[T] holds     |  | |
   |  |  | post-game positions == what snapshot[T] shows.   |  | |
+  |  |  | Only runs if game frame executed this tick        |  | |
+  |  |  | (_gameFrameRan guard — prevents duplicate        |  | |
+  |  |  | entries when sv_gameHz > 0 skips a tick).        |  | |
   |  |  | Human clients only — bots excluded (FIFO        |  | |
   |  |  | antilag handles bot targets; including bots      |  | |
   |  |  | creates a double-rewind conflict).               |  | |

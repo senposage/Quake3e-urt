@@ -442,7 +442,7 @@ removed in Fix 5 (PR #35), and `ComputeConfig` uses `sv_fps` Hz only.
 
 **Files:** `sv_main.c`, `sv_antilag.c`
 
-### Fix 9: Shadow recording order (before-game-frame → after-game-frame)
+### Fix 9: Shadow recording order (before-game-frame → after-game-frame) + sv_gameHz guard
 
 **Bug:** `SV_Antilag_RecordPositions()` ran **before** `GAME_RUN_FRAME` in
 each engine tick. This meant `shadow[T]` held entity positions from the
@@ -462,15 +462,30 @@ BEFORE (sv_main.c per-tick order):
 
 AFTER:
   sv.time += frameMsec
-  GAME_RUN_FRAME                 ← entities move; weapon traces fire here
-  SV_Antilag_RecordPositions()   ← records post-game positions at sv.time = T
+  _gameFrameRan = qfalse
+  GAME_RUN_FRAME (inner loop)    ← entities move; _gameFrameRan = qtrue
+  if _gameFrameRan:
+    SV_Antilag_RecordPositions() ← records post-game positions at sv.time = T
   SV_SendClientMessages()        ← snapshot carries same post-game positions
 
   Result: shadow[T] = P_N  ==  snapshot[T] = P_N  ✓
 ```
 
+**sv_gameHz guard:** When `sv_gameHz > 0`, the inner game loop runs at a
+slower rate than `sv_fps`. On ticks where `sv.gameTimeResidual < gameMsec`
+the inner loop does not fire — entities have not moved. Recording on such
+ticks would add a duplicate shadow entry (stale positions, new sv.time
+tag) that does not correspond to any real entity state change, polluting
+the history with incorrect timestamps. The `_gameFrameRan` flag is set
+inside the inner loop and used to skip recording on no-game-frame ticks.
+
+When `sv_gameHz <= 0` (disabled), `gameMsec = frameMsec` and the inner
+loop fires every sv_fps tick, so `_gameFrameRan` is always true and
+behaviour is unchanged.
+
 With this fix, `shadow[T]` and `snapshot[T]` always hold the same entity
-state, so fire-time lookups are consistent at all `sv_fps` rates.
+state, so fire-time lookups are consistent at all `sv_fps` and `sv_gameHz`
+rates.
 
 ### Fix 10: Snapshot-interval compensation in fire time
 
@@ -562,10 +577,13 @@ All items verified in the current codebase:
       Works at any `sv_fps` rate because `snapshotMsec` is per-client.
       Known limitation: a dropped snapshot increases the client's effective
       `cl_interp` by one `snapshotMsec`; the server cannot detect this.
-- [x] Shadow recording runs **after** the game frame in `SV_Frame`, ensuring
-      `shadow[T]` holds post-game-frame entity positions == what the snapshot
-      at time T delivers to clients. Previously recording ran before the game
-      frame, so `shadow[T]` was one tick behind the snapshot.
+- [x] Shadow recording runs **after** the game frame in `SV_Frame`, guarded
+      by `_gameFrameRan`. When `sv_gameHz > 0` the inner game loop may not
+      fire every sv_fps tick; the flag prevents recording duplicate shadow
+      entries (stale positions at a new sv.time) on no-game-frame ticks.
+      When `sv_gameHz <= 0`, `gameMsec = frameMsec` so the loop always
+      fires and `_gameFrameRan` is always true. In all cases `shadow[T]`
+      == post-game-frame entity state == what snapshot T delivers to clients.
 - [x] `sv.time` is used consistently in all shadow antilag paths that
       compare against fire time or shadow history timestamps
 - [x] `svs.time` is **only** used in `NoteSnapshot` rate tracking (wall-clock)
