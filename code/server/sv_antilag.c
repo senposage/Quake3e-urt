@@ -228,8 +228,13 @@ static int SV_Antilag_RewindAll( int shooterNum, int targetTime ) {
     for ( i = 0; i < sv.maxclients; i++ ) {
         cl = &svs.clients[i];
 
-        if ( i == shooterNum )          continue;
-        if ( cl->state != CS_ACTIVE )   continue;
+        if ( i == shooterNum )                              continue;
+        if ( cl->state != CS_ACTIVE )                       continue;
+        // Bots have 0 effective latency — their current world position is
+        // already correct.  Rewinding them would move them to a stale
+        // shadow-history entry (possibly left by a previous human occupying
+        // the same client slot) and produce wrong hit detection.
+        if ( cl->netchan.remoteAddress.type == NA_BOT )     continue;
 
         gent = SV_GentityNum( i );
         if ( !gent || !gent->r.linked ) continue;
@@ -293,6 +298,20 @@ static void SV_Antilag_RestoreAll( int shooterNum ) {
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
+
+/*
+SV_Antilag_ClearClient
+
+Zeroes the shadow history ring buffer for a single client slot.
+Called when a client disconnects so that a new occupant (bot or human)
+does not inherit stale position entries recorded for the previous player.
+*/
+void SV_Antilag_ClearClient( int clientNum ) {
+    if ( clientNum < 0 || clientNum >= MAX_CLIENTS )
+        return;
+    Com_Memset( &sv_shadowHistory[clientNum], 0, sizeof( sv_shadowHistory[clientNum] ) );
+}
+
 
 void SV_Antilag_Init( void ) {
     sv_antilag = Cvar_Get( "sv_antilag", "0",   CVAR_SERVERINFO );

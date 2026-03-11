@@ -21,6 +21,7 @@ extern cvar_t *sv_antilagDebug;
 extern cvar_t *sv_antilagRateDebug;
 
 void        SV_Antilag_Init( void );
+void        SV_Antilag_ClearClient( int clientNum );
 void        SV_Antilag_RecordPositions( void );
 void        SV_Antilag_NoteSnapshot( int clientNum );
 
