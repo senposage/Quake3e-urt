@@ -269,14 +269,26 @@ static int SV_Antilag_RewindAll( int shooterNum, int targetTime ) {
 
         if ( i == shooterNum )                              continue;
         if ( cl->state != CS_ACTIVE )                       continue;
-        // Bots are excluded from the shadow rewind.  The QVM's own FIFO
-        // antilag already handles bot targets (bots have zero network lag so
-        // their current position is always correct at trace time).  Including
-        // bots in the shadow rewind would create a double-rewind conflict:
-        // FIFO moves the bot to position A; shadow then overwrites with
-        // position B derived from a different time formula.  The trace would
-        // run against a position neither system intended.
-        if ( cl->netchan.remoteAddress.type == NA_BOT )     continue;
+        // Bots ARE included in the shadow rewind.
+        // The human shooter sees all entities — including bots — through the same
+        // snapshot/interpolation pipeline.  A shooter with 100 ms ping is aiming
+        // at the bot's position from ~(ping + snapshotMsec) ms ago, just as they
+        // would be for a human target.  Excluding bots produced a systematic miss
+        // for any human vs. bot engagement at non-trivial ping.
+        //
+        // The original "double-rewind conflict" concern: when g_antilag 1, the QVM
+        // FIFO antilag rewinds entities before calling trap_Trace.  The engine
+        // intercepts that syscall and applies its OWN rewind on top, which was
+        // assumed to conflict.  In practice both save/restore cycles are independent
+        // and commute correctly:
+        //   1. QVM FIFO may move entities (including any bot if FIFO touches it)
+        //   2. Engine saves the post-FIFO state
+        //   3. Engine applies shadow rewind → trace → restores to post-FIFO state
+        //   4. QVM FIFO restores to original
+        // The trace always sees shadow-recorded positions; entities end up back at
+        // original.  No conflict.
+        // sv_antilag 1 also auto-forces g_antilag 0 (SV_TrackCvarChanges) which
+        // eliminates any FIFO pre-setup entirely, making the ordering unambiguous.
 
         gent = SV_GentityNum( i );
         if ( !gent || !gent->r.linked ) continue;
@@ -397,10 +409,9 @@ void SV_Antilag_RecordPositions( void ) {
     for ( i = 0; i < sv.maxclients; i++ ) {
         client_t *cl = &svs.clients[i];
         if ( cl->state != CS_ACTIVE ) continue;
-        // Bots are excluded.  Their current position is always correct at
-        // trace time (zero network lag), and recording them would feed the
-        // double-rewind conflict described in SV_Antilag_RewindAll.
-        if ( cl->netchan.remoteAddress.type == NA_BOT ) continue;
+        // Bots ARE recorded.  Their positions must be in shadow history so that
+        // human-vs-bot traces can be rewound to the shooter's fireTime, giving
+        // fair hit registration at non-trivial ping (see SV_Antilag_RewindAll).
         SV_Antilag_RecordClient( i, sv.time );
     }
 }

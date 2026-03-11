@@ -509,7 +509,7 @@ Called from `SV_Init()`. Registers cvars: `sv_antilag`, `sv_antilagMaxMs`, `sv_a
 
 #### void SV_Antilag_RecordPositions()
 
-Called once per engine tick from `SV_Frame()`. Records `gent->r.currentOrigin`, `absmin`, `absmax` for all active **human** clients. Bots are excluded — their current position is always correct at trace time (zero network lag), and recording them would create a double-rewind conflict with the QVM's FIFO antilag.
+Called once per engine tick from `SV_Frame()`. Records `gent->r.currentOrigin`, `absmin`, `absmax` for all active clients — including bots. Bots are recorded so that human shooters get accurate lag compensation when targeting bots (the shooter sees the bot at a position from ~(ping + snapshotMsec) ms ago, same as for human targets). `sv_antilag 1` auto-forces `g_antilag 0`, so no QVM FIFO pre-setup interferes with the shadow rewind.
 
 #### void SV_Antilag_NoteSnapshot(int clientNum)
 
@@ -529,9 +529,8 @@ SV_Antilag_InterceptTrace:
         = svs.time - cl->ping, clamped to [svs.time - sv_antilagMaxMs, svs.time]
 
     rewound = SV_Antilag_RewindAll(passEntityNum, fireTime)
-        for each active non-bot non-shooter client:
-            ① sv_shadowSaved[i] = SV_Antilag_GetMostRecentPosition(i)
-               (overrides whatever the QVM's G_TimeShiftAllClients did)
+        for each active non-shooter client (humans and bots):
+            ① save gent->r.currentOrigin/absmin/absmax
             ② apply SV_Antilag_GetPositionAtTime(i, fireTime)
             ③ SV_LinkEntity(gent)
 
