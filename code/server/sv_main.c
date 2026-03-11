@@ -1508,10 +1508,6 @@ void SV_Frame( int msec ) {
 		svs.time += frameMsec;
 		sv.time += frameMsec;
 
-		// Record shadow positions for antilag (once per engine tick, before game frame)
-		if ( sv_antilag && sv_antilag->integer )
-			SV_Antilag_RecordPositions();
-
 		// Fire GAME_RUN_FRAME at sv_gameHz rate, independent of sv_fps.
 		// sv_fps = input sampling rate; sv_gameHz = level.time rate.
 		//
@@ -1605,6 +1601,15 @@ void SV_Frame( int msec ) {
 				  || ( sv_velSmooth && sv_velSmooth->integer > 0 ) ) ) {
 			SV_SmoothRecordAll();
 		}
+
+		// Record antilag shadow positions AFTER the game frame so that
+		// shadow[T] == snapshot[T] (both capture post-game-frame entity state).
+		// Recording before the game frame made shadow[T] hold pre-game positions
+		// while the snapshot sent at T carried post-game positions — a one-tick
+		// mismatch that caused SV_Antilag_GetClientFireTime to look up the wrong
+		// shadow slot even with a perfect ping estimate.
+		if ( sv_antilag && sv_antilag->integer )
+			SV_Antilag_RecordPositions();
 
 		// Issue and dispatch snapshots once per sv_fps tick, not once per Com_Frame.
 		SV_IssueNewSnapshot();

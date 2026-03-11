@@ -215,23 +215,33 @@ static int SV_Antilag_GetClientFireTime( int shooterNum ) {
 
     cl = &svs.clients[shooterNum];
 
-    // Rewind by the full round-trip time, not half.
+    // Full timing path (recording-after-game-frame ensures shadow[T] == snapshot[T]):
     //
-    // Timing proof:
-    //   T0      — position recorded in shadow history (sv.time = T0)
-    //   T0      — snapshot built and sent (messageSent = Sys_Milliseconds())
-    //   T0+RTT/2 — client receives snapshot, sees target at sv.time T0
-    //   T0+RTT/2 — client fires, sends usercmd
-    //   T0+RTT  — server receives usercmd (messageAcked = Sys_Milliseconds())
-    //              cl->ping = messageAcked - messageSent = RTT  (server-measured)
-    //              sv.time ≈ T0 + RTT  (advances at 1 ms / real-ms)
+    //   T0        positions recorded into shadow history (after game frame at tick T0)
+    //   T0        snapshot built and sent; messageSent = Sys_Milliseconds()
+    //             shadow[T0] == snapshot[T0]  ← guaranteed by recording order
+    //   T0+RTT/2  client receives snapshot; latest server time in client = T0
+    //   T0+RTT/2  client renders target at T0 − snapshotMsec because the Q3/URT
+    //             client interpolates one snapshot interval behind its latest
+    //             received snapshot (cl_interp ≈ snapshotMsec)
+    //   T0+RTT/2  client fires; sends usercmd
+    //   T0+RTT    server receives usercmd; messageAcked = Sys_Milliseconds()
+    //             cl->ping  = messageAcked − messageSent = RTT  (server-measured)
+    //             cl->snapshotMsec = 1000/snapHz  (per-client, from sv_fps/sv_snapshotFps)
+    //             sv.time  ≈ T0 + RTT
     //
-    // To rewind targets back to the position the client was aiming at (T0):
-    //   fireTime = sv.time - cl->ping = (T0 + RTT) - RTT = T0  ✓
+    //   Target position the client was aiming at: shadow[T0 − snapshotMsec]
+    //   fireTime = sv.time − ping − snapshotMsec
+    //            = (T0 + RTT) − RTT − snapshotMsec
+    //            = T0 − snapshotMsec  ✓
     //
-    // Using ping/2 only compensates one hop, leaving targets RTT/2 ms too
-    // far forward — the shooter must aim ahead of the visual position.
-    fireTime = sv.time - cl->ping;
+    // Limitation — dropped/late snapshots:
+    //   If a snapshot was dropped in transit the client interpolates across a
+    //   two-snapshot gap, effectively increasing cl_interp by snapshotMsec.
+    //   The server cannot detect this without client-reported data, so the
+    //   rewind will be snapshotMsec too shallow and the shot may miss.
+    //   This is unavoidable without a client-side interp report.
+    fireTime = sv.time - cl->ping - cl->snapshotMsec;
 
     maxRewind = sv_antilagMaxMs ? sv_antilagMaxMs->integer : SV_ANTILAG_MAX_REWIND_MS;
     if ( sv.time - fireTime > maxRewind )

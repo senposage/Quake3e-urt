@@ -2,9 +2,10 @@
 
 Reference document for manual review of engine-side shadow antilag fixes
 applied in **PR #35** (merged), **PR #36** (merged), **PR #37** (merged),
-and **PR #38** (current).
+**PR #38** (merged), and **PR #39** (current).
 
-All changes are in `code/server/sv_antilag.c` unless noted otherwise.
+All changes are in `code/server/sv_antilag.c` and/or `code/server/sv_main.c`
+unless noted otherwise.
 
 ---
 
@@ -15,8 +16,9 @@ All changes are in `code/server/sv_antilag.c` unless noted otherwise.
 3. [PR #36 — sv.time / svs.time domain fix](#pr-36--svtime--svstime-domain-fix)
 4. [PR #37 — Fire time formula revision (ping/2)](#pr-37--fire-time-formula-revision-ping2)
 5. [PR #38 — Fire time corrected to full RTT; sv_physicsScale removed](#pr-38--fire-time-corrected-to-full-rtt-sv_physicsscale-removed)
-6. [Combined before/after summary](#combined-beforeafter-summary)
-7. [Review checklist](#review-checklist)
+6. [PR #39 — Recording order fix; snapshot-interval compensation](#pr-39--recording-order-fix-snapshot-interval-compensation)
+7. [Combined before/after summary](#combined-beforeafter-summary)
+8. [Review checklist](#review-checklist)
 
 ---
 
@@ -436,23 +438,115 @@ removed in Fix 5 (PR #35), and `ComputeConfig` uses `sv_fps` Hz only.
 
 ---
 
+## PR #39 — Recording order fix; snapshot-interval compensation
+
+**Files:** `sv_main.c`, `sv_antilag.c`
+
+### Fix 9: Shadow recording order (before-game-frame → after-game-frame)
+
+**Bug:** `SV_Antilag_RecordPositions()` ran **before** `GAME_RUN_FRAME` in
+each engine tick. This meant `shadow[T]` held entity positions from the
+end of the *previous* tick (pre-game-frame state), while the snapshot
+sent at tick T carried post-game-frame positions. Every fire-time lookup
+was pointing at positions one tick stale relative to what the snapshot
+showed.
+
+```
+BEFORE (sv_main.c per-tick order):
+  sv.time += frameMsec
+  SV_Antilag_RecordPositions()   ← records pre-game positions at sv.time = T
+  GAME_RUN_FRAME                 ← entities move; weapon traces fire here
+  SV_SendClientMessages()        ← snapshot carries post-game positions at T
+
+  Result: shadow[T] = P_{N-1}  but  snapshot[T] = P_N  (mismatch)
+
+AFTER:
+  sv.time += frameMsec
+  GAME_RUN_FRAME                 ← entities move; weapon traces fire here
+  SV_Antilag_RecordPositions()   ← records post-game positions at sv.time = T
+  SV_SendClientMessages()        ← snapshot carries same post-game positions
+
+  Result: shadow[T] = P_N  ==  snapshot[T] = P_N  ✓
+```
+
+With this fix, `shadow[T]` and `snapshot[T]` always hold the same entity
+state, so fire-time lookups are consistent at all `sv_fps` rates.
+
+### Fix 10: Snapshot-interval compensation in fire time
+
+**Bug:** `fireTime = sv.time - cl->ping` rewound to the exact snapshot
+time `T0`. But the Q3/URT client interpolates targets **one snapshot
+interval behind** its latest received snapshot (`cl_interp ≈ snapshotMsec`
+by default). The visual position of a target was therefore at
+`T0 − snapshotMsec`, not `T0`.
+
+**Full timing path (after Fix 9):**
+
+```
+T0          shadow records positions (after game frame, post-Fix 9)
+T0          snapshot sent;  messageSent = Sys_Milliseconds()
+            shadow[T0] == snapshot[T0]  ← guaranteed by Fix 9
+T0+RTT/2    client receives snapshot; latest server time = T0
+T0+RTT/2    client RENDERS target at T0 − snapshotMsec (cl_interp)
+T0+RTT/2    client fires; sends usercmd
+T0+RTT      server receives usercmd;  messageAcked = Sys_Milliseconds()
+            cl->ping        = RTT       (server-measured)
+            cl->snapshotMsec = 1000/snapHz  (per-client, from sv_fps / sv_snapshotFps)
+            sv.time ≈ T0 + RTT
+```
+
+Target position the client aimed at: `shadow[T0 − snapshotMsec]`
+
+```c
+// BEFORE (PR #38)
+fireTime = sv.time - cl->ping;
+// → rewound to T0  (client was seeing T0 − snapshotMsec)
+
+// AFTER (PR #39)
+fireTime = sv.time - cl->ping - cl->snapshotMsec;
+// = (T0 + RTT) − RTT − snapshotMsec = T0 − snapshotMsec  ✓
+```
+
+`cl->snapshotMsec` is **per-client** (`1000 / snapHz`, set from
+`sv_fps` or `sv_snapshotFps` at connect/reconfigure). The formula is
+therefore correct at any `sv_fps` rate — 20 Hz, 60 Hz, 125 Hz, etc.
+
+**Limitation — dropped / late snapshots:**
+If a snapshot is dropped in transit the client interpolates across a
+two-snapshot gap. Its effective `cl_interp` increases by `snapshotMsec`
+for that shot. The server has no visibility into which snapshot the client
+used for aiming, so the rewind will be `snapshotMsec` too shallow and the
+shot may miss the shadow interpolation window. This is unavoidable without
+a client-side interp report.
+
+**Example (40 ms ping, 60 Hz snaps → snapshotMsec = 16 ms):**
+
+| Formula | Rewind | Assessment |
+|---------|--------|------------|
+| `sv.time - cl->ping / 2` (PR #37) | 20 ms | under-compensates |
+| `sv.time - cl->ping` (PR #38) | 40 ms | misses interp offset |
+| `sv.time - cl->ping - cl->snapshotMsec` (PR #39) | **56 ms** | **exact** |
+
+---
+
 ## Combined before/after summary
 
-| Area | Original code | After PR #35 | After PR #36 | After PR #37 | After PR #38 |
-|------|--------------|--------------|--------------|--------------|--------------|
-| **Fire time formula** | `svs.time - cl->ping` | `cl->lastUsercmd.serverTime` | *(unchanged)* | `sv.time - cl->ping / 2` | **`sv.time - cl->ping`** |
-| **Fire time clamps** | vs `svs.time` | vs `svs.time` | vs **`sv.time`** | *(unchanged)* | *(unchanged)* |
-| **Recording timestamp** | `svs.time` (bots excluded) | `svs.time` (bots ~~included~~ reverted) | **`sv.time`** (bots excluded) | *(unchanged)* | *(unchanged)* |
-| **sv_fps detection** | `sv_fps->modified` (race) | Integer value tracking | *(unchanged)* | *(unchanged)* | *(unchanged)* |
-| **History flush** | Only if slot count changed | Always on timing change | *(unchanged)* | *(unchanged)* | *(unchanged)* |
-| **Recording loop** | `physicsScale×` per tick | 1× per tick | *(unchanged)* | *(unchanged)* | *(unchanged)* |
-| **Slot calculation** | `fps × scale` Hz, off-by-one | `fps` Hz, +1 | *(unchanged)* | *(unchanged)* | *(unchanged)* |
-| **sv_physicsScale cvar** | registered + watched | *(unchanged)* | *(unchanged)* | *(unchanged)* | **removed** |
-| **Save/restore** | Via `GetMostRecentPosition` | Via `GetMostRecentPosition` | Direct `gent->r.currentOrigin` | *(unchanged)* | *(unchanged)* |
-| **No-history fallback** | Force-write saved pos back | Force-write saved pos back | Leave entity at current pos | *(unchanged)* | *(unchanged)* |
-| **Debug output time** | `svs.time` | `svs.time` | **`sv.time`** | *(unchanged)* | *(unchanged)* |
-| **Header cvar names** | `sv_antilagTraceLog` | *(unchanged)* | *(unchanged)* | **`sv_antilagDebug`** | *(unchanged)* |
-| **Enable cvar name** | — | `sv_antilagEnable` (docs only) | *(unchanged)* | **`sv_antilag`** (code + docs) | *(unchanged)* |
+| Area | Original code | After PR #35 | After PR #36 | After PR #37 | After PR #38 | After PR #39 |
+|------|--------------|--------------|--------------|--------------|--------------|--------------|
+| **Fire time formula** | `svs.time - cl->ping` | `cl->lastUsercmd.serverTime` | *(unchanged)* | `sv.time - cl->ping / 2` | `sv.time - cl->ping` | **`sv.time - cl->ping - cl->snapshotMsec`** |
+| **Fire time clamps** | vs `svs.time` | vs `svs.time` | vs **`sv.time`** | *(unchanged)* | *(unchanged)* | *(unchanged)* |
+| **Recording order in SV_Frame** | before game frame | *(unchanged)* | *(unchanged)* | *(unchanged)* | *(unchanged)* | **after game frame** |
+| **Recording timestamp** | `svs.time` (bots excluded) | `svs.time` (bots ~~included~~ reverted) | **`sv.time`** (bots excluded) | *(unchanged)* | *(unchanged)* | *(unchanged)* |
+| **sv_fps detection** | `sv_fps->modified` (race) | Integer value tracking | *(unchanged)* | *(unchanged)* | *(unchanged)* | *(unchanged)* |
+| **History flush** | Only if slot count changed | Always on timing change | *(unchanged)* | *(unchanged)* | *(unchanged)* | *(unchanged)* |
+| **Recording loop** | `physicsScale×` per tick | 1× per tick | *(unchanged)* | *(unchanged)* | *(unchanged)* | *(unchanged)* |
+| **Slot calculation** | `fps × scale` Hz, off-by-one | `fps` Hz, +1 | *(unchanged)* | *(unchanged)* | *(unchanged)* | *(unchanged)* |
+| **sv_physicsScale cvar** | registered + watched | *(unchanged)* | *(unchanged)* | *(unchanged)* | **removed** | *(unchanged)* |
+| **Save/restore** | Via `GetMostRecentPosition` | Via `GetMostRecentPosition` | Direct `gent->r.currentOrigin` | *(unchanged)* | *(unchanged)* | *(unchanged)* |
+| **No-history fallback** | Force-write saved pos back | Force-write saved pos back | Leave entity at current pos | *(unchanged)* | *(unchanged)* | *(unchanged)* |
+| **Debug output time** | `svs.time` | `svs.time` | **`sv.time`** | *(unchanged)* | *(unchanged)* | *(unchanged)* |
+| **Header cvar names** | `sv_antilagTraceLog` | *(unchanged)* | *(unchanged)* | **`sv_antilagDebug`** | *(unchanged)* | *(unchanged)* |
+| **Enable cvar name** | — | `sv_antilagEnable` (docs only) | *(unchanged)* | **`sv_antilag`** (code + docs) | *(unchanged)* | *(unchanged)* |
 
 ---
 
@@ -460,14 +554,18 @@ removed in Fix 5 (PR #35), and `ComputeConfig` uses `sv_fps` Hz only.
 
 All items verified in the current codebase:
 
-- [x] Fire time uses `sv.time - cl->ping` (full RTT).
-      `cl->ping` is the server-measured round-trip time. The snapshot was
-      built at `sv.time = T0`, sent at wall-clock `T0_wall`, received by
-      the client at `T0_wall + RTT/2`, and the usercmd arrives back at
-      `T0_wall + RTT` when `sv.time ≈ T0 + RTT`. Rewind target =
-      `sv.time - ping = T0`. Using `ping/2` (PR #37) left targets `RTT/2`
-      ms too far forward; using `lastUsercmd.serverTime` (PR #35)
-      over-compensated by the client's interp buffer (~30–50 ms extra).
+- [x] Fire time uses `sv.time - cl->ping - cl->snapshotMsec`.
+      `cl->ping` = full RTT (server-measured); `cl->snapshotMsec` = per-client
+      snapshot interval (`1000/snapHz`, from `sv_fps`/`sv_snapshotFps`) which
+      represents the Q3/URT client's default `cl_interp` delay. Together they
+      match the exact position the shooter was rendering when they fired.
+      Works at any `sv_fps` rate because `snapshotMsec` is per-client.
+      Known limitation: a dropped snapshot increases the client's effective
+      `cl_interp` by one `snapshotMsec`; the server cannot detect this.
+- [x] Shadow recording runs **after** the game frame in `SV_Frame`, ensuring
+      `shadow[T]` holds post-game-frame entity positions == what the snapshot
+      at time T delivers to clients. Previously recording ran before the game
+      frame, so `shadow[T]` was one tick behind the snapshot.
 - [x] `sv.time` is used consistently in all shadow antilag paths that
       compare against fire time or shadow history timestamps
 - [x] `svs.time` is **only** used in `NoteSnapshot` rate tracking (wall-clock)

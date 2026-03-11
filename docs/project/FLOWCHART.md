@@ -26,16 +26,6 @@
   |  |  sv.time  += frameMsec                                 | |
   |  |                                                        | |
   |  |  +--------------------------------------------------+  | |
-  |  |  | ANTILAG RECORDING                                |  | |
-  |  |  | SV_Antilag_RecordPositions()                     |  | |
-  |  |  |                                                  |  | |
-  |  |  | Records each active player's position into       |  | |
-  |  |  | per-client ring buffer at sv_fps Hz.             |  | |
-  |  |  | Bots included — their positions are rewound      |  | |
-  |  |  | to the shooter's fire time just like humans.     |  | |
-  |  |  +--------------------------------------------------+  | |
-  |  |                                                        | |
-  |  |  +--------------------------------------------------+  | |
   |  |  | GAME FRAME (sv_gameHz inner loop)                |  | |
   |  |  |                                                  |  | |
   |  |  | sv.gameTimeResidual += frameMsec                 |  | |
@@ -60,6 +50,18 @@
   |  |  |   SV_BotFrame( sv.gameTime )                     |  | |
   |  |  |   VM_Call( gvm, GAME_RUN_FRAME, sv.gameTime )    |  | |
   |  |  +--------------------------------------------------+  | |
+  |  |                                                        | |
+  |  |  +--------------------------------------------------+  | |
+  |  |  | ANTILAG RECORDING (after game frame)             |  | |
+  |  |  | SV_Antilag_RecordPositions()                     |  | |
+  |  |  |                                                  |  | |
+  |  |  | Records each active player's position into       |  | |
+  |  |  | per-client ring buffer at sv_fps Hz.             |  | |
+  |  |  | Runs AFTER the game frame so shadow[T] holds     |  | |
+  |  |  | post-game positions == what snapshot[T] shows.   |  | |
+  |  |  | Human clients only — bots excluded (FIFO        |  | |
+  |  |  | antilag handles bot targets; including bots      |  | |
+  |  |  | creates a double-rewind conflict).               |  | |
   |  |                                                        | |
   |  |  +--------------------------------------------------+  | |
   |  |  | PER-TICK SNAPSHOT DISPATCH                       |  | |

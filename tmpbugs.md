@@ -114,6 +114,53 @@ was recorded to when the trace runs is the full RTT (`= cl->ping`), not half.
 - Old error: ~20 ms positional lead required (~128 units at 320 ups)
 - New error: ~0 ms (exact snapshot compensation)
 
+*(Superseded by BUG-5 which adds snapshotMsec compensation on top.)*
+
+---
+
+## BUG-5 — Shadow recording before game frame misaligns with snapshot; missing snapshotMsec compensation — **RESOLVED**
+
+**Resolution (two-part):**
+
+### Part A — Recording order fixed
+
+`SV_Antilag_RecordPositions()` in `sv_main.c` was called **before**
+`GAME_RUN_FRAME`. Entity positions are updated by the game frame, so
+`shadow[T]` held pre-game positions while `snapshot[T]` held post-game
+positions — a one-tick mismatch at all `sv_fps` rates.
+
+Moved `SV_Antilag_RecordPositions()` to **after** the game frame (but
+before `SV_SendClientMessages()`). Now `shadow[T] == snapshot[T]`.
+
+### Part B — snapshotMsec compensation in fireTime
+
+Even with the recording-order fix, `fireTime = sv.time - ping` rewound to
+the exact snapshot send time `T0`. But the Q3/URT client interpolates one
+snapshot interval behind its latest received snapshot (`cl_interp ≈
+cl->snapshotMsec`). The target was visually at `T0 - snapshotMsec`.
+
+Changed `fireTime = sv.time - cl->ping - cl->snapshotMsec`.
+
+`cl->snapshotMsec = 1000 / snapHz` is per-client and driven by
+`sv_fps`/`sv_snapshotFps` — the formula is correct at any `sv_fps` rate.
+
+**Timing proof (both parts applied):**
+- `T0`: shadow records (post-game) + snapshot sent → `shadow[T0] == snapshot[T0]`
+- `T0 + RTT/2`: client receives snapshot, sees target at `T0`
+- `T0 + RTT/2`: client **renders** target at `T0 - snapshotMsec` (cl_interp)
+- `T0 + RTT`: usercmd arrives, `sv.time ≈ T0 + RTT`, `cl->ping = RTT`
+- Correct `fireTime = sv.time - ping - snapshotMsec = T0 - snapshotMsec` ✓
+
+**Impact at 40 ms ping, 60 Hz snaps (snapshotMsec = 16 ms):**
+- Previous formula: rewinds 40 ms → points at T0, target was at T0 − 16 ms → 16 ms error
+- New formula: rewinds 56 ms → points at T0 − 16 ms ✓
+
+**Known limitation — dropped packets:**
+If a snapshot is dropped the client's effective `cl_interp` grows by
+`snapshotMsec`. The server cannot detect this — the rewind will be
+`snapshotMsec` too shallow for that shot. Not fixable without a
+client-side interp report.
+
 ---
 
 ## NOTES (not bugs, design decisions)

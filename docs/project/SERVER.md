@@ -1056,9 +1056,6 @@ Com_Frame(msec)
     └── [tick loop: while timeResidual >= frameMsec]
         ├── sv.time++
         │
-        ├── SV_Antilag_RecordPositions()
-        │     └── for each active client (bots + humans): record origin/absmin/absmax to shadow history
-        │
         ├── [game frame loop: while gameTimeResidual >= gameMsec]
         │   ├── SV_BotFrame(sv.gameTime)
         │   └── VM_Call(gvm, GAME_RUN_FRAME, sv.gameTime)
@@ -1067,6 +1064,9 @@ Com_Frame(msec)
         │                   ├── SV_Antilag_RewindAll(shooter, fireTime)
         │                   ├── SV_Trace()  ← hit detection at rewound state
         │                   └── SV_Antilag_RestoreAll()
+        │
+        ├── SV_Antilag_RecordPositions()  ← AFTER game frame (shadow[T] == snapshot[T])
+        │     └── for each active human client (bots excluded — FIFO antilag handles bot targets): record origin/absmin/absmax to shadow history
         │
         ├── [if ring buffer active]:
         │   SV_SmoothRecordAll()
