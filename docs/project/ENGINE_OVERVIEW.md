@@ -257,7 +257,7 @@ All engine changes relative to stock Quake3e, organized by phase:
 | `client/snd_mem.c` | dmaHD memory allocation (2×1536), dmaHD_LoadSound intercept | `NO_DMAHD` |
 | `client/snd_dmahd.c` | **New file** — full HRTF/spatial HD sound system (~1467 lines) | `NO_DMAHD` |
 | `client/snd_dmahd.h` | **New file** — dmaHD public API | `NO_DMAHD` |
-| `win32/win_snd.c` | WASAPI disabled when dmaHD active, force DirectSound 44100Hz stereo 16-bit | `NO_DMAHD` |
+| `win32/win_snd.c` | dmaHD: WASAPI uses `GetMixFormat` for native bit-perfect output (no resampling); DirectSound fallback 48 kHz 16-bit PCM | `NO_DMAHD` |
 | `Makefile` | NO_DMAHD=0 flag, sv_antilag.o + snd_dmahd.o build entries | — |
 
 ### Not Yet Implemented

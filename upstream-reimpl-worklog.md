@@ -165,10 +165,10 @@ Branch: `upstream-reimpl` based on `upstream/main`
 - snd_dmahd.c (NEW, ~1467 lines): Full HRTF/spatial sound system, copied from master
 - snd_dmahd.h (NEW): Public interface (dmaHD_LoadSound, dmaHD_Enabled, dmaHD_Init)
 - snd_local.h: ch_side_t struct (vol/offset/bass/reverb per side), channel_t unions (leftvol/rightvol + ch_side_t), sodrot vec3_t, sfx_t weaponsound field
-- snd_dma.c: #include snd_dmahd.h, removed static from s_soundStarted/s_soundMuted/listener_number/loopSounds/s_knownSfx/s_numSfx/s_mixahead + S_GetSoundtime/S_ScanChannelStarts/S_UpdateBackgroundTrack, s_khz default 44 when dmaHD enabled, dmaHD_Init call at end of S_Base_Init
+- snd_dma.c: #include snd_dmahd.h, removed static from s_soundStarted/s_soundMuted/listener_number/loopSounds/s_knownSfx/s_numSfx/s_mixahead + S_GetSoundtime/S_ScanChannelStarts/S_UpdateBackgroundTrack, s_khz default 48 when dmaHD enabled, dmaHD_Init call at end of S_Base_Init
 - snd_mem.c: #include snd_dmahd.h, dmaHD memory allocation (2*1536 fixed), dmaHD_LoadSound intercept in S_LoadSound
-- win32/win_snd.c: dmaHD_Enabled declaration, WASAPI disabled when dmaHD active, force DirectSound driver, force 44100Hz/stereo/16-bit
-- Makefile: NO_DMAHD=0 flag, -DNO_DMAHD conditional, snd_dmahd.o in client build
+- win32/win_snd.c: dmaHD_Enabled declaration at file-top; dmaHD WASAPI path calls GetMixFormat to use the OS native rate/format bit-perfect (no resampling, no APO disruption); DirectSound fallback 48 kHz 16-bit PCM; dmaHD_TransferPaintBuffer supports float32 + 32-bit int PCM + 16-bit PCM output
+- Makefile: NO_DMAHD=0 flag, -DNO_DMAHD conditional, snd_dmahd.o in client build; USE_SDL=1 force-disables dmaHD
 - All guarded with #ifndef NO_DMAHD
 
 ### Pending FTWGL Phases

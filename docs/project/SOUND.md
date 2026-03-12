@@ -251,21 +251,35 @@ typedef struct sfx_s {
 
 ### win_snd.c Changes [URT]
 
-On Windows, when dmaHD is active:
-- WASAPI driver disabled (force DirectSound)
-- Forces 44100 Hz sample rate
-- Forces stereo (2 channels)
-- Forces 16-bit sample depth
+On Windows, when dmaHD is active with WASAPI:
+- **`GetMixFormat`** is called to discover the device's own native rate and sample format.  This makes WASAPI operate **bit-perfect** — no internal resampling, no Windows Audio Processing Object (APO) disruption, and no added latency.
+- If the native format is 32-bit float (the default on virtually all modern Windows systems), dmaHD uses that directly via the new float write path in `dmaHD_TransferPaintBuffer`.
+- If `GetMixFormat` fails the safe fallback is 48 000 Hz / 32-bit float.
+- DirectSound (legacy fallback) uses 48 000 Hz / stereo / 16-bit PCM (DirectSound is PCM-only).
 
 ```c
-// win32/win_snd.c
+// win32/win_snd.c  — SNDDMA_InitWASAPI (dmaHD path)
 #ifndef NO_DMAHD
-if ( dmaHD_Enabled() ) {
-    // disable WASAPI, use DirectSound
-    // force 44100/stereo/16-bit
+if ( dmaHD_Enabled() )
+{
+    // Query native mix format: avoids WASAPI resampling and APO disruption.
+    if ( iAudioClient->lpVtbl->GetMixFormat( iAudioClient, &mixFormat ) == S_OK && mixFormat )
+    {
+        dma.speed = (int)mixFormat->nSamplesPerSec;
+        if ( /* float32 subformat */ )
+            dma.samplebits = 32;   // → dma.isfloat = qtrue after negotiation
+        CoTaskMemFree( mixFormat );
+    }
+    else { dma.speed = 48000; dma.samplebits = 32; } // safe fallback
 }
+else
 #endif
+switch ( s_khz->integer ) { ... }
 ```
+
+`initFormat` was updated to emit `WAVE_FORMAT_IEEE_FLOAT` (instead of `WAVE_FORMAT_PCM`) when `nBits == 32`, so the format request is accepted by WASAPI without negotiation.
+
+`dmaHD_TransferPaintBuffer` was updated with a 32-bit float write path that normalises the 24.8 fixed-point paint accumulator to `[-1.0, 1.0]`, matching the formula used by the base `S_TransferPaintBuffer` in `snd_mix.c`.
 
 ### Build System
 
@@ -430,9 +444,10 @@ typedef struct {
 ### dmaHD-Specific Behavior [URT]
 
 When dmaHD is active (`NO_DMAHD` not set):
-- `s_khz` default changes to **44** (required for HRTF processing)
+- `s_khz` defaults to **48** (used as fallback; on Windows WASAPI the native device rate is used regardless)
 - `s_doppler` enables HRTF Doppler simulation
-- WASAPI is disabled on Windows (forced DirectSound at 44100 Hz)
+- On Windows, WASAPI queries `GetMixFormat` and matches the native device rate + format exactly — **no resampling, no APO disruption** (typically 48 000 Hz / 32-bit float on modern hardware)
+- DirectSound fallback: 48 000 Hz / stereo / 16-bit PCM
 - Sound loading goes through `dmaHD_LoadSound` for HRTF pre-processing
 
 Build flag: compile with `NO_DMAHD=1` to disable dmaHD and use the standard DMA backend.
