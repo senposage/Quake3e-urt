@@ -1072,21 +1072,6 @@ void SV_SendClientMessages( void )
 		if ( c->state == CS_FREE )
 			continue;		// not connected
 
-		// Zombie clients get a brief grace window (sv_dropzombies ms) to acknowledge
-		// final reliable messages and to recover from brief connection interruptions
-		// (e.g. a network blip during a map change).  If the client sends any inbound
-		// packet within that window we keep sending for the full sv_zombietime period.
-		// Once the grace window expires with no packet back, flush outstanding buffers
-		// and stop sending -- at high snapshot rates a gone client would otherwise keep
-		// the queue filling until the full sv_zombietime expires.
-		if ( c->state == CS_ZOMBIE ) {
-			if ( c->netchan.incomingSequence <= c->zombieIncomingSeq &&
-			     svs.time - c->lastDisconnectTime > sv_dropzombies->integer ) {
-				SV_Netchan_FreeQueue( c );
-				continue;
-			}
-		}
-
 		//if ( *c->downloadName )
 		//	continue;		// Client is downloading, don't send snapshots
 

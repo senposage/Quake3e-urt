@@ -216,8 +216,6 @@ typedef struct client_s {
 	int				lastPacketTime;		// svs.time when packet was last received
 	int				lastConnectTime;	// svs.time when connection started
 	int				lastDisconnectTime;
-	int				zombieIncomingSeq;	// netchan.incomingSequence at the moment of entering CS_ZOMBIE;
-										// if incomingSequence advances past this, the client has acked back
 	int				lastSnapshotTime;	// svs.time of last sent snapshot
 	qboolean		rateDelayed;		// true if nextSnapshotTime was set based on rate instead of snapshotMsec
 	int				timeoutCount;		// must timeout a few frames in a row so debugging doesn't break
@@ -357,7 +355,6 @@ extern	cvar_t	*sv_velSmooth;
 extern	cvar_t	*sv_extrapolate;
 extern	cvar_t	*sv_timeout;
 extern	cvar_t	*sv_zombietime;
-extern	cvar_t	*sv_dropzombies;		// ms of grace before stopping snapshots to zombie clients
 extern	cvar_t	*sv_rconPassword;
 extern	cvar_t	*sv_privatePassword;
 extern	cvar_t	*sv_allowDownload;
