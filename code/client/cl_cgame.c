@@ -1243,18 +1243,17 @@ void CL_SetCGameTime( void ) {
 		if ( cl.serverTime - cl.oldServerTime < 0 ) {
 			cl.serverTime = cl.oldServerTime;
 		}
-		// Cap serverTime one millisecond below the latest received snapshot
-		// (adaptive timing only).  Release the cap when the uncapped time
-		// drifts several snapshot intervals past the last snapshot (server
-		// stopped sending).
-		if ( cl_adaptiveTiming->integer && !cl.serverForbidsAdaptiveTiming ) {
-			if ( cl.serverTime >= cl.snap.serverTime ) {
-				int drift = cl.serverTime - cl.snap.serverTime;
-				int capLimit = 1000;
-				if ( drift < capLimit ) {
-					cl.serverTime = cl.snap.serverTime - 1;
-					SCR_NetMonitorAddCapHit();
-				}
+		// Cap serverTime one millisecond below the latest received snapshot.
+		// Prevents cl.serverTime from running ahead of snap.serverTime, which
+		// would make usercmd p_serverTime exceed the server's commandTime and
+		// cause ping=999. Release after 1s of drift (server stopped sending).
+		// Applied unconditionally — this is a safety guarantee, not an
+		// adaptive-timing feature, so cl_adaptiveTiming=0 still benefits.
+		if ( cl.serverTime >= cl.snap.serverTime ) {
+			int drift = cl.serverTime - cl.snap.serverTime;
+			if ( drift < 1000 ) {
+				cl.serverTime = cl.snap.serverTime - 1;
+				SCR_NetMonitorAddCapHit();
 			}
 		}
 		cl.oldServerTime = cl.serverTime;
@@ -1288,7 +1287,8 @@ void CL_SetCGameTime( void ) {
 				SCR_NetMonitorAddExtrap();
 			}
 		} else {
-			// vanilla Q3: hardcoded 5ms threshold, no fractional accumulator
+			// vanilla Q3: diff >= -5ms equivalent (when slowFrac=0, the full
+			// adaptive check "(diff * 4 + slowFrac) >= -20" reduces to "diff >= -5")
 			if ( cls.realtime + cl.serverTimeDelta - cl.snap.serverTime >= -5 ) {
 				cl.extrapolatedSnapshot = qtrue;
 			}
