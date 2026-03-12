@@ -607,6 +607,10 @@ void SV_SpawnServer( const char *mapname, qboolean killBots ) {
 					// the new gamestate will be sent
 					svs.clients[i].state = CS_CONNECTED;
 					svs.clients[i].gentity = NULL;
+					// Reset antiwarp baseline: stale pre-cycle value would trigger
+					// a spurious GAME_CLIENT_THINK on the first post-cycle active tick.
+					// Setting to 0 activates the "never received a real command yet" guard.
+					svs.clients[i].awLastThinkTime = 0;
 				} else {
 					SV_ClientEnterWorld( &svs.clients[i] );
 				}
