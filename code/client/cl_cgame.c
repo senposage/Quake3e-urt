@@ -982,15 +982,13 @@ static void CL_AdjustTimeDelta( void ) {
 	int		deltaDelta;
 	int		resetTime;
 	int		fastAdjust;
-	// Effective adaptive timing level: fall back to vanilla (0) on servers
-	// that don't have our custom timing protocol (detected via sv_snapshotFps).
-	int		effectiveAdaptiveTiming = cl.vanillaServer ? 0 : cl_adaptiveTiming->integer;
 
 	// Scale thresholds proportionally to the measured snapshot interval so the
 	// system reacts at the same number-of-snapshots equivalent across all rates.
 	// At 20Hz (snapshotMsec=50): resetTime=500, fastAdjust=100 — same as vanilla.
 	// At 60Hz (snapshotMsec=16): resetTime=500 (floor), fastAdjust=50 (floor).
-	if ( effectiveAdaptiveTiming ) {
+	// Safe for vanilla servers: snapshotMsec is measured from actual intervals.
+	if ( cl_adaptiveTiming->integer ) {
 		resetTime  = cl.snapshotMsec * 10;
 		fastAdjust = cl.snapshotMsec * 2;
 		if ( resetTime  < 500 ) resetTime  = 500;
@@ -1046,7 +1044,7 @@ static void CL_AdjustTimeDelta( void ) {
 			// for faster convergence on mid-range disturbances.
 			if ( slowFrac >= 4 ) {
 				int step = 1;
-				if ( effectiveAdaptiveTiming >= 2 && deltaDelta > cl.snapshotMsec ) {
+				if ( cl_adaptiveTiming->integer >= 2 && deltaDelta > cl.snapshotMsec ) {
 					step = deltaDelta / 4;
 					if ( step < 1 ) step = 1;
 					if ( step > deltaDelta / 2 ) step = deltaDelta / 2;
@@ -1056,7 +1054,7 @@ static void CL_AdjustTimeDelta( void ) {
 				SCR_NetMonitorAddSlowAdjust( +step );
 			} else if ( slowFrac <= -4 ) {
 				int step = 1;
-				if ( effectiveAdaptiveTiming >= 2 && deltaDelta > cl.snapshotMsec ) {
+				if ( cl_adaptiveTiming->integer >= 2 && deltaDelta > cl.snapshotMsec ) {
 					step = deltaDelta / 4;
 					if ( step < 1 ) step = 1;
 					if ( step > deltaDelta / 2 ) step = deltaDelta / 2;
@@ -1267,9 +1265,12 @@ void CL_SetCGameTime( void ) {
 
 		// note if we are almost past the latest frame (without timeNudge),
 		// so we will try and adjust back a bit when the next snapshot arrives.
-		if ( cl_adaptiveTiming->integer && !cl.vanillaServer ) {
+		// The scaled threshold (snapshotMsec/3) is safe for vanilla servers: it
+		// uses measured intervals and has no serverTime cap side-effects.
+		if ( cl_adaptiveTiming->integer ) {
 			// Scale the detection window with the measured snapshot interval.
 			// Evaluated in 1/4ms units so slowFrac state is visible.
+			// At 20Hz: thresh=16ms (vs hardcoded 5ms) → better equilibrium on vanilla.
 			int extrapolateThresh = cl.snapshotMsec / 3;
 			if ( extrapolateThresh <  3 ) extrapolateThresh =  3;
 			if ( extrapolateThresh > 16 ) extrapolateThresh = 16;
@@ -1278,7 +1279,7 @@ void CL_SetCGameTime( void ) {
 				SCR_NetMonitorAddExtrap();
 			}
 		} else {
-			// vanilla (or vanilla server): hardcoded 5ms threshold; include fractional accumulator
+			// cl_adaptiveTiming 0: hardcoded 5ms threshold; include fractional accumulator
 			if ( ( cls.realtime + cl.serverTimeDelta - cl.snap.serverTime ) * 4 + slowFrac >= -20 ) {
 				cl.extrapolatedSnapshot = qtrue;
 			}
