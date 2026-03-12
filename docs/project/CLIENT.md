@@ -267,9 +267,20 @@ CL_SetCGameTime:
     // Prevent cl.serverTime from running at or ahead of snap.serverTime.
     // If it does, outgoing usercmd serverTime values can exceed the server's
     // commandTime → ping=999 → URT ping-kick → zombie-state flood loop.
-    // Cap margin = snapshotMsec/4, clamped to [2, 8] ms.
+    //
+    // History vs vanilla:
+    //   Vanilla Q3e:   NO cap — cl.serverTime could freely exceed snap.serverTime.
+    //   PR #65/66:     cap = 1ms, but gated on cl_adaptiveTiming && !vanillaServer
+    //                  (vanilla servers were excluded, so the flood bug persisted).
+    //   PR #68:        cap = 1ms, unconditional — correct fix, but 1ms was still
+    //                  too tight: at high-jitter connections cl.serverTime could
+    //                  oscillate across the boundary every frame, hammering the cap.
+    //   Commit 571ab66: tried to raise to 2ms but only changed the comment; the
+    //                  actual -1 value was never updated.
+    //   Current:       cap = snapshotMsec/4, clamped [2, 8] ms, unconditional.
+    //                  At 20Hz (snapshotMsec=50) → 8ms.  At 60Hz (16ms) → 4ms.
+    //
     // Released after 2s of continuous drift (server stopped sending).
-    // Applied unconditionally regardless of cl_adaptiveTiming.
     capMs = clamp(snapshotMsec / 4, 2, 8)
     if (cl.serverTime >= cl.snap.serverTime AND drift < 2000):
         cl.serverTime = cl.snap.serverTime - capMs

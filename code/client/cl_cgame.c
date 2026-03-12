@@ -1257,7 +1257,7 @@ void CL_SetCGameTime( void ) {
 			if ( capMs > 8 ) capMs = 8;
 			if ( cl.serverTime >= cl.snap.serverTime ) {
 				int drift = cl.serverTime - cl.snap.serverTime;
-				if ( drift < 2000 ) {
+				if ( drift < 2000 ) { // 2000ms = 2s release threshold
 					cl.serverTime = cl.snap.serverTime - capMs;
 					SCR_NetMonitorAddCapHit();
 				}
