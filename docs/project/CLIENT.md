@@ -263,24 +263,37 @@ Computes `cl.serverTime` for the cgame. The most change-heavy function in the cl
 CL_SetCGameTime:
     if !cl.snap.valid: handle extrapolation
     
-    [CUSTOM: proportional safety cap]
-    // Prevent cl.serverTime from running at or ahead of snap.serverTime.
-    // If it does, outgoing usercmd serverTime values can exceed the server's
-    // commandTime → ping=999 → URT ping-kick → zombie-state flood loop.
+    [CUSTOM: safety cap — correct architecture, not a workaround]
+    // WHY A CAP: usercmd.serverTime is stamped directly from cl.serverTime
+    // (CL_FinishMove), so if cl.serverTime runs ahead of sv.time the URT game
+    // QVM computes a negative (→ 999) ping, triggering a ping-kick that feeds
+    // the zombie-state reconnect flood.  Capping cl.serverTime here is the
+    // correct fix — the only alternative would be to decouple usercmd.serverTime
+    // from cl.serverTime, which is a much larger refactor.
+    //
+    // MARGIN vs BACKSTOP: capMs = snapshotMsec/4.  The extrapolate threshold
+    // below is snapshotMsec/3 — slightly larger — so CL_AdjustTimeDelta starts
+    // pulling serverTimeDelta back BEFORE cl.serverTime reaches the cap boundary.
+    // In normal operation the cap fires rarely (jitter spikes only); it is a
+    // backstop, not a primary timing control.  A 1ms margin (historical bug)
+    // made the cap fire every inter-snapshot frame, freezing cl.serverTime and
+    // causing visible stutter and movement lag.
+    //
+    // RELEASE (2000ms): absolute wall-clock server-silence detector — not
+    // proportional to snapshotMsec.  Once the last snapshot is >2s old the
+    // server is presumed dead; the cap releases so cl.serverTime can advance
+    // and the engine can extrapolate gracefully until cl_timeout fires.
     //
     // History vs vanilla:
     //   Vanilla Q3e:   NO cap — cl.serverTime could freely exceed snap.serverTime.
     //   PR #65/66:     cap = 1ms, but gated on cl_adaptiveTiming && !vanillaServer
     //                  (vanilla servers were excluded, so the flood bug persisted).
-    //   PR #68:        cap = 1ms, unconditional — correct fix, but 1ms was still
-    //                  too tight: at high-jitter connections cl.serverTime could
-    //                  oscillate across the boundary every frame, hammering the cap.
+    //   PR #68:        cap = 1ms, unconditional — correct architecture, but 1ms
+    //                  was too tight: cap fired every inter-snapshot frame → freeze.
     //   Commit 571ab66: tried to raise to 2ms but only changed the comment; the
     //                  actual -1 value was never updated.
     //   Current:       cap = snapshotMsec/4, clamped [2, 8] ms, unconditional.
     //                  At 20Hz (snapshotMsec=50) → 8ms.  At 60Hz (16ms) → 4ms.
-    //
-    // Released after 2s of continuous drift (server stopped sending).
     capMs = clamp(snapshotMsec / 4, 2, 8)
     if (cl.serverTime >= cl.snap.serverTime AND drift < 2000):
         cl.serverTime = cl.snap.serverTime - capMs
@@ -323,6 +336,8 @@ else (slow drift — fractional accumulator):
 ```
 
 **Fractional accumulator:** Prevents ±1ms oscillation at equilibrium. At 60Hz, equilibrium extrap rate is 50% (-2 and +2 cancel). At 20Hz, 33% (-4 and +2 cancel at 1:2 ratio). slowFrac oscillates in [-2, +2] at equilibrium — never reaching the ±4 commit threshold, so serverTimeDelta stays rock stable.
+
+**Relationship to the safety cap:** `extrapolateThresh = snapshotMsec/3` (set in the CL_SetCGameTime block below the cap). `capMs = snapshotMsec/4`. Because snapshotMsec/3 > snapshotMsec/4, the extrapolate flag fires and AdjustTimeDelta starts pulling serverTimeDelta back *before* cl.serverTime reaches the cap boundary. In steady state the cap should fire rarely — only during sudden jitter spikes. It is a backstop, not the primary timing control.
 
 **cl_adaptiveTiming modes:**
 - **0**: vanilla Q3e thresholds (hardcoded). slowFrac accumulator still active.

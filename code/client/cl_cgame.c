@@ -1243,21 +1243,36 @@ void CL_SetCGameTime( void ) {
 		if ( cl.serverTime - cl.oldServerTime < 0 ) {
 			cl.serverTime = cl.oldServerTime;
 		}
-		// Cap serverTime below the latest received snapshot by a margin proportional
-		// to the snapshot interval. Prevents cl.serverTime from running ahead of
-		// snap.serverTime, which would make outgoing usercmd serverTime values
-		// exceed the server's commandTime, causing ping=999 and a URT ping-kick
-		// that feeds the zombie-state flood loop. Release after 2s of continuous
-		// drift (server stopped sending). Applied unconditionally — this is a
-		// safety guarantee, not an adaptive-timing feature, so cl_adaptiveTiming=0
-		// still benefits.
+		// Safety cap: keep cl.serverTime strictly below snap.serverTime.
+		//
+		// WHY A CAP: usercmd.serverTime is stamped directly from cl.serverTime
+		// (CL_FinishMove), so if cl.serverTime runs ahead of the server's sv.time
+		// the URT game QVM computes a negative (→ 999) ping, triggering a ping-kick
+		// that feeds the zombie-state reconnect flood.  The cap is the architecturally
+		// correct fix — not a workaround — because the alternative would require
+		// decoupling usercmd.serverTime from cl.serverTime.
+		//
+		// MARGIN vs BACKSTOP: capMs = snapshotMsec/4.  The extrapolate threshold in
+		// the adaptive-timing check below is snapshotMsec/3 — slightly larger than
+		// capMs — so CL_AdjustTimeDelta starts pulling serverTimeDelta back BEFORE
+		// cl.serverTime can reach the cap boundary.  In normal operation the cap
+		// fires rarely (jitter spikes only); it is a backstop, not a primary
+		// timing control.  A margin that is too tight (e.g. 1ms) makes the cap fire
+		// every inter-snapshot client frame, freezing cl.serverTime and causing
+		// visible stutter and movement lag.
+		//
+		// RELEASE (2000ms): once drift ≥ 2s the server is presumed dead (no snapshot
+		// for 2 full seconds).  The cap is released so cl.serverTime can advance and
+		// the engine can extrapolate gracefully until cl_timeout fires.  This is an
+		// absolute wall-clock threshold — not proportional to snapshotMsec — because
+		// "server has been silent for 2 seconds" is rate-independent.
 		{
 			int capMs = cl.snapshotMsec / 4;
 			if ( capMs < 2 ) capMs = 2;
 			if ( capMs > 8 ) capMs = 8;
 			if ( cl.serverTime >= cl.snap.serverTime ) {
 				int drift = cl.serverTime - cl.snap.serverTime;
-				if ( drift < 2000 ) { // 2000ms = 2s release threshold
+				if ( drift < 2000 ) { // release after 2s of silence (server presumed dead)
 					cl.serverTime = cl.snap.serverTime - capMs;
 					SCR_NetMonitorAddCapHit();
 				}
