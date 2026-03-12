@@ -172,6 +172,18 @@ extern portable_samplepair_t	s_rawsamples[];
 static portable_samplepair_t	dmaHD_paintbuffer[DMAHD_PAINTBUFFER_SIZE];
 static int						dmaHD_snd_vol;
 
+// Normalisation divisor for converting the 24.8 fixed-point paint accumulator
+// to a [-1.0, 1.0] float sample, matching S_TransferPaintBuffer in snd_mix.c.
+#define DMAHD_FLOAT_RDIV   (1.0f / (32768.0f * 256.0f - 128.0f))
+
+// Clamp bounds for the float output path (24.8 fixed-point accumulator limits).
+#define DMAHD_FLOAT_MAX    (32767 * 256)    // 0x7FFF00
+#define DMAHD_FLOAT_MIN    (-32768 * 256)   // -0x800000
+
+// Clamp bounds for the 32-bit int PCM output path (24-bit signed range).
+#define DMAHD_INT24_MAX    0x7FFFFF         //  8388607
+#define DMAHD_INT24_MIN    (-0x800000)      // -8388608
+
 qboolean g_tablesinit = qfalse;
 float g_voltable[256];
 
@@ -710,6 +722,8 @@ void dmaHD_TransferPaintBuffer(int endtime)
     int      snd_linear_count;
     short*   snd_out;
     short*   snd_outtmp;
+    float*   float_out;
+    int*     int32_out;
     unsigned long *pbuf = (unsigned long *)dma.buffer;
 
     snd_p = (int*)dmaHD_paintbuffer;
@@ -720,25 +734,57 @@ void dmaHD_TransferPaintBuffer(int endtime)
         // handle recirculating buffer issues
         lpos = ls_paintedtime & ((dma.samples >> 1) - 1);
 
-        snd_out = (short *)pbuf + (lpos << 1);
-
         snd_linear_count = (dma.samples >> 1) - lpos;
         if (ls_paintedtime + snd_linear_count > endtime)
             snd_linear_count = endtime - ls_paintedtime;
 
         snd_linear_count <<= 1;
 
-        // write a linear blast of samples
-        for (snd_outtmp = snd_out, i = 0; i < snd_linear_count; ++i)
+        if ( dma.isfloat && dma.samplebits == 32 )
         {
-            val = *snd_p++ >> 8;
-            *snd_outtmp++ = SMPCLAMP(val);
+            // 32-bit IEEE float output (native WASAPI float path).
+            // Normalise 24.8 fixed-point accumulator to [-1.0, 1.0].
+            float_out = (float *)pbuf + (lpos << 1);
+            for (i = 0; i < snd_linear_count; ++i)
+            {
+                val = *snd_p++;
+                if (val > DMAHD_FLOAT_MAX) val = DMAHD_FLOAT_MAX;
+                else if (val < DMAHD_FLOAT_MIN) val = DMAHD_FLOAT_MIN;
+                *float_out++ = (float)(val + 128) * DMAHD_FLOAT_RDIV;
+            }
+            // AVI capture expects 16-bit PCM; skip for float output path.
+        }
+        else if ( !dma.isfloat && dma.samplebits == 32 )
+        {
+            // 32-bit integer PCM output (e.g. 24-valid-bits-in-32-bit container).
+            // Windows stores the valid bits MSB-aligned, so the 24-bit value
+            // occupies bits [31:8] of the 32-bit container (i.e. val << 8).
+            // The accumulator is naturally in 24-bit range; clamp then shift.
+            int32_out = (int *)pbuf + (lpos << 1);
+            for (i = 0; i < snd_linear_count; ++i)
+            {
+                val = *snd_p++;
+                if (val > DMAHD_INT24_MAX) val = DMAHD_INT24_MAX;
+                else if (val < DMAHD_INT24_MIN) val = DMAHD_INT24_MIN;
+                *int32_out++ = val << 8;
+            }
+            // AVI capture expects 16-bit PCM; skip for 32-bit int output path.
+        }
+        else
+        {
+            // 16-bit PCM output (DirectSound / 16-bit WASAPI fallback).
+            snd_out = (short *)pbuf + (lpos << 1);
+            for (snd_outtmp = snd_out, i = 0; i < snd_linear_count; ++i)
+            {
+                val = *snd_p++ >> 8;
+                *snd_outtmp++ = SMPCLAMP(val);
+            }
+
+            if (CL_VideoRecording())
+                CL_WriteAVIAudioFrame((byte *)snd_out, snd_linear_count << 1);
         }
 
         ls_paintedtime += (snd_linear_count>>1);
-
-        if (CL_VideoRecording())
-            CL_WriteAVIAudioFrame((byte *)snd_out, snd_linear_count << 1);
     }
 }
 

@@ -1483,12 +1483,14 @@ qboolean S_Base_Init( soundInterface_t *si ) {
 	}
 
 #ifndef NO_DMAHD
-	s_khz = Cvar_Get( "s_khz", "44", CVAR_ARCHIVE_ND | CVAR_LATCH );
+	s_khz = Cvar_Get( "s_khz", "48", CVAR_ARCHIVE_ND | CVAR_LATCH );
+	Cvar_CheckRange( s_khz, "0", "48", CV_INTEGER );
+	Cvar_SetDescription( s_khz, "Specifies the sound sampling rate in kHz. Valid values: 8, 11, 22, 44, 48. Default is 48 with dmaHD; on Windows WASAPI the native device rate is used regardless." );
 #else
 	s_khz = Cvar_Get( "s_khz", "22", CVAR_ARCHIVE_ND | CVAR_LATCH );
-#endif
 	Cvar_CheckRange( s_khz, "0", "48", CV_INTEGER );
 	Cvar_SetDescription( s_khz, "Specifies the sound sampling rate, (8, 11, 22, 44, 48) in kHz. Default value is 22." );
+#endif
 
 	switch( s_khz->integer ) {
 		case 48:
