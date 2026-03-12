@@ -987,6 +987,7 @@ static void CL_AdjustTimeDelta( void ) {
 	// system reacts at the same number-of-snapshots equivalent across all rates.
 	// At 20Hz (snapshotMsec=50): resetTime=500, fastAdjust=100 — same as vanilla.
 	// At 60Hz (snapshotMsec=16): resetTime=500 (floor), fastAdjust=50 (floor).
+	// Safe for vanilla servers: snapshotMsec is measured from actual intervals.
 	if ( cl_adaptiveTiming->integer ) {
 		resetTime  = cl.snapshotMsec * 10;
 		fastAdjust = cl.snapshotMsec * 2;
@@ -1234,7 +1235,8 @@ void CL_SetCGameTime( void ) {
 		// (adaptive timing only).  Release the cap when the uncapped time
 		// drifts several snapshot intervals past the last snapshot (server
 		// stopped sending).
-		if ( cl_adaptiveTiming->integer ) {
+		// Skip this cap on vanilla servers — they don't support our timing protocol.
+		if ( cl_adaptiveTiming->integer && !cl.vanillaServer ) {
 			if ( cl.serverTime >= cl.snap.serverTime ) {
 				int drift = cl.serverTime - cl.snap.serverTime;
 				int capLimit = 1000;
@@ -1263,9 +1265,12 @@ void CL_SetCGameTime( void ) {
 
 		// note if we are almost past the latest frame (without timeNudge),
 		// so we will try and adjust back a bit when the next snapshot arrives.
+		// The scaled threshold (snapshotMsec/3) is safe for vanilla servers: it
+		// uses measured intervals and has no serverTime cap side-effects.
 		if ( cl_adaptiveTiming->integer ) {
 			// Scale the detection window with the measured snapshot interval.
 			// Evaluated in 1/4ms units so slowFrac state is visible.
+			// At 20Hz: thresh=16ms (vs hardcoded 5ms) → better equilibrium on vanilla.
 			int extrapolateThresh = cl.snapshotMsec / 3;
 			if ( extrapolateThresh <  3 ) extrapolateThresh =  3;
 			if ( extrapolateThresh > 16 ) extrapolateThresh = 16;
@@ -1274,7 +1279,7 @@ void CL_SetCGameTime( void ) {
 				SCR_NetMonitorAddExtrap();
 			}
 		} else {
-			// vanilla: hardcoded 5ms threshold; include fractional accumulator
+			// cl_adaptiveTiming 0: hardcoded 5ms threshold; include fractional accumulator
 			if ( ( cls.realtime + cl.serverTimeDelta - cl.snap.serverTime ) * 4 + slowFrac >= -20 ) {
 				cl.extrapolatedSnapshot = qtrue;
 			}
