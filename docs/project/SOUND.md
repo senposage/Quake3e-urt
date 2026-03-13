@@ -1133,100 +1133,131 @@ Build flag: compile with `NO_DMAHD=1` to disable dmaHD and use the standard DMA 
 
 ---
 
-## Global Audio Preemption — Root Cause and Fix
+## Global Audio Preemption — Design and Implementation
 
-### Root cause
+### How DMA handles it ("vanilla")
 
-Q3's channel model lets any new sound on the same `(entnum, entchannel)` slot
-immediately stop whatever is currently playing there.  This created several
-distinct problems confirmed by `s_alDebugPlayback 1`:
+`snd_dma.c` uses no per-sound guards at all.  Every new `S_StartSound` call
+allocates from a free-list; when the pool is full it steals the **oldest**
+channel — same entity first, then any entity, then the listener as last resort.
+`CHAN_ANNOUNCER` is the only channel with steal-protection.  CHAN_WEAPON has
+no special treatment whatsoever.
 
-| Pattern | Example | Effect |
-|---------|---------|--------|
-| CHAN_WEAPON cross-sfx | `de_out.wav` cut at 3% by `cock.wav` | Fire boom inaudible |
-| CHAN_WEAPON same-sfx | `mac11-inside.wav` cut at 17% by itself | Rapid-fire clips itself |
-| CHAN_WEAPON variant switch | `mac11-inside.wav` cut by `mac11-outside.wav` | Location switch early |
-| Ambient same-sfx | `truckpassby.wav` cut at 35–90% by itself | Pass-by sound truncated |
-| Impact cross-sfx | `concrete1.wav` cut at 5% by `brass2.wav` | Impact crack inaudible |
+Three mechanisms keep DMA from drowning in its own events:
 
-Earlier time-based guards (`CHAN_WEAPON_MIN_PLAY_MS = 100`, then 50 ms) only
-postponed the CHAN_WEAPON problem — after the guard expired, `cock.wav` still
-killed `de_out.wav`, and none of the other channels were protected at all.
+| Mechanism | Value | Purpose |
+|-----------|-------|---------|
+| Per-entity dedup window | 20 ms (100 ms for world) | Same sfx from same entity can't fire again within the window — prevents double-start in a single frame |
+| Per-entity concurrency cap | 16 (listener), 8 (other), 2 (world) | Limits how many concurrent copies of the same sound any one entity can hold |
+| `ENTITYNUM_WORLD` hard cap | `MAX_CHANNELS / 8` | Brass, impacts, and ricochets all share the world entity — without this cap they exhaust the pool under heavy fire |
 
-### Fix — adaptive content-based guard
+That's it.  No content awareness, no looping, no fade.  It works because
+weapon sounds are **different files** (`de_out.wav`, `back.wav`, `cock.wav`),
+so each can play concurrently rather than fighting for the same slot.  The
+dedup window prevents the same file from firing twice in one frame.
 
-`S_AL_RegisterSound` now scans the decoded PCM **backward** to find the last
-frame above the silence threshold (≈ −54 dB for 16-bit).  This value,
-`contentSamples`, is stored in `alSfxRec_t` alongside `soundLength`.  The scan
-is an O(N) integer comparison loop — microseconds per file — done once while
-the PCM is already in RAM before being handed to OpenAL.
+### Why OpenAL needed more
 
-`S_AL_StartSound` applies two checks before engaging the guard:
+OpenAL maps each `(entnum, entchannel)` pair to a **single source**.  When a
+new sound arrives on an occupied slot the existing source must be stopped and
+the buffer replaced — a hard cut.  Under URT's weapon-animation event burst
+(all three DE-50 sounds arrive within ~30 ms) every sound immediately evicted
+its predecessor, making the fire boom completely inaudible.
 
-1. **State check** — query `AL_SOURCE_STATE`.  If `AL_STOPPED` (sound finished
-   but `isPlaying` not yet cleared by `S_AL_Update`), skip the guard entirely;
-   `AL_SAMPLE_OFFSET` resets to 0 on a stopped source and would otherwise
-   falsely trigger the guard, silencing rapid-fire follow-ups.
-
-2. **Content-magnitude check** — compare the incoming sound's `contentSamples`
-   against the current sound's `contentSamples`.  If the incoming sound has
-   *more* audible content than the current sound, skip the guard and allow
-   preemption immediately.  This lets a fire boom (large `contentSamples`)
-   always cut through a weapon-cycle sound (small `contentSamples`, e.g.
-   `cock.wav`, `slide.wav`) that is still in playback on the channel —
-   preventing automatic fire and rapid-fire pistols from being silenced when the
-   cycle event from the previous shot has not yet finished.
-
-If both checks pass (source is `AL_PLAYING` and incoming content ≤ current
-content), `AL_SAMPLE_OFFSET` is read; if `offset < contentSamples`, the
-incoming request is dropped.  If the current sound has consumed its audible
-content (or the file is all-silent, `contentSamples == 0`), preemption proceeds
-normally.
+DMA avoids this because its channel pool is larger and the three sounds land on
+**separate** channels (no `(entnum, entchannel)` constraint).
 
 ### URT weapon audio model
 
 URT builds weapon audio by continuously re-submitting the fire sound while the
-trigger is held — it does **not** use OpenAL looping (`AL_LOOPING`).  The game
-fires `EV_FIRE_WEAPON` every server frame; each submission attempts to restart
-the same file from the beginning.  The guard lets the current iteration play
-until its audible content is consumed before accepting the restart, which
-creates a seamless looping effect at the weapon's fire cadence.  When the
-trigger is released (no more `EV_FIRE_WEAPON` events), the current iteration
-plays out its silent tail and the source reaches `AL_STOPPED` naturally —
-producing the characteristic "spin-down" feel without any hard truncation.
+trigger is held.  The game fires `EV_FIRE_WEAPON` every server frame; each
+event attempts to restart the same buffer on the same channel.
 
-Semi-automatic weapons (pistols, DE-50) additionally submit per-shot animation
-sounds (`back.wav`, `cock.wav`, `slide.wav`) on `CHAN_WEAPON` immediately after
-the fire event.  These cycle sounds must not be able to silence the fire boom,
-and the fire boom must be able to preempt a cycle sound that is still playing
-when the trigger is pulled again.
+- **Automatic fire**: re-submissions arrive at the weapon's fire cadence
+  (e.g. 150 ms for MAC-11).  The OpenAL source should loop seamlessly rather
+  than restart from frame 0 each time.
+- **Semi-auto / single shot**: one `EV_FIRE_WEAPON` per trigger pull, followed
+  immediately by cycle sounds (`back.wav`, `cock.wav`) on the same channel.
+- **Trigger released**: events stop; the current buffer iteration should play
+  out to its natural end — not be hard-stopped.
 
-### What the guard handles
+Sounds that need special handling are not limited to `CHAN_WEAPON`:
 
-- **DE-50 `de_out.wav`** — ~2.5 s audible content in a 3.74 s file.
-  `cock.wav` (short, small `contentSamples`) arriving at 130 ms: incoming
-  content < current content → guard applied → `cock.wav` dropped.  Fire boom
-  plays fully.
-- **MAC-11 continuous fire** — fire sound re-submitted every server frame.
-  Same sfx → equal content → guard applied; guard expires at the fire cadence
-  so the sound restarts cleanly at each cycle.  Trigger release: no more
-  submissions; current iteration plays out its tail.  Re-fire after burst:
-  either the silent tail has been passed (`offset ≥ contentSamples`, guard
-  expired) or the source is `AL_STOPPED` (guard skipped by state check) —
-  both cases allow an immediate restart.
-- **Pistol / semi-auto rapid-fire** — fire sound (`contentSamples` = X) plays,
-  cycle sound (`contentSamples` = Y < X) preempts once the fire guard expires.
-  Next fire event: incoming content (X) > current content (Y) → content-
-  magnitude check skips the guard → fire sound starts immediately.  No silent
-  shots on rapid trigger pulls.
-- **MAC-11 inside → outside** — location variant switch at 160 ms.  Guard
-  (≈ 150 ms) has just expired; the outside variant is accepted immediately.
-- **`truckpassby.wav`** — 9.2 s ambient pass-by.  Guard holds for the full
-  audible length; the map can only retrigger once the truck has passed.
-- **Impact sounds** — each crack plays to its audible end before the slot is
-  reused for the next impact or casing.
+| Sound class | Channel | Problem without guards | Guard needed |
+|-------------|---------|----------------------|--------------|
+| Fire boom (DE-50 `de_out.wav`) | CHAN_WEAPON | Cut by cycle sounds at 30 ms | Transient protection (≤ 150 ms) |
+| Fire loop (MAC-11) | CHAN_WEAPON | Restart gap every 150 ms | `AL_LOOPING` seamless loop |
+| Cycle sounds (`back.wav`, `cock.wav`) | CHAN_WEAPON | Silenced by long fire guard | Cap lets them through after 150 ms |
+| Brass / shell casings | CHAN_AUTO / world | Pool exhaustion at high sv_fps | World-entity cap + dedup window |
+| Bullet impacts / ricochets | CHAN_AUTO / world | Same as above | Same caps |
+| Ambient pass-bys (`truckpassby`) | CHAN_AUTO | Cut mid-file by retrigger | Full content guard (no cap) |
+| Impact cracks (`concrete1`, `ric1`) | CHAN_AUTO / world | Cut by casing within 5 ms | Full content guard (no cap) |
 
-### Design note — why no cache
+### Current implementation
+
+**`S_AL_RegisterSound`** scans the decoded PCM backward to find the last
+frame above the silence threshold (≈ −54 dB for 16-bit).  This value,
+`contentSamples`, is stored in `alSfxRec_t` once at load time.
+
+**`S_AL_StartSound`** applies the following logic when a new sound arrives on
+an occupied named channel:
+
+1. **Same sfx, recent re-submission** (`allocTime` age ≤ `WEAPON_FIRE_LOOP_-
+   TIMEOUT_MS`) → engage `AL_LOOPING = AL_TRUE` for a seamless fire loop;
+   refresh `lastFireMs`; return without allocating a new source.
+
+2. **Different sfx — preemption guard:**
+   - Query `AL_SOURCE_STATE`; skip guard entirely if `AL_STOPPED` (offset
+     resets to 0 on a stopped source and would falsely re-engage the guard).
+   - Read `AL_SAMPLE_OFFSET`; if `offset < contentSamples`, drop the request.
+   - **`CHAN_WEAPON` cap**: `contentSamples` is clamped to
+     `WEAPON_GUARD_CAP_MS` (150 ms) before the comparison so that long fire
+     sounds (`de_out.wav`, ~2.5 s) cannot silence rapid-fire events for their
+     full content duration.  Non-weapon channels (ambient, impacts) use the
+     full `contentSamples` so they play to their audible end.
+   - Guard expires → stop old source → start new source with gain fade-in.
+
+3. **Gain fade-in** (`SRC_FADE_IN_MS` = 15 ms): newly-started local sources
+   begin at `AL_GAIN = 0` and ramp to full gain in `S_AL_Update`, masking the
+   hard cut of the predecessor.
+
+**`S_AL_Update`** (every frame):
+- **Loop timeout**: if `weaponLoop` is set and `(now − lastFireMs) >
+  WEAPON_FIRE_LOOP_TIMEOUT_MS` (250 ms), set `AL_LOOPING = AL_FALSE` —
+  OpenAL finishes the current buffer iteration and stops naturally (trigger-
+  released "plays out" behaviour).
+- **Fade-in ramp**: advance gain on local sources that are still within their
+  `SRC_FADE_IN_MS` window.
+
+### Behaviour by scenario
+
+| Scenario | Before | After |
+|----------|--------|-------|
+| DE-50 — fire once, wait | ✓ worked | ✓ works |
+| DE-50 — spam trigger | Silent after first shot (2.5 s guard) | Each shot plays; 150 ms cap lets cycle sounds through |
+| MAC-11 — hold trigger | Re-submission gap every 150 ms | `AL_LOOPING` seamless loop |
+| MAC-11 — burst then re-fire | Blocked by previous sound's tail | Loop times out, plays out, restarts cleanly |
+| Pistol rapid-fire | Blocked by `cock.wav` still playing | 150 ms cap; cycle sound preemptable after its own guard |
+| Ambient pass-by | Cut mid-file by retrigger | Full content guard; completes audible length |
+| Impacts / brass | Pool exhaustion | Existing world-entity cap + dedup window |
+
+### Future work
+
+- **True crossfade**: requires two concurrent sources per channel slot.  An
+  "orphan fade-out" list would let the evicted source decay to silence (≈ 20 ms)
+  while the new source fades in — eliminating even the brief click on the
+  predecessor.  Cost: doubles source-pool usage for active weapons.
+
+- **Priority tagging**: a `soundPriority` field on `alSfxRec_t` (set at load
+  time from the file path or a sidecar config) would replace the content-
+  magnitude heuristic with explicit intent: `fire_boom > cycle > ambient`.
+
+- **Per-class dedup / cap tuning**: brass and ricochet sounds could carry their
+  own dedup window (matching the DMA 100 ms world-entity window) and a
+  per-class concurrency cap, giving the same headroom DMA provides without
+  requiring the blunt world-entity hard cap.
+
+### Design note — why no cache for `contentSamples`
 
 The PCM scan is ≈ 0.04 ms per file.  Across a full session (≤ 1 000 sounds
 loaded lazily on first use), total cost is under 50 ms spread across the whole
