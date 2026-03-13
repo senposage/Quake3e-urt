@@ -1,7 +1,9 @@
 # Sound System
 
-> Covers `code/client/snd_main.c`, `snd_dma.c`, `snd_dmahd.c`, `snd_mem.c`, `snd_mix.c`, `snd_adpcm.c`, `snd_codec.c`, `snd_codec_wav.c`, `snd_wavelet.c`, and `snd_local.h`.
-> This branch adds dmaHD HRTF/spatial sound integration via `snd_dmahd.c` (guarded by `#ifndef NO_DMAHD`).
+> Covers `code/client/snd_main.c`, `snd_dma.c`, `snd_dmahd.c`, `snd_openal.c`, `snd_mem.c`, `snd_mix.c`, `snd_adpcm.c`, `snd_codec.c`, `snd_codec_wav.c`, `snd_wavelet.c`, and `snd_local.h`.
+> This branch adds:
+> - **OpenAL Soft backend** (`snd_openal.c`, guarded by `#ifdef USE_OPENAL`) — the **preferred** backend for click-free HRTF audio.
+> - dmaHD HRTF/spatial sound fallback via `snd_dmahd.c` (guarded by `#ifndef NO_DMAHD`).
 
 ---
 
@@ -9,13 +11,14 @@
 
 1. [Architecture Overview](#architecture-overview)
 2. [snd_main.c — Sound Dispatcher](#snd_mainc--sound-dispatcher)
-3. [snd_dma.c — Base DMA Backend](#snd_dmac--base-dma-backend)
-4. [snd_dmahd.c — High-Definition Backend](#snd_dmahdcc--high-definition-backend)
-5. [snd_mem.c — Sound Data Loading](#snd_memc--sound-data-loading)
-6. [snd_mix.c — Mixing Engine](#snd_mixc--mixing-engine)
-7. [Codecs](#codecs)
-8. [Key Data Structures](#key-data-structures)
-9. [Key Sound Cvars](#key-sound-cvars)
+3. [snd_openal.c — OpenAL Soft Backend [URT]](#snd_openalc--openal-soft-backend-urt)
+4. [snd_dma.c — Base DMA Backend](#snd_dmac--base-dma-backend)
+5. [snd_dmahd.c — High-Definition dmaHD Backend](#snd_dmahdcc--high-definition-backend)
+6. [snd_mem.c — Sound Data Loading](#snd_memc--sound-data-loading)
+7. [snd_mix.c — Mixing Engine](#snd_mixc--mixing-engine)
+8. [Codecs](#codecs)
+9. [Key Data Structures](#key-data-structures)
+10. [Key Sound Cvars](#key-sound-cvars)
 
 ---
 
@@ -25,32 +28,152 @@
 Game calls S_StartSound(origin, entnum, channel, sfxHandle)
                 │
                 ▼
-         snd_main.c dispatcher
-         (si.StartSound / si.StartLocalSound)
+         snd_main.c  S_Init()
+         ┌─────────────────────────────────┐
+         │  1. Try S_AL_Init()  (USE_OPENAL)│  ← preferred: click-free HRTF
+         │  2. Try S_Base_Init() → dmaHD    │  ← fallback: legacy DMA+HRTF
+         └─────────────────────────────────┘
                 │
-         ┌──────┴────────┐
-         │               │
-    snd_dma.c       snd_dmahd.c
-  (base backend)   (HD backend)
-         │               │
-         └──────┬────────┘
+         soundInterface_t *si (active backend)
                 │
-          snd_mix.c
-       (channel mixing)
-                │
-                ▼
-         platform audio driver
-     (sdl_snd.c / win_snd.c / linux_snd.c)
-                │
-                ▼
-           OS audio device
+         ┌──────┴──────────────────────┐
+         │                             │
+    snd_openal.c               snd_dma.c + snd_dmahd.c
+  (OpenAL Soft backend)        (DMA base + HD override)
+         │                             │
+    OpenAL Soft                  snd_mix.c
+    (HRTF, mixing,               (channel mixing)
+     resampling all                    │
+     handled by OpenAL)               ▼
+         │                      platform driver
+         │                (sdl_snd / win_snd / linux_snd)
+         │                             │
+         └─────────────────────────────┘
+                          │
+                    OS audio device
 ```
 
-The sound system runs in the game thread (not a separate audio thread). `S_Update(msec)` is called from `CL_Frame` once per frame. The platform driver provides a DMA buffer; the engine writes mixed samples into it.
+**Backend selection priority (compile-time `USE_OPENAL=1`):**
+
+| Priority | Backend | Guard | When used |
+|----------|---------|-------|-----------|
+| 1 | OpenAL Soft (`snd_openal.c`) | `USE_OPENAL` | If OpenAL library loads at runtime |
+| 2 | dmaHD (`snd_dmahd.c`) | `NO_DMAHD=0` | If OpenAL unavailable and dmaHD enabled |
+| 3 | Base DMA (`snd_dma.c`) | always | Final fallback |
+
+The OpenAL backend is entirely self-contained — it does **not** use `snd_mix.c`, `snd_mem.c`, or the DMA buffer.  The DMA backends share the `snd_mix.c` paint path.
+
+The sound system runs in the game thread (not a separate audio thread). `S_Update(msec)` is called from `CL_Frame` once per frame.
 
 ---
 
-## snd_main.c — Sound Dispatcher
+## snd_openal.c — OpenAL Soft Backend [URT]
+
+**File:** `code/client/snd_openal.c`  
+**Guard:** `#ifdef USE_OPENAL` (enabled by default; build with `USE_OPENAL=0` to disable)  
+**New file** added in this branch.
+
+### Why OpenAL Soft instead of dmaHD
+
+The dmaHD backend suffered from recurring audio click/pop artefacts (PRs #70 #73 #74 #75) caused by:
+
+1. **HP/LP filter warm-up contamination** — the resampling loop pre-fills a 4-sample warm-up from negative positions that wrap near the end of the source buffer; Hermite `x+2` lookahead then exceeded `soundLength` and wrapped to `sample[0]` (the attack peak), injecting spurious energy into `buffer[0..2]` — **a step discontinuity every time any sound started**.
+2. **End-of-buffer spike** — the same wraparound at the last resampling iteration contaminated `buffer[outcount-1]` before the channel ended.
+
+Both root causes were addressed in snd_dmahd.c (PR #75), but the fundamental complexity of managing custom IIR filter state, manual resampling, and hand-coded HP/LP filters creates ongoing maintenance risk.
+
+**OpenAL Soft eliminates these artefacts structurally:**
+
+- Buffer transitions are guaranteed click-free by the OpenAL specification — no filter warm-up state to manage.
+- HRTF is provided by OpenAL Soft using measured HRIR datasets (CIPIC / MIT KEMAR) — no custom convolution code needed.
+- Resampling is handled internally by OpenAL Soft at the device's native rate.
+- Cross-platform: WASAPI (Windows), PipeWire/ALSA/PulseAudio (Linux), CoreAudio (macOS) — single code path.
+
+### Dynamic Library Loading
+
+The OpenAL library is loaded at **run-time** via `dlopen` / `LoadLibrary` so that:
+- The executable has no mandatory OpenAL dependency.
+- If OpenAL Soft is not installed the engine silently falls back to dmaHD.
+- No link-time `-lopenal` flag required.
+
+Library names tried (in order):
+
+| Platform | Libraries |
+|----------|-----------|
+| Windows  | `OpenAL32.dll`, `soft_oal.dll` |
+| Linux    | `libopenal.so.1`, `libopenal.so` |
+| macOS    | `/System/Library/Frameworks/OpenAL.framework/OpenAL`, `libopenal.dylib` |
+
+### HRTF Activation
+
+When the device supports `ALC_SOFT_HRTF` (OpenAL Soft extension):
+
+```c
+ALCint attribs[] = { ALC_HRTF_SOFT, ALC_TRUE, 0 };
+context = alcCreateContext(device, attribs);
+```
+
+HRTF status is printed at startup (`s_info` command shows `HRTF: enabled/disabled`).
+
+Controlled by the `s_alHRTF` cvar (default `1`).
+
+### Source Pool
+
+Up to `MAX_CHANNELS` (96) OpenAL sources are pre-allocated at init.  Source stealing (oldest non-looping source) handles overflow gracefully.
+
+### Music Streaming
+
+Background music is streamed via a dedicated AL source and `S_AL_MUSIC_BUFFERS` (4) ping-pong buffers of 32 KiB each, refilled from the codec in `S_AL_Update`.
+
+### Raw Samples
+
+`S_RawSamples` (cinematics, VoIP) queues PCM data through a dedicated streaming source with `S_AL_RAW_BUFFERS` (8) rotating buffers.
+
+### Key New Cvars
+
+| Cvar | Default | Notes |
+|------|---------|-------|
+| `s_alDevice` | `""` | OpenAL output device name; empty = system default |
+| `s_alHRTF` | `1` | Enable HRTF via `ALC_SOFT_HRTF` |
+| `s_alMaxDist` | `1024` | Maximum attenuation distance (game units) |
+
+### snd_openal.h — Public API
+
+```c
+#ifdef USE_OPENAL
+qboolean S_AL_Init(soundInterface_t *si);  // init OpenAL + populate si table
+#endif
+```
+
+### snd_main.c Changes [URT]
+
+```c
+// snd_main.c: S_Init — try OpenAL first, fall back to base
+#ifdef USE_OPENAL
+if (!started)
+    started = S_AL_Init(&si);
+#endif
+if (!started)
+    started = S_Base_Init(&si);
+```
+
+### Build System
+
+```makefile
+USE_OPENAL = 1          # default: enabled
+# USE_OPENAL = 0        # disable: use dmaHD / base DMA only
+```
+
+```makefile
+ifeq ($(USE_OPENAL),1)
+  BASE_CFLAGS += -DUSE_OPENAL
+endif
+# snd_openal.o added to Q3OBJ when USE_OPENAL=1
+```
+
+No link-time library flag needed — OpenAL is loaded dynamically at runtime.
+
+---
 
 **File:** `code/client/snd_main.c`
 
@@ -589,16 +712,34 @@ typedef struct {
 | `s_initsound` | 1 | Enable sound system |
 | `s_volume` | 0.8 | Master volume |
 | `s_musicvolume` | 0.25 | Music volume |
-| `s_doppler` | 1 | Enable Doppler effect (HD backend only) |
-| `s_khz` | 44 | Playback frequency (11/22/44/48 kHz) |
-| `s_mixahead` | 0.2 | How far ahead to mix (seconds) |
-| `s_mixPreStep` | 0.05 | Mix step size |
+| `s_doppler` | 1 | Enable Doppler effect (all backends) |
+| `s_khz` | 44 | Playback frequency (DMA backends only; 11/22/44/48 kHz) |
+| `s_mixahead` | 0.2 | How far ahead to mix (DMA backends only) |
+| `s_mixPreStep` | 0.05 | Mix step size (DMA backends only) |
 | `s_compression` | 0 | Sound compression: 0=none, 1=wavelet, 2=ADPCM |
-| `s_useHD` | 1 | Use HD backend (higher quality mixing) |
+| `s_useHD` | 1 | Use HD backend (dmaHD; no effect when OpenAL is active) |
+
+### OpenAL Soft Backend Cvars [URT]
+
+When the OpenAL backend is active (`USE_OPENAL=1` and `libopenal.so.1` present):
+
+| Cvar | Default | Notes |
+|---|---|---|
+| `s_alDevice` | `""` | OpenAL output device name; empty = OS default |
+| `s_alHRTF` | `1` | Enable HRTF via `ALC_SOFT_HRTF` (OpenAL Soft only) |
+| `s_alMaxDist` | `1024` | Maximum distance for source attenuation (game units) |
+
+- OpenAL Soft selects the native device rate automatically (no `s_khz` needed).
+- `s_doppler` controls `AL_DOPPLER_FACTOR` (1.0 = enabled, 0.0 = disabled).
+- HRTF uses OpenAL Soft's built-in CIPIC / MIT KEMAR datasets — no custom DSP code.
+
+Build flags:
+- `USE_OPENAL=0` — disable OpenAL, force dmaHD / base DMA.
+- `NO_DMAHD=1` — disable dmaHD; only relevant when OpenAL is also disabled.
 
 ### dmaHD-Specific Behavior [URT]
 
-When dmaHD is active (`NO_DMAHD` not set):
+When dmaHD is active and OpenAL is unavailable (`USE_OPENAL=0` or OpenAL library not found):
 - `s_khz` defaults to **48** (used as fallback; on Windows WASAPI the native device rate is used regardless)
 - `s_doppler` enables HRTF Doppler simulation
 - On Windows, WASAPI queries `GetMixFormat` and matches the native device rate + format exactly — **no resampling, no APO disruption** (typically 48 000 Hz / 32-bit float on modern hardware)
