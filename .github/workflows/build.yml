@@ -74,6 +74,17 @@ jobs:
         make clean ARCH=${{ matrix.arch }}
         make ${{ matrix.rule }} -j$(nproc) ARCH=${{ matrix.arch }} COMPILE_ARCH=${{ matrix.arch }} CC=${{ matrix.cc }} DESTDIR=bin USE_SDL=0 USE_RENDERER_DLOPEN=0 RENDERER_DEFAULT=opengl
 
+    - name: Download soft_oal.dll
+      if: ${{ github.event_name != 'release' || matrix.btype != 'Debug' }}
+      shell: bash
+      run: |
+        ver=1.25.1
+        zip="openal-soft-${ver}-bin.zip"
+        curl -fsSL -o "${zip}" "https://github.com/kcat/openal-soft/releases/download/${ver}/${zip}"
+        win_arch=$( [ "${{ matrix.arch }}" = "x86" ] && echo "Win32" || echo "Win64" )
+        7z e "${zip}" "openal-soft-${ver}-bin/bin/${win_arch}/soft_oal.dll" -obin/ -y
+        rm "${zip}"
+
     - uses: actions/upload-artifact@v4
       if: matrix.cc == 'gcc' && matrix.btype == 'Release'
       with:
@@ -126,6 +137,17 @@ jobs:
         make ${{ matrix.rule }} ARCH=${{ matrix.arch }} DESTDIR=bin USE_SDL=0 USE_RENDERER_DLOPEN=0 RENDERER_DEFAULT=vulkan CNAME=quake3e-vulkan BUILD_SERVER=0
         make clean ARCH=${{ matrix.arch }}
         make ${{ matrix.rule }} ARCH=${{ matrix.arch }} DESTDIR=bin USE_SDL=0 USE_RENDERER_DLOPEN=0 RENDERER_DEFAULT=opengl
+
+    - name: Download soft_oal.dll
+      if: ${{ github.event_name != 'release' || matrix.btype != 'Debug' }}
+      shell: bash
+      run: |
+        ver=1.25.1
+        zip="openal-soft-${ver}-bin.zip"
+        curl -fsSL -o "${zip}" "https://github.com/kcat/openal-soft/releases/download/${ver}/${zip}"
+        win_arch=$( [ "${{ matrix.arch }}" = "x86" ] && echo "Win32" || echo "Win64" )
+        7z e "${zip}" "openal-soft-${ver}-bin/bin/${win_arch}/soft_oal.dll" -obin/ -y
+        rm "${zip}"
 
     - uses: actions/upload-artifact@v4
       if: matrix.btype == 'Release'
@@ -187,6 +209,17 @@ jobs:
         copy code\win32\msvc2017\output\quake3e.exe bin\quake3e-vulkan${{ matrix.suffix }}.exe
         msbuild code\win32\msvc2017\renderervk.vcxproj -p:Configuration=${{ matrix.btype }},Platform=${{ matrix.platform }} -t:Clean
         msbuild code\win32\msvc2017\quake3e.vcxproj -p:TargetName=quake3e,Configuration=${{ matrix.btype }},Platform=${{ matrix.platform }},UseWasapi=USE_WASAPI=0 -t:Clean
+
+    - name: Download soft_oal.dll
+      if: ${{ github.event_name != 'release' || matrix.btype != 'Debug' }}
+      shell: pwsh
+      run: |
+        $ver = "1.25.1"
+        $zip = "openal-soft-$ver-bin.zip"
+        Invoke-WebRequest "https://github.com/kcat/openal-soft/releases/download/$ver/$zip" -OutFile $zip
+        $winArch = @{ x86 = "Win32"; x64 = "Win64"; arm64 = "ARM64" }["${{ matrix.arch }}"]
+        7z e $zip "openal-soft-$ver-bin/bin/$winArch/soft_oal.dll" "-obin\" -y
+        Remove-Item $zip
 
     - uses: actions/upload-artifact@v4
       if: ${{ matrix.btype == 'Release' }}
