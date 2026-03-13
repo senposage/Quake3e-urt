@@ -231,26 +231,22 @@ static LPALAUXILIARYEFFECTSLOTF       qalAuxiliaryEffectSlotf;
 #define S_AL_WEAPON_SOUND_PREFIX        "sound/weapons/"
 #define S_AL_WEAPON_SOUND_PREFIX_LEN    14  /* strlen("sound/weapons/") */
 
-/* Minimum time (ms) a CHAN_WEAPON sound must play before it can be preempted
- * by another sound on the same channel.
+/* Minimum time (ms) a CHAN_WEAPON sound must play before the SAME sound can
+ * restart it (rapid-fire / full-auto).
  *
- * Without this guard, weapon fire-animation sequences submit multiple sounds
- * on CHAN_WEAPON in rapid succession (e.g. DE-50: de_out.wav → back.wav →
- * cock.wav) and each one preempts the previous after only ~30 ms (1 % of the
- * 3.74 s shot sound), making the gunshot completely inaudible.  This affects
- * ALL weapons to varying degrees — longer samples tolerate preemption less
- * (DE-50 de_out.wav is most severe) while shorter samples are less impacted,
- * but all CHAN_WEAPON sounds benefit from the protection.
+ * Cross-sound preemption (a different sfxHandle cutting the current one short)
+ * is blocked entirely in S_AL_StartSound — this constant only governs same-sfx
+ * restarts, i.e. a rapid-fire or full-auto weapon re-firing the identical
+ * sample.
  *
- * 100 ms is chosen to:
- *   • protect the initial crack/transient of semi-auto shots before mechanical
- *     cycling sounds (slide back, hammer cock) take over the channel
- *   • not block full-auto weapons: the Negev fires negev_sil.wav every ~100 ms
- *     so the guard (elapsed < 100 ms) expires at the same cadence as fire rate
- *   • semi-auto weapons cannot physically fire faster than ~100 ms/round, so
- *     no legitimate cross-shot preemption is blocked
+ * Purpose: swallow duplicate submissions of the same fire event that arrive on
+ * consecutive render frames (≤ 16 ms apart at 60 fps) due to client-side
+ * prediction.  50 ms is 3× that window — enough to suppress all per-frame
+ * duplicates — while staying well below the cadence of the fastest full-auto
+ * weapon in URT (ZM300 ≈ 120 ms/shot, Negev ≈ 200 ms/shot), so real rapid-
+ * fire restarts are never blocked.
  */
-#define CHAN_WEAPON_MIN_PLAY_MS  100
+#define CHAN_WEAPON_MIN_PLAY_MS  50
 
 /* Per-sound-file data */
 typedef struct alSfxRec_s {
@@ -1541,11 +1537,33 @@ static void S_AL_StartSound( const vec3_t origin, int entnum,
     if (entchannel != CHAN_AUTO) {
         srcIdx = S_AL_FindSourceByChannel(entnum, entchannel);
         if (srcIdx >= 0) {
-            /* Minimum play-time guard for CHAN_WEAPON — see CHAN_WEAPON_MIN_PLAY_MS. */
+            /* CHAN_WEAPON cross-sound preemption guard.
+             *
+             * Fire-animation sequences submit multiple distinct sounds on
+             * CHAN_WEAPON after a shot (e.g. DE-50: de_out.wav → back.wav →
+             * cock.wav).  Allowing any of those to preempt the primary fire
+             * boom silences the gunshot.  The fix has two layers:
+             *
+             *   1. Cross-sound block: if the incoming sfxHandle differs from
+             *      the currently playing one, drop the request entirely.  The
+             *      game re-submits animation events every frame; they will
+             *      naturally start once the channel is free.
+             *
+             *   2. Same-sfx minimum-play guard: rapid-fire and full-auto
+             *      weapons restart the SAME fire sample on each shot.  Enforce
+             *      CHAN_WEAPON_MIN_PLAY_MS so the sample is not restarted
+             *      faster than the weapon's true fire rate (prevents micro-
+             *      glitches from duplicate per-frame events; 50 ms is 3× one
+             *      render frame at 60 fps and well below the fastest weapon
+             *      cadence in URT ≈ 120 ms/shot). */
             if (entchannel == CHAN_WEAPON) {
-                int elapsed = Com_Milliseconds() - s_al_src[srcIdx].allocTime;
-                if (elapsed < CHAN_WEAPON_MIN_PLAY_MS)
+                if (s_al_src[srcIdx].sfx != sfx)
                     return;
+                {
+                    int elapsed = Com_Milliseconds() - s_al_src[srcIdx].allocTime;
+                    if (elapsed < CHAN_WEAPON_MIN_PLAY_MS)
+                        return;
+                }
             }
 
             /* Level 1: label preemptions so they are visually distinct from
