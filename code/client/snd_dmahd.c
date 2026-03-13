@@ -191,6 +191,20 @@ static float					s_dmaHD_limiterGain = 1.0f;
 #define DMAHD_INT24_MAX    0x7FFFFF         //  8388607
 #define DMAHD_INT24_MIN    (-0x800000)      // -8388608
 
+// Minimum output samples to fade to zero at the end of a resampled buffer.
+// The actual fade length is computed adaptively from the step scale (see
+// dmaHD_ResampleSfx) so that it always covers the boundary-wraparound
+// contamination from ALL interpolation modes regardless of the output rate
+// WASAPI reports.  This constant acts as a floor: even at the lowest
+// supported upsampling ratio the fade is at least 16 samples long.
+#define DMAHD_ENDPAD_MIN   16
+
+// Tracks the last s_soundtime value processed by dmaHD_Update_Mix so that
+// the mixer is not called twice for the same hardware position.  Kept at
+// module scope (not function-local static) so it can be reset when
+// s_soundtime is reinitialised by S_StopAllSounds / vid_restart.
+static int dmaHD_lastsoundtime = -1;
+
 qboolean g_tablesinit = qfalse;
 float g_voltable[256];
 
@@ -408,6 +422,12 @@ static int dmaHD_GetNoInterpolationSample(float t, int samples, byte *data,
     // Get points
     x = (int)t;
 
+    // Round to nearest: if the fractional part is > 0.5, advance to the next
+    // sample.  At the last valid position (t ≈ samples - stepscale), this
+    // round-up makes x = samples, which dmaHD_GetSampleRaw wraps to 0 (the
+    // start of the sound).  This is the same modulo-wraparound that affects
+    // the Hermite/cubic/linear paths — setting dmaHD_interpolation 0 does
+    // NOT avoid it.  The end-of-buffer fade in dmaHD_ResampleSfx is the fix.
     if (FLOAT_DECIMAL_PART(t) > 0.5) x++;
 
     return dmaHD_GetSampleRaw(x, samples, data);
@@ -490,6 +510,72 @@ void dmaHD_ResampleSfx( sfx_t *sfx, int channels, int inrate, int inwidth, byte 
         lp_data = lp_a * (float)bsample + lp_inva * lp_last;
         buffer[idx_lp++] = SMPCLAMP(lp_data);
         lp_last = lp_data;
+    }
+
+    /* --- End-of-buffer boundary fix -------------------------------------------
+     * ROOT CAUSE: dmaHD_GetSampleRaw (all four _16bitMono/_8bitMono/etc.
+     * variants) wraps out-of-bounds indices modulo soundLength:
+     *
+     *     if (index >= samples) index -= samples;  // wraps to 0
+     *
+     * This is the correct behaviour for seamless-loop sounds, but for a
+     * non-looping sound it means that whenever any interpolation or rounding
+     * step reads one index past the end of the buffer, it silently returns
+     * the FIRST sample of the sound (the attack peak) instead of silence.
+     *
+     * Every interpolation mode triggers this at the final output sample:
+     *
+     *   • Hermite (dmaHD_interpolation 1/default): kernel reads x+1 and x+2;
+     *     at the last position both exceed soundLength and wrap to 0 and 1.
+     *
+     *   • No-interpolation (dmaHD_interpolation 0): the round-up
+     *     `if (FLOAT_DECIMAL_PART(t) > 0.5) x++` advances x from
+     *     soundLength-1 to soundLength, which dmaHD_GetSampleRaw then wraps
+     *     to 0.  Setting dmaHD_interpolation 0 does NOT avoid the click.
+     *
+     *   • Linear (2): reads x+1, same wrap as Hermite (one sample).
+     *   • Cubic (3): reads x+1 and x+2, same as Hermite.
+     *
+     * The bass sub-buffer is always filled with dmaHD_GetNoInterpolationSample
+     * and has the same round-up wrap.
+     *
+     * IMPACT: worst on silence-padded WAV files (e.g. a 1.5 s ding stored in
+     * a 4 s file): the 2.5 s of trailing zeros keep the DMA buffer at silence,
+     * so the single spike at the last output sample — a step from 0 to
+     * ~attack_peak × hp_a — is immediately audible as a loud click/pop the
+     * instant playback ends.  Reproducible at exactly 3-4 s after the kill,
+     * in both channels, regardless of dmaHD_interpolation setting.
+     *
+     * FIX: after the resampling loop, linearly fade the last n_pad samples of
+     * both sub-buffers (high-freq and bass) to zero.  The last sample is
+     * forced to exactly 0, eliminating the spike at the buffer boundary for
+     * all interpolation modes.  n_pad is computed from stepscale to cover the
+     * full Hermite lookahead at any WASAPI output rate (see below).
+     */
+    {
+        /* n_pad = ceilf(2 / stepscale) + 4 covers all interpolation modes.
+         * The worst-case lookahead is Hermite (reads x+1 and x+2 = 2 input
+         * samples past the end), each spanning 1/stepscale output samples.
+         * The no-interpolation and bass paths (round-up wraps 1 input sample)
+         * are covered by the +4 margin.  Floored at DMAHD_ENDPAD_MIN.
+         * dma.speed comes from WASAPI GetMixFormat and can be any supported
+         * rate (44100, 48000, 96000, 192000 Hz); adaptive sizing ensures full
+         * coverage at high output rates where a fixed constant would fail. */
+        int n_pad = (stepscale > 0.0f) ? (int)ceilf(2.0f / stepscale) + 4 : DMAHD_ENDPAD_MIN;
+        int n, div, i;
+        if (n_pad < DMAHD_ENDPAD_MIN) n_pad = DMAHD_ENDPAD_MIN;
+        n   = (outcount < n_pad) ? outcount : n_pad;
+        div = (n > 1) ? (n - 1) : 1;
+        for (i = 0; i < n; i++)
+        {
+            int scale256 = ((n - 1 - i) * 256) / div;
+            int idx      = outcount - n + i;
+            buffer[idx]            = (short)(((int)buffer[idx]            * scale256) >> 8);
+            buffer[outcount + idx] = (short)(((int)buffer[outcount + idx] * scale256) >> 8);
+        }
+        if (dmaHD_debugLevel && dmaHD_debugLevel->integer >= 1)
+            Com_DPrintf("dmaHD: %s resampled %d->%d Hz, end-fade %d samples (stepscale %.4f)\n",
+                sfx->soundName, inrate, dma.speed, n, (double)stepscale);
     }
 
     sfx->soundData = (sndBuffer*)buffer;
@@ -1418,7 +1504,6 @@ void dmaHD_Update_Mix(void)
     int samps;
     static int lastTime = 0.0f;
     int mixahead, op, thisTime, sane;
-    static int lastsoundtime = -1;
 
     if (!s_soundStarted || s_soundMuted) return;
 
@@ -1427,8 +1512,23 @@ void dmaHD_Update_Mix(void)
     // Updates s_soundtime
     S_GetSoundtime();
 
-    if (s_soundtime <= lastsoundtime) return;
-    lastsoundtime = s_soundtime;
+    /* Guard against s_soundtime being reset (vid_restart, level change).
+     * If it jumped backward by more than one second's worth of samples the
+     * sound subsystem was reinitialised (s_soundtime set back to 0 by
+     * S_Base_Init / S_Base_StopAllSounds).  Without this check the function-
+     * local static lastsoundtime would remain at the old large value and the
+     * mixer would silently skip every call until s_soundtime climbed back up —
+     * causing complete silence for several seconds after a vid_restart. */
+    if ((dmaHD_lastsoundtime - s_soundtime) > (int)dma.speed)
+    {
+        Com_DPrintf(S_COLOR_YELLOW "dmaHD: s_soundtime reset detected (%d -> %d), resetting mixer state\n",
+            dmaHD_lastsoundtime, s_soundtime);
+        dmaHD_lastsoundtime = s_soundtime - 1;
+        s_dmaHD_limiterGain = 1.0f;
+    }
+
+    if (s_soundtime <= dmaHD_lastsoundtime) return;
+    dmaHD_lastsoundtime = s_soundtime;
 
     // clear any sound effects that end before the current time,
     // and start any new sounds

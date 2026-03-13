@@ -352,7 +352,85 @@ dmaHD was audited for correctness at sample rates above the original 44 100 Hz t
 | LP (bass) filter coefficient | `lp_a = 0.03 × (44100 / dma.speed)` | ✅ | Maintains ~211 Hz cutoff at all rates |
 | Sound storage layout | High-freq at `[0..soundLength]`, bass at `[soundLength..2×soundLength]` | ✅ | Both halves use `outcount` samples at `dma.speed` |
 
-**No bugs were found.** The filter coefficient scaling (`44100.0f / dma.speed`) introduced in PR 67 is mathematically correct for first-order IIR filters at the small-coefficient approximation used here. Overflow in `CALCSMPOFF` is not possible at supported sample rates (≤ 48 000 Hz) for any in-map distance.
+The filter coefficient scaling (`44100.0f / dma.speed`) introduced in PR 67 is mathematically correct for first-order IIR filters at the small-coefficient approximation used here. Overflow in `CALCSMPOFF` is not possible at supported sample rates (≤ 48 000 Hz) for any in-map distance.
+
+### Audio Click/Pop at End of Sound — Bug & Fix [URT]
+
+**Symptoms (PRs #69, #70, #73, issue continuation):**
+A loud click/pop is audible in both channels at the exact moment a kill-sound finishes playing — approximately 3–4 seconds after a kill event on Windows with WASAPI. The sound is a 16-bit PCM stereo WAV file at 22 050 Hz, approximately 4 seconds long: ~1.5 seconds of actual ding audio followed by ~2.5 seconds of digital silence (zero samples). The click is reproducible on every kill.
+
+**Root cause — modulo wraparound in `dmaHD_GetSampleRaw` (all interpolation modes):**
+
+Every `dmaHD_GetSampleRaw_*` variant uses **modulo wrapping** for out-of-bounds indices (correct for seamless-loop sounds, wrong for non-looping ones):
+
+```c
+if (index >= samples) index -= samples;  // wraps to 0 for index == samples
+```
+
+This is triggered at the final output sample by **every** interpolation mode:
+
+| Mode (`dmaHD_interpolation`) | How it triggers the wrap |
+|------------------------------|--------------------------|
+| **0 — no-interpolation** | `FLOAT_DECIMAL_PART(t) > 0.5` rounds `x` up from `soundLength-1` to `soundLength` → wraps to 0 |
+| **1 — Hermite (default)** | kernel reads `x+1` and `x+2`; both exceed `soundLength` → wrap to 0 and 1 |
+| **2 — linear** | reads `x+1`; exceeds `soundLength` → wraps to 0 |
+| **3 — cubic** | reads `x+1` and `x+2`; same as Hermite |
+
+> **Setting `dmaHD_interpolation 0` does NOT avoid the click.** The no-interpolation round-up triggers the same wrap-to-0 that the Hermite lookahead does. This was confirmed by testing: the click was present with `dmaHD_interpolation 0`, `1`, and the default setting.
+
+The bass sub-buffer is always filled with `dmaHD_GetNoInterpolationSample` (mode 0 behaviour) regardless of `dmaHD_interpolation`, and has the same issue.
+
+**Why silence-padded files make this maximally audible:**
+
+With 2.5 seconds of trailing zeros in the source file:
+- Output samples `outcount − 120 000` through `outcount − 2` are all zero (silence)
+- Output sample `outcount − 1` (the last) has `sample[0]` (attack peak) injected via wraparound; the high-pass filter then outputs `hp_a × attack_peak ≈ attack_peak` — roughly **±15 000** for a typical ding sound
+- The hardware DMA plays 2.5 s of silence, then encounters this spike, then drops to silence → **step discontinuity → loud click in both channels**
+
+The timing matches exactly: `outcount / dma.speed ≈ 192 000 / 48 000 = 4.0 s` after the sound starts.
+
+**Fix applied (`dmaHD_ResampleSfx`):**
+
+After the main resampling loop, a linear fade-out is applied to the last `n_pad` samples of both the high-frequency and bass sub-buffers. `n_pad` is computed **adaptively** from `stepscale = inrate / dma.speed` so it always covers the wraparound-contaminated samples across all interpolation modes and at any output rate that WASAPI's `GetMixFormat` may report (44100, 48000, 96000, or 192000 Hz):
+
+| Source rate | WASAPI rate | stepscale | Max contamination | n_pad used |
+|-------------|-------------|-----------|-------------------|------------|
+| 22 050 Hz | 44 100 Hz | 0.500 | ~4 samples | 16 (floor) |
+| 22 050 Hz | 48 000 Hz | 0.459 | ~5 samples | 16 (floor) |
+| 22 050 Hz | 96 000 Hz | 0.230 | ~9 samples | 16 (floor) |
+| 22 050 Hz | 192 000 Hz | 0.115 | ~18 samples | **22** |
+| 11 025 Hz | 48 000 Hz | 0.230 | ~9 samples | 16 (floor) |
+| 8 000 Hz | 48 000 Hz | 0.167 | ~12 samples | 16 (floor) |
+
+```c
+int n_pad = (stepscale > 0.0f) ? (int)ceilf(2.0f / stepscale) + 4 : DMAHD_ENDPAD_MIN;
+int n     = (outcount < n_pad) ? outcount : n_pad;
+int div   = (n > 1) ? (n - 1) : 1;   // guard: div by zero when n == 1
+for (i = 0; i < n; i++) {
+    int scale256 = ((n - 1 - i) * 256) / div;   // 256→0 over n samples
+    int idx      = outcount - n + i;
+    buffer[idx]            = (short)(((int)buffer[idx]            * scale256) >> 8);
+    buffer[outcount + idx] = (short)(((int)buffer[outcount + idx] * scale256) >> 8);
+}
+if (dmaHD_debugLevel && dmaHD_debugLevel->integer >= 1)
+    Com_DPrintf("dmaHD: %s resampled %d->%d Hz, end-fade %d samples\n",
+        sfx->soundName, inrate, dma.speed, n);
+```
+
+`n_pad` = `ceilf(2 / stepscale) + 4` (where `stepscale = inrate / dma.speed`), floored at `DMAHD_ENDPAD_MIN = 16`.  This is adaptive: on a device where WASAPI's `GetMixFormat` reports 192 kHz, `stepscale = 22050 / 192000 ≈ 0.115` → `n_pad = 22`; at the typical 48 kHz → `n_pad = 9`, floored to 16.  The `dmaHD_debugLevel 1` log line lets the user confirm the actual rate and pad size during testing.
+
+**Secondary fix — `dmaHD_lastsoundtime` reset guard (`dmaHD_Update_Mix`):**
+
+The previous `static int lastsoundtime = -1;` was function-local, so it was never reset when `s_soundtime` was reinitialised to 0 by `S_Base_Init` / `S_Base_StopAllSounds` (e.g., `vid_restart`, level change, disconnect/reconnect). After such a reset, `s_soundtime (0) <= lastsoundtime (large)` caused `dmaHD_Update_Mix` to silently skip **all** painting until `s_soundtime` climbed back up to the old value — potentially several seconds of complete silence.
+
+The variable was promoted to module scope as `dmaHD_lastsoundtime`. A guard resets it (and the peak-limiter gain) if `s_soundtime` drops more than one second below the last seen value:
+
+```c
+if ((dmaHD_lastsoundtime - s_soundtime) > (int)dma.speed) {
+    dmaHD_lastsoundtime = s_soundtime - 1;
+    s_dmaHD_limiterGain = 1.0f;
+}
+```
 
 ---
 
