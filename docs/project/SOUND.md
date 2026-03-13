@@ -386,23 +386,33 @@ The timing matches exactly: `outcount / dma.speed ≈ 192 000 / 48 000 = 4.0 s` 
 
 **Fix applied (`dmaHD_ResampleSfx`):**
 
-After the main resampling loop, a linear fade-out is applied to the last `DMAHD_ENDPAD` (16) samples of both the high-frequency and bass sub-buffers:
+After the main resampling loop, a linear fade-out is applied to the last `n_pad` samples of both the high-frequency and bass sub-buffers. `n_pad` is computed **adaptively** from `stepscale = inrate / dma.speed` so it always covers the exact number of output samples the Hermite kernel can contaminate, regardless of the output rate that WASAPI's `GetMixFormat` reports at runtime (which may be 44100, 48000, 96000, or 192000 Hz depending on the hardware):
+
+| Source rate | WASAPI rate | stepscale | Hermite contamination | n_pad used |
+|-------------|-------------|-----------|-----------------------|------------|
+| 22 050 Hz | 44 100 Hz | 0.500 | ~4 samples | 16 (floor) |
+| 22 050 Hz | 48 000 Hz | 0.459 | ~5 samples | 16 (floor) |
+| 22 050 Hz | 96 000 Hz | 0.230 | ~9 samples | 16 (floor) |
+| 22 050 Hz | 192 000 Hz | 0.115 | ~18 samples | **21** |
+| 11 025 Hz | 48 000 Hz | 0.230 | ~9 samples | 16 (floor) |
+| 8 000 Hz | 48 000 Hz | 0.167 | ~12 samples | 16 (floor) |
 
 ```c
-int n   = (outcount < DMAHD_ENDPAD) ? outcount : DMAHD_ENDPAD;
-int div = (n > 1) ? (n - 1) : 1;   // guard: div by zero when n == 1
+int n_pad = (stepscale > 0.0f) ? (int)ceilf(2.0f / stepscale) + 4 : DMAHD_ENDPAD_MIN;
+int n     = (outcount < n_pad) ? outcount : n_pad;
+int div   = (n > 1) ? (n - 1) : 1;   // guard: div by zero when n == 1
 for (i = 0; i < n; i++) {
     int scale256 = ((n - 1 - i) * 256) / div;   // 256→0 over n samples
-    int idx = outcount - n + i;
+    int idx      = outcount - n + i;
     buffer[idx]            = (short)(((int)buffer[idx]            * scale256) >> 8);
     buffer[outcount + idx] = (short)(((int)buffer[outcount + idx] * scale256) >> 8);
 }
+if (dmaHD_debugLevel && dmaHD_debugLevel->integer >= 1)
+    Com_DPrintf("dmaHD: %s resampled %d->%d Hz, end-fade %d samples\n",
+        sfx->soundName, inrate, dma.speed, n);
 ```
 
-- The last output sample (`i = n−1`) is forced to **zero**, eliminating the Hermite spike.
-- For sounds that already decay to silence (natural fade, or silence-padded) the fade is imperceptible — multiplying near-zero by a linearly-decreasing factor remains near-zero.
-- At 48 000 Hz, 16 samples = **0.33 ms** — shorter than the threshold of human auditory perception for transients.
-- Covers all common source rates: at 11 025 Hz (`stepscale ≈ 0.23`) up to 5 output samples can be contaminated; `DMAHD_ENDPAD = 16` provides a safe margin at any supported input rate.
+`n_pad` = `ceilf(2 / stepscale) + 4` (where `stepscale = inrate / dma.speed`), floored at `DMAHD_ENDPAD_MIN = 16`.  This is adaptive: on a device where WASAPI's `GetMixFormat` reports 192 kHz, `stepscale = 22050 / 192000 ≈ 0.115` → `n_pad = 22`; at the typical 48 kHz → `n_pad = 9`, floored to 16.  The `dmaHD_debugLevel 1` log line lets the user confirm the actual rate and pad size during testing.
 
 **Secondary fix — `dmaHD_lastsoundtime` reset guard (`dmaHD_Update_Mix`):**
 

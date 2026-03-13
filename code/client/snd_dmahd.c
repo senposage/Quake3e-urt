@@ -191,16 +191,13 @@ static float					s_dmaHD_limiterGain = 1.0f;
 #define DMAHD_INT24_MAX    0x7FFFFF         //  8388607
 #define DMAHD_INT24_MIN    (-0x800000)      // -8388608
 
-// Number of output samples to linearly fade to zero at the end of every
-// resampled sound buffer.  The 4-point Hermite interpolator reads x+1 and
-// x+2 beyond the last valid input sample; dmaHD_GetSampleRaw wraps those
-// indices modulo soundLength (seamless-loop semantics).  For a non-looping
-// sound this injects the beginning-of-sound amplitude into the final 1-2
-// output samples.  When the sound has trailing silence the preceding samples
-// are all zero, so the sudden spike to the attack level followed by silence
-// produces an audible click/pop.  Fading the last DMAHD_ENDPAD samples to
-// zero eliminates the artefact; at 48 kHz, 16 samples = 0.33 ms — inaudible.
-#define DMAHD_ENDPAD       16
+// Minimum output samples to fade to zero at the end of a resampled buffer.
+// The actual fade length is computed adaptively from the step scale (see
+// dmaHD_ResampleSfx) so that it always covers the Hermite lookahead
+// contamination regardless of the output rate WASAPI reports.  This constant
+// acts as a floor: even at the lowest supported upsampling ratio the fade is
+// at least 16 samples long.
+#define DMAHD_ENDPAD_MIN   16
 
 // Tracks the last s_soundtime value processed by dmaHD_Update_Mix so that
 // the mixer is not called twice for the same hardware position.  Kept at
@@ -513,7 +510,7 @@ void dmaHD_ResampleSfx( sfx_t *sfx, int channels, int inrate, int inwidth, byte 
      * The 4-point Hermite interpolator reads x+1 and x+2 beyond the last
      * valid input sample; dmaHD_GetSampleRaw wraps those indices back to 0
      * (loop semantics).  For a non-looping sound this contaminates the last
-     * 1-2 output samples with beginning-of-sound amplitude.
+     * N output samples with beginning-of-sound amplitude.
      *
      * The no-interpolation path used for the bass sub-buffer also rounds up
      * at the boundary (FLOAT_DECIMAL_PART > 0.5 → index++ → wraps to 0),
@@ -525,21 +522,36 @@ void dmaHD_ResampleSfx( sfx_t *sfx, int channels, int inrate, int inwidth, byte 
      * carries the attack amplitude the hardware produces a loud click/pop the
      * instant playback ends — reproducibly at exactly 3-4 s after the kill.
      *
-     * Fix: linearly fade the last DMAHD_ENDPAD samples of both sub-buffers to
-     * zero.  For sounds that already decay to silence the fade is completely
-     * inaudible; for others it adds at most 0.33 ms of extra tail at 48 kHz.
+     * The number of contaminated output samples is ceil(2 / stepscale) because
+     * the kernel reads 2 input samples ahead and each input sample spans
+     * 1/stepscale output samples.  stepscale = inrate / dma.speed, so the
+     * count scales with the output rate: at 48 kHz (22 kHz source) it is ~5;
+     * at 96 kHz it is ~9; at 192 kHz it is ~18.  dma.speed is set from
+     * WASAPI's GetMixFormat at init time and may be any rate the hardware
+     * reports — a fixed constant would under-count at high output rates.
+     *
+     * Fix: compute n_pad adaptively from stepscale, then linearly fade the
+     * last n_pad output samples of both sub-buffers to zero.  For sounds that
+     * already decay to silence the fade is imperceptible; for others it adds
+     * at most ~0.5 ms of extra tail even at 192 kHz — inaudible.
      */
     {
-        int n   = (outcount < DMAHD_ENDPAD) ? outcount : DMAHD_ENDPAD;
-        int div = (n > 1) ? (n - 1) : 1;
-        int i;
+        /* ceilf(2 / stepscale) + 4 safety margin; floor of DMAHD_ENDPAD_MIN */
+        int n_pad = (stepscale > 0.0f) ? (int)ceilf(2.0f / stepscale) + 4 : DMAHD_ENDPAD_MIN;
+        int n, div, i;
+        if (n_pad < DMAHD_ENDPAD_MIN) n_pad = DMAHD_ENDPAD_MIN;
+        n   = (outcount < n_pad) ? outcount : n_pad;
+        div = (n > 1) ? (n - 1) : 1;
         for (i = 0; i < n; i++)
         {
             int scale256 = ((n - 1 - i) * 256) / div;
             int idx      = outcount - n + i;
-            buffer[idx]           = (short)(((int)buffer[idx]           * scale256) >> 8);
+            buffer[idx]            = (short)(((int)buffer[idx]            * scale256) >> 8);
             buffer[outcount + idx] = (short)(((int)buffer[outcount + idx] * scale256) >> 8);
         }
+        if (dmaHD_debugLevel && dmaHD_debugLevel->integer >= 1)
+            Com_DPrintf("dmaHD: %s resampled %d->%d Hz, end-fade %d samples (stepscale %.4f)\n",
+                sfx->soundName, inrate, dma.speed, n, (double)stepscale);
     }
 
     sfx->soundData = (sndBuffer*)buffer;
