@@ -209,6 +209,22 @@ static LPALAUXILIARYEFFECTSLOTF       qalAuxiliaryEffectSlotf;
  * etc. retain their designed levels. */
 #define S_AL_AMBIENT_TARGET_RMS  0.085f   /* ≈ -21 dBFS (was 0.125 / -18 dBFS) */
 
+/* Looping-ambient fade timings.
+ * FADEIN  — gain ramps 0→1 when a loop source first starts (prevents cold-start
+ *           pop when you enter a fountain/ambient entity's range).
+ * FADEOUT — gain ramps 1→0 before a loop source stops, triggered when the entity
+ *           leaves the client snapshot (PVS cull) or is explicitly removed, so the
+ *           sound tapers off instead of cutting to silence mid-cycle. */
+#define S_AL_LOOP_FADEIN_MS   150   /* ms — ~9 frames at 60 fps */
+#define S_AL_LOOP_FADEOUT_MS  120   /* ms — ~7 frames at 60 fps */
+
+/* CHAN_WEAPON gun-muzzle proximity: sources on the weapon channel within this
+ * distance of the listener are treated as "own gun barrel" and bypass occlusion
+ * regardless of entity ownership.  This covers muzzle-flash origin offsets
+ * (~50–100 u) with margin and prevents PLAYERCLIP slope geometry from muffling
+ * the player's own weapon fire even when the sound was emitted as a world sound. */
+#define S_AL_WEAPON_NOOCC_DIST  160.0f
+
 /* Per-sound-file data */
 typedef struct alSfxRec_s {
     ALuint              buffer;                 /* AL buffer handle */
@@ -268,6 +284,8 @@ typedef struct {
     int         framenum;
     float       dopplerScale;
     float       oldDopplerScale;
+    int         fadeStartMs;        /* Com_Milliseconds() when fade-in began (0 = not fading in) */
+    int         fadeOutStartMs;     /* Com_Milliseconds() when fade-out began (0 = not fading out) */
 } alLoop_t;
 
 static alLoop_t s_al_loops[MAX_GENTITIES];
@@ -342,6 +360,23 @@ static cvar_t *s_alVolOther;     /* other entity/player volume multiplier [0..1.
 static cvar_t *s_alVolEnv;       /* looping ambient volume multiplier [0..1.0] */
 static cvar_t *s_alVolUI;        /* hit/kill/UI sound multiplier [0..1.0] */
 static cvar_t *s_alLocalSelf;    /* force own-entity sounds local even with explicit origin */
+
+/* Acoustic-environment tuning CVars (used by S_AL_UpdateDynamicReverb).
+ * All CVAR_ARCHIVE_ND so user tweaks persist across sessions.
+ * Change any of these at runtime and type /s_alReset to hear the effect
+ * immediately without a map reload or snd_restart. */
+static cvar_t *s_alEnvHorizDist;   /* horizontal probe ray max distance */
+static cvar_t *s_alEnvVertDist;    /* diagonal-up / straight-up ray max distance */
+static cvar_t *s_alEnvDownDist;    /* straight-down ray max distance */
+static cvar_t *s_alEnvHorizWeight; /* fraction of openFrac from horizontal rays [0-1] */
+static cvar_t *s_alEnvSmoothPole;  /* IIR blend pole (higher = slower transitions) */
+static cvar_t *s_alEnvHistorySize; /* rolling history window size [1-S_AL_ENV_HISTORY_MAX] */
+static cvar_t *s_alEnvVelThresh;   /* speed (units/probe-cycle) to enable look-ahead */
+static cvar_t *s_alEnvVelWeight;   /* max look-ahead ray blend weight [0-0.5] */
+static cvar_t *s_alOccWeaponDist;  /* CHAN_WEAPON no-occlusion radius (gun-muzzle zone) */
+
+/* Set to qtrue by the s_alReset command; cleared on the next probe cycle. */
+static qboolean s_al_reverbReset = qfalse;
 
 /* =========================================================================
  * Section 5 — Library loading helpers
@@ -856,7 +891,7 @@ static float S_AL_ComputeAcousticPosition( const vec3_t srcOrigin, vec3_t acoust
 
     CM_BoxTrace(&tr, s_al_listener_origin, srcOrigin,
                 vec3_origin, vec3_origin,
-                0, CONTENTS_SOLID | CONTENTS_PLAYERCLIP, qfalse);
+                0, CONTENTS_SOLID, qfalse);
 
     directFrac = tr.fraction;
     if (directFrac >= 1.0f)
@@ -902,7 +937,7 @@ static float S_AL_ComputeAcousticPosition( const vec3_t srcOrigin, vec3_t acoust
 
             CM_BoxTrace(&pr, s_al_listener_origin, probe,
                         vec3_origin, vec3_origin,
-                        0, CONTENTS_SOLID | CONTENTS_PLAYERCLIP, qfalse);
+                        0, CONTENTS_SOLID, qfalse);
 
             if (pr.fraction > bestFrac) {
                 bestFrac = pr.fraction;
@@ -1258,6 +1293,7 @@ static void S_AL_Shutdown( void )
     s_al_started = qfalse;
 
     Cmd_RemoveCommand("s_devices");
+    Cmd_RemoveCommand("s_alReset");
 
     /* Stop all sources */
     for (i = 0; i < s_al_numSrc; i++)
@@ -1551,50 +1587,136 @@ static void S_AL_StopLoopingSound( int entityNum )
     s_al_loops[entityNum].active = qfalse;
 }
 
-/* Update looping sounds: start, stop, reposition. */
+/* Update looping sounds: start, stop, reposition.
+ *
+ * Fade-in  (S_AL_LOOP_FADEIN_MS):  new loop sources start at gain=0 and ramp
+ *   to full over ~150 ms, preventing the cold-start pop when the listener
+ *   enters an ambient entity's range.
+ *
+ * Fade-out (S_AL_LOOP_FADEOUT_MS): when a loop is killed (entity leaves the
+ *   client snapshot / PVS cull) or explicitly removed, the source ramps to
+ *   silence over ~120 ms before being stopped.  This prevents the hard cut
+ *   heard when walking out of a fountain or ambient-sound entity's range.
+ *
+ * State machine per alLoop_t:
+ *   active=true,  fadeOutStartMs=0  → normal playing (or fade-in still running)
+ *   active=false, fadeOutStartMs>0  → fading out; source still playing
+ *   active=false, fadeOutStartMs=0  → fully stopped / idle
+ *
+ * Re-activation during fade-out (entity pops back into snapshot mid-fade):
+ *   fadeOutStartMs is cleared, a fresh fade-in begins from the current source
+ *   so there is no audible gap or restart. */
 static void S_AL_UpdateLoops( void )
 {
     int       i, srcIdx;
     alLoop_t *lp;
+    int       now = Com_Milliseconds();
 
     for (i = 0; i < MAX_GENTITIES; i++) {
         lp = &s_al_loops[i];
 
-        /* Kill sounds that were not renewed this frame */
+        /* ---- Step 1: Trigger fade-out when a loop goes stale / killed ---- */
         if (lp->active && (lp->kill || lp->framenum != s_al_loopFrame)) {
             lp->active = qfalse;
             lp->kill   = qfalse;
-            if (lp->srcIdx >= 0 && lp->srcIdx < s_al_numSrc) {
-                S_AL_StopSource(lp->srcIdx);
-                s_al_src[lp->srcIdx].loopSound = qfalse;
+            if (lp->srcIdx >= 0 && lp->srcIdx < s_al_numSrc &&
+                    s_al_src[lp->srcIdx].isPlaying) {
+                /* Start fade-out instead of hard-stopping. */
+                if (!lp->fadeOutStartMs)
+                    lp->fadeOutStartMs = (now > 0) ? now : 1;
+            } else {
+                /* Source not playing — nothing to fade, clean up immediately. */
+                lp->srcIdx         = -1;
+                lp->fadeOutStartMs = 0;
+                lp->fadeStartMs    = 0;
             }
-            lp->srcIdx = -1;
-            continue;
+        }
+
+        /* ---- Step 2: Drive the fade-out ramp ---- */
+        if (!lp->active && lp->fadeOutStartMs > 0) {
+            if (lp->srcIdx >= 0 && lp->srcIdx < s_al_numSrc &&
+                    s_al_src[lp->srcIdx].isPlaying) {
+                int elapsed = now - lp->fadeOutStartMs;
+                if (elapsed >= S_AL_LOOP_FADEOUT_MS) {
+                    /* Fade complete — hard-stop the source. */
+                    S_AL_StopSource(lp->srcIdx);
+                    s_al_src[lp->srcIdx].loopSound = qfalse;
+                    lp->srcIdx         = -1;
+                    lp->fadeOutStartMs = 0;
+                    lp->fadeStartMs    = 0;
+                } else {
+                    float    t      = 1.0f - (float)elapsed / (float)S_AL_LOOP_FADEOUT_MS;
+                    alSrc_t *src    = &s_al_src[lp->srcIdx];
+                    float    catVol = S_AL_GetCategoryVol(SRC_CAT_AMBIENT);
+                    if (lp->sfx >= 0 && lp->sfx < s_al_numSfx)
+                        catVol *= s_al_sfx[lp->sfx].normGain;
+                    qalSourcef(src->source, AL_GAIN,
+                               (src->master_vol / 255.f) * catVol * t);
+                }
+            } else {
+                /* Source stopped externally (e.g. StopAllSounds). */
+                lp->srcIdx         = -1;
+                lp->fadeOutStartMs = 0;
+                lp->fadeStartMs    = 0;
+            }
+            continue;   /* don't touch this loop further this frame */
         }
 
         if (!lp->active) continue;
-
         if (lp->sfx < 0 || lp->sfx >= s_al_numSfx) continue;
         if (!s_al_sfx[lp->sfx].buffer) continue;
 
-        /* Start new loop source if needed */
+        /* ---- Step 3: Cancel fade-out if the entity was re-added ---- *
+         * (active=true while a previous fade-out is still running means the
+         * entity re-entered the snapshot before the fade finished.) */
+        if (lp->fadeOutStartMs > 0) {
+            /* Don't restart the source — just cancel the fade-out and let
+             * the fade-in ramp bring gain back up from here. */
+            lp->fadeOutStartMs = 0;
+            lp->fadeStartMs    = (now > 0) ? now : 1;
+        }
+
+        /* ---- Step 4: Start a new source if needed ---- */
         if (lp->srcIdx < 0 || !s_al_src[lp->srcIdx].isPlaying) {
             srcIdx = S_AL_GetFreeSource();
             if (srcIdx < 0) continue;
-            float vol = S_AL_GetMasterVol();
-            S_AL_SrcSetup(srcIdx, lp->sfx, lp->origin, qtrue,
-                          i, CHAN_AUTO, vol, qfalse,
-                          qtrue /* looping ambient */);
+            {
+                float vol = S_AL_GetMasterVol();
+                S_AL_SrcSetup(srcIdx, lp->sfx, lp->origin, qtrue,
+                              i, CHAN_AUTO, vol, qfalse,
+                              qtrue /* looping ambient */);
+            }
             s_al_src[srcIdx].loopSound = qtrue;
             qalSourcei(s_al_src[srcIdx].source, AL_LOOPING, AL_TRUE);
+            /* Start silent — gain driven up by the fade-in ramp below. */
+            qalSourcef(s_al_src[srcIdx].source, AL_GAIN, 0.0f);
             qalSourcePlay(s_al_src[srcIdx].source);
-            lp->srcIdx = srcIdx;
+            lp->srcIdx      = srcIdx;
+            lp->fadeStartMs = (now > 0) ? now : 1;
         } else {
-            /* Update position */
+            /* Update position and velocity every frame. */
             qalSource3f(s_al_src[lp->srcIdx].source, AL_POSITION,
                         lp->origin[0], lp->origin[1], lp->origin[2]);
             qalSource3f(s_al_src[lp->srcIdx].source, AL_VELOCITY,
                         lp->velocity[0], lp->velocity[1], lp->velocity[2]);
+        }
+
+        /* ---- Step 5: Apply fade-in gain ramp ---- */
+        if (lp->fadeStartMs > 0) {
+            int     elapsed = now - lp->fadeStartMs;
+            float   fadeGain;
+            alSrc_t *src    = &s_al_src[lp->srcIdx];
+            float    catVol = S_AL_GetCategoryVol(SRC_CAT_AMBIENT);
+            if (lp->sfx >= 0 && lp->sfx < s_al_numSfx)
+                catVol *= s_al_sfx[lp->sfx].normGain;
+            if (elapsed >= S_AL_LOOP_FADEIN_MS) {
+                fadeGain        = 1.0f;
+                lp->fadeStartMs = 0;   /* fade complete — stop updating gain */
+            } else {
+                fadeGain = (float)elapsed / (float)S_AL_LOOP_FADEIN_MS;
+            }
+            qalSourcef(src->source, AL_GAIN,
+                       (src->master_vol / 255.f) * catVol * fadeGain);
         }
     }
 }
@@ -1700,9 +1822,10 @@ static void S_AL_UpdateEntityPosition( int entityNum, const vec3_t origin )
  * ========================================================================= */
 
 #define S_AL_ENV_RAYS        14
-#define S_AL_ENV_RATE        16    /* update every N frames */
-#define S_AL_ENV_HISTORY      3    /* rolling average window — damps spurious reads */
-#define S_AL_ENV_MOVE_THRESH 32.0f /* units; skip re-cast when barely moved */
+#define S_AL_ENV_RATE         16    /* update every N frames */
+#define S_AL_ENV_HISTORY       3    /* default rolling window (s_alEnvHistorySize default) */
+#define S_AL_ENV_HISTORY_MAX   8    /* hard cap; array sizing for s_alEnvHistorySize */
+#define S_AL_ENV_MOVE_THRESH  32.0f /* units; skip re-cast when barely moved */
 
 /* World-space probe directions (normalised).
  * 8 horizontal (every 45°), 4 diagonal-up, 1 up, 1 down. */
@@ -1798,9 +1921,9 @@ static void S_AL_UpdateDynamicReverb( void )
      * sets so that a single "confused" reading (thin wall, window, doorway
      * straddling) only moves the average by 1/N rather than flipping the
      * whole classification. */
-    static float histSize[S_AL_ENV_HISTORY];
-    static float histOpen[S_AL_ENV_HISTORY];
-    static float histCorr[S_AL_ENV_HISTORY];
+    static float histSize[S_AL_ENV_HISTORY_MAX];
+    static float histOpen[S_AL_ENV_HISTORY_MAX];
+    static float histCorr[S_AL_ENV_HISTORY_MAX];
     static int   histIdx   = 0;
     static int   histCount = 0;
 
@@ -1813,6 +1936,12 @@ static void S_AL_UpdateDynamicReverb( void )
     static float  cachedHorizOpen  = 0.f;  /* for debug verbose split display */
     static float  cachedVertOpen   = 0.f;
     static qboolean haveCache = qfalse;
+
+    /* Velocity tracking for direction-of-travel look-ahead probing.
+     * cachedVelSpeed: movement units since last probe (0 when stationary).
+     * cachedVelDir:   normalised horizontal direction of travel. */
+    static float  cachedVelSpeed      = 0.f;
+    static float  cachedVelDir[3]     = {1.f, 0.f, 0.f};
 
     float horizDists[8];            /* per-ray horizontal distances, original order */
     float horizTotalFrac, vertTotalFrac;
@@ -1830,15 +1959,18 @@ static void S_AL_UpdateDynamicReverb( void )
      * would crash with "bad handle 0 < 0 < 256" when cm.numSubModels == 0. */
     if (CM_NumInlineModels() <= 0)                            return;
 
-    /* Detect frame-counter reset (map load / StopAllSounds) */
-    snap = (s_al_loopFrame < lastFrame || curDecay < 0.f);
+    /* Detect frame-counter reset (map load / StopAllSounds) or explicit reset
+     * command (s_alReset — lets the user re-probe after changing tuning cvars). */
+    snap = (s_al_loopFrame < lastFrame || curDecay < 0.f || s_al_reverbReset);
     if (snap) {
-        lastFrame  = s_al_loopFrame - S_AL_ENV_RATE;
+        lastFrame       = s_al_loopFrame - S_AL_ENV_RATE;
+        s_al_reverbReset = qfalse;
         /* Invalidate history and movement cache so the first post-load probe
          * snaps immediately rather than blending stale data from the old map. */
         histCount  = 0;
         histIdx    = 0;
         haveCache  = qfalse;
+        cachedVelSpeed = 0.f;
     }
 
     if ((s_al_loopFrame - lastFrame) < S_AL_ENV_RATE)
@@ -1866,26 +1998,34 @@ static void S_AL_UpdateDynamicReverb( void )
             horizTotalFrac = 0.f;
             vertTotalFrac  = 0.f;
 
-            for (i = 0; i < S_AL_ENV_RAYS; i++) {
-                trace_t tr;
-                vec3_t  end;
+            /* Per-ray max distances from tuning CVars (or compile-time defaults). */
+            {
+                float hd = s_alEnvHorizDist ? s_alEnvHorizDist->value : S_AL_SOUND_MAXDIST;
+                float vd = s_alEnvVertDist  ? s_alEnvVertDist->value  : S_AL_ENV_VERT_DIST;
+                float dd = s_alEnvDownDist  ? s_alEnvDownDist->value  : S_AL_ENV_DOWN_DIST;
 
-                end[0] = s_al_listener_origin[0] + s_al_envDirs[i][0] * s_al_envDists[i];
-                end[1] = s_al_listener_origin[1] + s_al_envDirs[i][1] * s_al_envDists[i];
-                end[2] = s_al_listener_origin[2] + s_al_envDirs[i][2] * s_al_envDists[i];
+                for (i = 0; i < S_AL_ENV_RAYS; i++) {
+                    trace_t tr;
+                    vec3_t  end;
+                    float   rayDist = (i < 8) ? hd : ((i < 13) ? vd : dd);
 
-                CM_BoxTrace(&tr, s_al_listener_origin, end,
-                            vec3_origin, vec3_origin, 0, CONTENTS_SOLID, qfalse);
+                    end[0] = s_al_listener_origin[0] + s_al_envDirs[i][0] * rayDist;
+                    end[1] = s_al_listener_origin[1] + s_al_envDirs[i][1] * rayDist;
+                    end[2] = s_al_listener_origin[2] + s_al_envDirs[i][2] * rayDist;
 
-                if (i < 8) {
-                    horizDists[i]   = tr.fraction * s_al_envDists[i];
-                    horizTotalFrac += tr.fraction;
-                } else {
-                    /* Vertical / diagonal-up rays: shorter calibrated distances
-                     * (S_AL_ENV_VERT_DIST / DOWN_DIST) make tr.fraction sensitive
-                     * to realistic URT ceiling heights rather than comparing
-                     * against the full 1330-unit horizontal range. */
-                    vertTotalFrac += tr.fraction;
+                    CM_BoxTrace(&tr, s_al_listener_origin, end,
+                                vec3_origin, vec3_origin, 0, CONTENTS_SOLID, qfalse);
+
+                    if (i < 8) {
+                        horizDists[i]   = tr.fraction * rayDist;
+                        horizTotalFrac += tr.fraction;
+                    } else {
+                        /* Vertical / diagonal-up rays: shorter calibrated distances
+                         * (s_alEnvVertDist / s_alEnvDownDist) make tr.fraction
+                         * sensitive to realistic URT ceiling heights rather than
+                         * comparing against the full 1330-unit horizontal range. */
+                        vertTotalFrac += tr.fraction;
+                    }
                 }
             }
 
@@ -1963,11 +2103,28 @@ static void S_AL_UpdateDynamicReverb( void )
 
             vertOpenFrac = vertTotalFrac / 6.f;  /* 14 − 8 = 6 vertical rays */
 
-            /* Combined openness: 70 % horizontal, 30 % vertical.
-             * Overhead obstructions (overhangs, low bridges) affect only
-             * the vertical component so they cannot alone flip an outdoor
-             * classification to ENCLOSED. */
-            openFrac = horizOpenFrac * 0.70f + vertOpenFrac * 0.30f;
+            /* ---- Horizontal/vertical openness combine ---------------------- */
+            {
+                float hw = s_alEnvHorizWeight ? s_alEnvHorizWeight->value : 0.70f;
+                if (hw < 0.f) hw = 0.f;
+                if (hw > 1.f) hw = 1.f;
+                openFrac = horizOpenFrac * hw + vertOpenFrac * (1.f - hw);
+            }
+
+            /* ---- Velocity direction from this probe's movement ------------- */
+            {
+                float hdx = moveDelta[0], hdy = moveDelta[1];
+                float hlen = hdx*hdx + hdy*hdy;
+                if (hlen > 1.f) {
+                    hlen = (float)sqrt((double)hlen);
+                    cachedVelDir[0] = hdx / hlen;
+                    cachedVelDir[1] = hdy / hlen;
+                    cachedVelDir[2] = 0.f;
+                    cachedVelSpeed  = moveDist;
+                } else {
+                    cachedVelSpeed = 0.f;
+                }
+            }
 
             cachedSize      = sizeFactor;
             cachedOpen      = openFrac;
@@ -1978,28 +2135,94 @@ static void S_AL_UpdateDynamicReverb( void )
         }
     }
 
-    /* --- Rolling history: average last S_AL_ENV_HISTORY measurements -----
-     * Smooths transient confusing reads caused by doorways, arches, windows,
-     * or other threshold geometry where a single probe set straddles two
-     * environment types.  Also damps classifier confusion that persists even
-     * when standing still in spaces with unusual geometry (e.g. a room with
-     * a large window or a doorway to the side of the probe grid). */
-    histSize[histIdx] = sizeFactor;
-    histOpen[histIdx] = openFrac;
-    histCorr[histIdx] = corrFactor;
-    histIdx = (histIdx + 1) % S_AL_ENV_HISTORY;
-    if (histCount < S_AL_ENV_HISTORY) histCount++;
+    /* --- Velocity look-ahead: bias openFrac toward the upcoming environment --
+     *
+     * When the player is moving, cast 2 extra horizontal rays in the direction
+     * of travel and blend their openness reading into horizOpenFrac.  The blend
+     * weight grows with speed (max s_alEnvVelWeight, default 0.30) so a fast
+     * run toward an outdoor exit shifts the classifier earlier, preventing the
+     * probe from stalling in the TRANSITION zone for several seconds.
+     *
+     * Only active on cache misses (moveDist ≥ S_AL_ENV_MOVE_THRESH), when the
+     * player is actually moving.  cachedVelSpeed is 0 on cache hits or when
+     * standing still, so the block is a no-op in those cases. */
+    {
+        float velThresh = s_alEnvVelThresh ? s_alEnvVelThresh->value : 48.f;
+        float velWMax   = s_alEnvVelWeight ? s_alEnvVelWeight->value : 0.30f;
 
-    if (histCount > 1) {
-        float sumSize = 0.f, sumOpen = 0.f, sumCorr = 0.f;
-        for (i = 0; i < histCount; i++) {
-            sumSize += histSize[i];
-            sumOpen += histOpen[i];
-            sumCorr += histCorr[i];
+        if (cachedVelSpeed > velThresh && CM_NumInlineModels() > 0) {
+            float biasSum = 0.f;
+            float perpX   = -cachedVelDir[1];
+            float perpY   =  cachedVelDir[0];
+            float hd      = s_alEnvHorizDist ? s_alEnvHorizDist->value : S_AL_SOUND_MAXDIST;
+            int   k;
+
+            /* Ray 0: straight ahead in direction of travel.
+             * Ray 1: 45° left of travel — wider spatial preview. */
+            for (k = 0; k < 2; k++) {
+                trace_t vtr;
+                vec3_t  vend;
+                float dx, dy;
+
+                if (k == 0) {
+                    dx = cachedVelDir[0];
+                    dy = cachedVelDir[1];
+                } else {
+                    dx = cachedVelDir[0] * 0.707f + perpX * 0.707f;
+                    dy = cachedVelDir[1] * 0.707f + perpY * 0.707f;
+                }
+                vend[0] = s_al_listener_origin[0] + dx * hd;
+                vend[1] = s_al_listener_origin[1] + dy * hd;
+                vend[2] = s_al_listener_origin[2];
+
+                CM_BoxTrace(&vtr, s_al_listener_origin, vend,
+                            vec3_origin, vec3_origin, 0, CONTENTS_SOLID, qfalse);
+                biasSum += vtr.fraction;
+            }
+
+            {
+                float biasOpen  = biasSum * 0.5f;
+                float velFactor = (cachedVelSpeed - velThresh) / 200.f;
+                if (velFactor < 0.f) velFactor = 0.f;
+                if (velFactor > velWMax) velFactor = velWMax;
+
+                {
+                    float hw = s_alEnvHorizWeight ? s_alEnvHorizWeight->value : 0.70f;
+                    if (hw < 0.f) hw = 0.f;
+                    if (hw > 1.f) hw = 1.f;
+                    horizOpenFrac = horizOpenFrac * (1.f - velFactor) + biasOpen * velFactor;
+                    openFrac      = horizOpenFrac * hw + vertOpenFrac * (1.f - hw);
+                }
+            }
         }
-        sizeFactor = sumSize / (float)histCount;
-        openFrac   = sumOpen / (float)histCount;
-        corrFactor = sumCorr / (float)histCount;
+    }
+
+    /* --- Rolling history: average last N measurements -------------------- */
+    {
+        int historySize = s_alEnvHistorySize ? (int)s_alEnvHistorySize->value
+                                             : S_AL_ENV_HISTORY;
+        if (historySize < 1)                    historySize = 1;
+        if (historySize > S_AL_ENV_HISTORY_MAX) historySize = S_AL_ENV_HISTORY_MAX;
+
+        histSize[histIdx] = sizeFactor;
+        histOpen[histIdx] = openFrac;
+        histCorr[histIdx] = corrFactor;
+        histIdx = (histIdx + 1) % historySize;
+        if (histCount < historySize) histCount++;
+        /* If the user shrank historySize, drop excess entries. */
+        if (histCount > historySize) histCount = historySize;
+
+        if (histCount > 1) {
+            float sumSize = 0.f, sumOpen = 0.f, sumCorr = 0.f;
+            for (i = 0; i < histCount; i++) {
+                sumSize += histSize[i];
+                sumOpen += histOpen[i];
+                sumCorr += histCorr[i];
+            }
+            sizeFactor = sumSize / (float)histCount;
+            openFrac   = sumOpen / (float)histCount;
+            corrFactor = sumCorr / (float)histCount;
+        }
     }
 
     /* --- Derive target EFX parameters ------------------------------------ */
@@ -2046,16 +2269,24 @@ static void S_AL_UpdateDynamicReverb( void )
         curRefl  = targetRefl;
         curSlot  = targetSlot;
     } else {
-        /* Pole 0.92 — substantially slower than the previous 0.85, giving
-         * roughly twice the half-transition time (~3.5 s at 60 fps).
-         * Combined with the rolling history buffer this eliminates the
-         * instant-apply / un-apply / re-apply flicker on doorway thresholds
-         * (observed on maps such as ut4_sanc) and keeps multi-layer weapon
-         * events from sounding different depending on reverb timing. */
-        curDecay = curDecay * 0.92f + targetDecay * 0.08f;
-        curLate  = curLate  * 0.92f + targetLate  * 0.08f;
-        curRefl  = curRefl  * 0.92f + targetRefl  * 0.08f;
-        curSlot  = curSlot  * 0.92f + targetSlot  * 0.08f;
+        /* Base pole from s_alEnvSmoothPole (default 0.92).
+         * Reduced toward 0.85 when the player is moving — faster probe-to-probe
+         * response during environment transitions.  At full walking speed the
+         * half-transition time drops from ~3.5 s to ~2.2 s. */
+        float basePole = s_alEnvSmoothPole ? s_alEnvSmoothPole->value : 0.92f;
+        float blendPole;
+        {
+            float velThresh = s_alEnvVelThresh ? s_alEnvVelThresh->value : 48.f;
+            float vf = (cachedVelSpeed > velThresh)
+                       ? (cachedVelSpeed - velThresh) / 200.f : 0.f;
+            if (vf > 1.f) vf = 1.f;
+            blendPole = basePole - vf * 0.07f;
+            if (blendPole < 0.5f) blendPole = 0.5f;
+        }
+        curDecay = curDecay * blendPole + targetDecay * (1.f - blendPole);
+        curLate  = curLate  * blendPole + targetLate  * (1.f - blendPole);
+        curRefl  = curRefl  * blendPole + targetRefl  * (1.f - blendPole);
+        curSlot  = curSlot  * blendPole + targetSlot  * (1.f - blendPole);
     }
 
     /* --- Push to EFX effect and re-upload to slot ------------------------- */
@@ -2094,16 +2325,34 @@ static void S_AL_UpdateDynamicReverb( void )
                    curDecay,   curLate,   curRefl,   curSlot);
 
         if (s_alDebugReverb->integer >= 2) {
-            /* Extra line: show raw (pre-history) metrics and cache state.
-             * horizOpen / vertOpen split reveals overhang / low-ceiling effects:
-             * a large horizOpen with low vertOpen means overhead obstruction. */
+            /* Extra line: show raw (pre-history) metrics, cache state, and
+             * active tuning parameters so the user can verify cvar changes
+             * took effect after an s_alReset. */
+            int  historySize = s_alEnvHistorySize ? (int)s_alEnvHistorySize->value
+                                                  : S_AL_ENV_HISTORY;
+            if (historySize < 1) historySize = 1;
+            if (historySize > S_AL_ENV_HISTORY_MAX) historySize = S_AL_ENV_HISTORY_MAX;
             Com_Printf(S_COLOR_CYAN "             raw: size=%.2f  horizOpen=%.2f  vertOpen=%.2f  corr=%.2f"
-                       "  |  hist=%d/%d  cache=%s\n",
+                       "  |  hist=%d/%d  vel=%.0f  cache=%s\n",
                        cachedSize, horizOpenFrac, vertOpenFrac, cachedCorr,
-                       histCount, S_AL_ENV_HISTORY,
+                       histCount, historySize, cachedVelSpeed,
                        haveCache ? "hit" : "miss");
         }
     }
+}
+
+/* Lightweight dynamic-reverb state reset, triggered by the s_alReset console
+ * command.  Invalidates the history buffer, movement cache, velocity tracking,
+ * and forces a "snap" on the next probe cycle so all s_alEnv* cvar changes
+ * take effect immediately — no map reload or snd_restart needed. */
+static void S_AL_ReverbReset_f( void )
+{
+    if (!s_al_started) {
+        Com_Printf("S_AL: not running.\n");
+        return;
+    }
+    s_al_reverbReset = qtrue;
+    Com_Printf("S_AL: reverb state reset — will snap on next probe cycle.\n");
 }
 
 static void S_AL_Update( int msec )
@@ -2233,6 +2482,16 @@ static void S_AL_Update( int msec )
                 /* Full-volume zone: always at max gain, exact HRTF position.
                  * No wall can separate source from listener at this range; any
                  * filter attenuation here would be wrong. */
+                interval = 0;
+            } else if (s_al_src[i].entchannel == CHAN_WEAPON &&
+                       distSq < ((s_alOccWeaponDist ? s_alOccWeaponDist->value : S_AL_WEAPON_NOOCC_DIST) *
+                                 (s_alOccWeaponDist ? s_alOccWeaponDist->value : S_AL_WEAPON_NOOCC_DIST))) {
+                /* Gun-muzzle zone: weapon-channel sources within 160 u of the
+                 * listener are almost certainly the own player's gun barrel.
+                 * Skip occlusion regardless of entity ownership — a muzzle
+                 * origin at ~80 u can be just past the full-volume sphere and
+                 * clip-brush geometry on nearby slopes would otherwise trigger
+                 * false muffling on every shot. */
                 interval = 0;
             } else if (distSq < (300.f * 300.f)) {
                 interval = 1;   /* close — per-frame, e.g. nearby players */
@@ -2574,6 +2833,36 @@ qboolean S_AL_Init( soundInterface_t *si )
     Cvar_CheckRange(s_alLocalSelf, "0", "1", CV_INTEGER);
     Cvar_SetDescription(s_alLocalSelf, "Force own-player sounds (footsteps, weapon, breath) to be non-spatialized regardless of any world-space origin supplied by the game. Prevents stale-position artefacts caused by URT jumping/sliding physics. Default 1.");
 
+    /* Acoustic-environment tuning — all live-tunable; type /s_alReset after
+     * changing to hear the effect without a map reload. */
+    s_alEnvHorizDist = Cvar_Get("s_alEnvHorizDist", "1330", CVAR_ARCHIVE_ND);
+    Cvar_CheckRange(s_alEnvHorizDist, "200", "4096", CV_FLOAT);
+    Cvar_SetDescription(s_alEnvHorizDist, "Dynamic reverb: max distance for the 8 horizontal probe rays (game units). Larger values make open spaces sound more open. Default 1330 = full attenuation range.");
+    s_alEnvVertDist = Cvar_Get("s_alEnvVertDist", "400", CVAR_ARCHIVE_ND);
+    Cvar_CheckRange(s_alEnvVertDist, "50", "2000", CV_FLOAT);
+    Cvar_SetDescription(s_alEnvVertDist, "Dynamic reverb: max distance for diagonal-up and straight-up probe rays (game units). Calibrated for URT indoor ceiling heights (160-280 u). Default 400.");
+    s_alEnvDownDist = Cvar_Get("s_alEnvDownDist", "160", CVAR_ARCHIVE_ND);
+    Cvar_CheckRange(s_alEnvDownDist, "50", "1000", CV_FLOAT);
+    Cvar_SetDescription(s_alEnvDownDist, "Dynamic reverb: max distance for the straight-down probe ray (game units). Detects pits and voids below the player. Default 160.");
+    s_alEnvHorizWeight = Cvar_Get("s_alEnvHorizWeight", "0.70", CVAR_ARCHIVE_ND);
+    Cvar_CheckRange(s_alEnvHorizWeight, "0", "1", CV_FLOAT);
+    Cvar_SetDescription(s_alEnvHorizWeight, "Dynamic reverb: fraction of openFrac contributed by the 8 horizontal rays. Remaining (1-value) comes from vertical rays. Default 0.70 — overhead obstructions are less acoustically dominant than surrounding walls.");
+    s_alEnvSmoothPole = Cvar_Get("s_alEnvSmoothPole", "0.92", CVAR_ARCHIVE_ND);
+    Cvar_CheckRange(s_alEnvSmoothPole, "0.5", "0.99", CV_FLOAT);
+    Cvar_SetDescription(s_alEnvSmoothPole, "Dynamic reverb: IIR smoothing pole for EFX parameter blending [0.5-0.99]. Higher = slower, smoother transitions; lower = snappier. 0.92 ~= 3.5 s half-life at 60 fps. Automatically reduced up to 0.07 below this when the player is moving fast.");
+    s_alEnvHistorySize = Cvar_Get("s_alEnvHistorySize", "3", CVAR_ARCHIVE_ND);
+    Cvar_CheckRange(s_alEnvHistorySize, "1", "8", CV_INTEGER);
+    Cvar_SetDescription(s_alEnvHistorySize, "Dynamic reverb: rolling history window size [1-8]. Larger values smooth out doorway/threshold flicker at the cost of slower environment transitions. Default 3.");
+    s_alEnvVelThresh = Cvar_Get("s_alEnvVelThresh", "48", CVAR_ARCHIVE_ND);
+    Cvar_CheckRange(s_alEnvVelThresh, "8", "400", CV_FLOAT);
+    Cvar_SetDescription(s_alEnvVelThresh, "Dynamic reverb: player speed threshold (game units per 16-frame probe cycle, ~180 u/s at 60fps) to activate velocity look-ahead rays. Below this, look-ahead is disabled. Default 48.");
+    s_alEnvVelWeight = Cvar_Get("s_alEnvVelWeight", "0.30", CVAR_ARCHIVE_ND);
+    Cvar_CheckRange(s_alEnvVelWeight, "0", "0.5", CV_FLOAT);
+    Cvar_SetDescription(s_alEnvVelWeight, "Dynamic reverb: maximum blend weight of the 2 look-ahead rays (in direction of travel) into openFrac when the player is moving. Higher values make environment transitions respond faster to movement direction. Default 0.30.");
+    s_alOccWeaponDist = Cvar_Get("s_alOccWeaponDist", "160", CVAR_ARCHIVE_ND);
+    Cvar_CheckRange(s_alOccWeaponDist, "80", "400", CV_FLOAT);
+    Cvar_SetDescription(s_alOccWeaponDist, "Occlusion: CHAN_WEAPON sources within this distance of the listener bypass occlusion tracing entirely. Covers gun-muzzle origin offsets (~50-100 u) and prevents PLAYERCLIP slope geometry from muffling your own weapon fire. Default 160.");
+
     /* Load library */
     if (!S_AL_LoadLibrary())
         return qfalse;
@@ -2750,6 +3039,7 @@ qboolean S_AL_Init( soundInterface_t *si )
     s_al_muted   = qfalse;
 
     Cmd_AddCommand("s_devices", S_AL_ListDevicesCmd);
+    Cmd_AddCommand("s_alReset",  S_AL_ReverbReset_f);
 
     /* Populate the soundInterface_t */
     si->Shutdown             = S_AL_Shutdown;
