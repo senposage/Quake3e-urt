@@ -228,12 +228,6 @@ static LPALAUXILIARYEFFECTSLOTF       qalAuxiliaryEffectSlotf;
  * the player's own weapon fire even when the sound was emitted as a world sound. */
 #define S_AL_WEAPON_NOOCC_DIST  160.0f
 
-/* Path prefix used to identify weapon sounds by filename.
- * Sounds under this directory receive the CHAN_WEAPON occlusion bypass when
- * near the listener, regardless of which channel they were started on. */
-#define S_AL_WEAPON_SOUND_PREFIX        "sound/weapons/"
-#define S_AL_WEAPON_SOUND_PREFIX_LEN    14  /* strlen("sound/weapons/") */
-
 /* Dedup window removed — vanilla URT has the same double-start behaviour
  * and nobody notices.  Culling is handled by distance rejection and by the
  * priority-ordered eviction in S_AL_GetFreeSource.
@@ -368,7 +362,7 @@ static alEfx_t s_al_efx;
 static cvar_t *s_alDevice;
 static cvar_t *s_alHRTF;
 static cvar_t *s_alEFX;          /* 0 = skip EFX init entirely (test/debug) */
-static cvar_t *s_alDirectChannels; /* 0 = disable AL_SOFT_direct_channels even if available (LATCH) */
+static cvar_t *s_alDirectChannels; /* 0 = disable AL_SOFT_direct_channels; active only when s_alHRTF 1 */
 static cvar_t *s_alMaxDist;
 static cvar_t *s_alReverb;       /* master EFX reverb toggle (0/1) */
 static cvar_t *s_alReverbGain;   /* wet-signal slot gain [0..1] */
@@ -435,14 +429,14 @@ static void S_AL_CheckALError( const char *where )
         Com_Printf("[altrace] ^1AL error 0x%04x at %s\n", (unsigned)err, where);
 }
 
-/* AL_SOFT_direct_channels: when available, local (head-locked) sources bypass
- * the HRTF convolution pipeline and route PCM straight to the stereo output.
- * Without this, even a source at position (0,0,0) relative goes through the
- * HRTF "center" HRIR, which smears the initial transient of weapon sounds
- * (e.g. de.wav) and produces the characteristic "wet blanket / no punch"
- * complaint on weapons like the DE-50. */
+/* AL_SOFT_direct_channels: when HRTF is on (s_alHRTF 1), local (head-locked)
+ * sources bypass the HRTF convolution pipeline and route PCM straight to the
+ * stereo output.  Without this, even a source at position (0,0,0) relative
+ * goes through the HRTF "center" HRIR, which smears the initial transient of
+ * weapon sounds (e.g. de.wav).  Only active when s_alHRTF 1 — with HRTF off
+ * there is no convolution to bypass, so this has no effect. */
 static qboolean s_al_directChannelsExt = qfalse; /* AL_SOFT_direct_channels extension present */
-static qboolean s_al_directChannels    = qfalse; /* active: extension present AND cvar enabled */
+static qboolean s_al_directChannels    = qfalse; /* active: extension present, cvar on, AND s_alHRTF 1 */
 
 /* =========================================================================
  * Section 5 — Library loading helpers
@@ -1193,15 +1187,14 @@ static void S_AL_SrcSetup( int idx, sfxHandle_t sfx,
             if (s_alDebugReverb && s_alDebugReverb->integer >= 2)
                 Com_Printf(S_COLOR_CYAN "[alfilter] src#%d local: cleared stale filter\n", idx);
         }
-        /* Bypass the HRTF convolution for head-locked (own-player) sounds.
-         * Even at AL_POSITION (0,0,0) relative, OpenAL Soft runs the signal
-         * through the "center" HRIR when HRTF is enabled.  That convolution
-         * smears the initial transient of de.wav and removes the characteristic
-         * crack that defines the DE-50's punch — producing the "wet blanket"
-         * effect.  AL_DIRECT_CHANNELS_SOFT routes the PCM directly to the
-         * stereo output mix, bypassing all spatialization / HRTF entirely.
-         * 3D sources (other players' weapons) are unaffected: they need HRTF
-         * for correct directional rendering. */
+        /* Bypass the HRTF convolution for head-locked (own-player) sounds
+         * when HRTF is active (s_alHRTF 1).  Even at AL_POSITION (0,0,0)
+         * relative, OpenAL Soft runs the signal through the "center" HRIR
+         * when HRTF is enabled.  That convolution smears the initial transient
+         * of weapon sounds.  AL_DIRECT_CHANNELS_SOFT routes the PCM directly
+         * to the stereo output mix, bypassing the HRTF kernel.
+         * s_al_directChannels is false when s_alHRTF 0 (default), so this
+         * call is skipped unless the user has explicitly enabled HRTF. */
         if (s_al_directChannels)
             qalSourcei(sid, AL_DIRECT_CHANNELS_SOFT, AL_TRUE);
     } else {
@@ -2812,16 +2805,11 @@ static void S_AL_Update( int msec )
                 /* Full-volume zone: wall cannot separate source from listener. */
                 interval = 0;
             } else if (distSq < (weapDist * weapDist) &&
-                       (s_al_src[i].entchannel == CHAN_WEAPON ||
-                        (s_al_src[i].sfx >= 0 && s_al_src[i].sfx < s_al_numSfx &&
-                         !Q_strncmp(s_al_sfx[s_al_src[i].sfx].name,
-                                    S_AL_WEAPON_SOUND_PREFIX,
-                                    S_AL_WEAPON_SOUND_PREFIX_LEN)))) {
-                /* Gun-muzzle zone: bypass occlusion for CHAN_WEAPON sources
-                 * and for any sound/weapons/ sound near the listener.  Covers
-                 * secondary weapon layers on CHAN_AUTO (e.g. de.wav fired
-                 * alongside a primary crack layer) where the channel tag alone
-                 * would not trigger the bypass. */
+                       s_al_src[i].entchannel == CHAN_WEAPON) {
+                /* Gun-muzzle zone: bypass occlusion for CHAN_WEAPON sources.
+                 * Covers muzzle-flash origin offsets (~50-100 u ahead of the
+                 * player eye) that would otherwise trigger false filter
+                 * attenuation from nearby slope/clip geometry. */
                 interval = 0;
             } else if (distSq < (300.f * 300.f)) {
                 /* Close range — trace every frame for nearby player accuracy. */
@@ -3125,15 +3113,24 @@ static void S_AL_SoundInfo( void )
             : S_COLOR_GREEN "OFF" S_COLOR_WHITE,
         s_alOcclusion ? s_alOcclusion->integer : 0);
 
-    /* AL_DIRECT_CHANNELS_SOFT — bypasses HRTF on local sources (good for weapons) */
+    /* AL_DIRECT_CHANNELS_SOFT — bypasses HRTF on local sources (active only when s_alHRTF 1) */
     if (!s_al_directChannelsExt) {
         Com_Printf("    DirectChannels    " S_COLOR_YELLOW "OFF" S_COLOR_WHITE
                    "  (AL_SOFT_direct_channels not available)\n");
     } else {
-        Com_Printf("    DirectChannels    %s  (s_alDirectChannels %d, LATCH)\n",
+        const char *reason = "";
+        if (!s_al_directChannels) {
+            if (s_alDirectChannels && !s_alDirectChannels->integer)
+                reason = "  (disabled by s_alDirectChannels 0)";
+            else if (!s_alHRTF || !s_alHRTF->integer)
+                reason = "  (inactive — s_alHRTF 0)";
+        }
+        Com_Printf("    DirectChannels    %s  (s_alDirectChannels %d, s_alHRTF %d, LATCH)%s\n",
             s_al_directChannels ? S_COLOR_GREEN "ON " S_COLOR_WHITE
                                 : S_COLOR_YELLOW "OFF" S_COLOR_WHITE,
-            s_alDirectChannels ? s_alDirectChannels->integer : 1);
+            s_alDirectChannels ? s_alDirectChannels->integer : 1,
+            s_alHRTF          ? s_alHRTF->integer          : 0,
+            reason);
     }
 
     Com_Printf("\n");
@@ -3239,11 +3236,12 @@ qboolean S_AL_Init( soundInterface_t *si )
     s_alDirectChannels = Cvar_Get("s_alDirectChannels", "1", CVAR_ARCHIVE_ND | CVAR_LATCH);
     Cvar_CheckRange(s_alDirectChannels, "0", "1", CV_INTEGER);
     Cvar_SetDescription(s_alDirectChannels,
-        "Enable AL_SOFT_direct_channels for own-player (local) sources. "
+        "Enable AL_SOFT_direct_channels for own-player (local) sources when s_alHRTF 1. "
         "When 1 (default), own-weapon and footstep sounds are routed directly to the "
-        "stereo mix, bypassing the HRTF centre-HRIR convolution — this preserves the "
-        "transient punch of weapon sounds (e.g. de.wav) even when s_alHRTF is on. "
-        "Set to 0 to route all sources through the full OpenAL pipeline. "
+        "stereo mix, bypassing the HRTF centre-HRIR convolution — preserving the "
+        "transient punch of weapon sounds (e.g. de.wav) for headphone users. "
+        "Has no effect when s_alHRTF 0 (default — HRTF off). "
+        "Set to 0 to route local sources through the full HRTF pipeline. "
         "Requires vid_restart (LATCH).");
     /* s_alMaxDist: default matches the vanilla dma max-audible distance.
      * Values below 1330 are clamped to 1330 by the distance-model setup. */
@@ -3563,17 +3561,21 @@ qboolean S_AL_Init( soundInterface_t *si )
     S_AL_InitEFX();
 
     /* Detect AL_SOFT_direct_channels.  Available in OpenAL Soft since v1.13.
-     * When present AND s_alDirectChannels is 1 (default), local sources
-     * (own-player weapons, footsteps) will be routed directly to the stereo
-     * output instead of through the HRTF convolution kernel — preserving the
-     * transient punch of de.wav etc. */
+     * Only active when HRTF is on (s_alHRTF 1): routing PCM directly to the
+     * stereo output only makes sense when there is a convolution kernel to
+     * bypass.  With s_alHRTF 0 (default) HRTF is already off, so this is a
+     * no-op and we skip setting it to reflect the actual intent. */
     s_al_directChannelsExt = qalIsExtensionPresent("AL_SOFT_direct_channels");
     s_al_directChannels    = s_al_directChannelsExt &&
-                             s_alDirectChannels && s_alDirectChannels->integer;
+                             s_alDirectChannels && s_alDirectChannels->integer &&
+                             s_alHRTF && s_alHRTF->integer;
     Com_Printf("S_AL: AL_SOFT_direct_channels: %s%s\n",
                s_al_directChannelsExt ? "available" : "not available",
                (s_al_directChannelsExt && !s_al_directChannels)
-                   ? " (disabled by s_alDirectChannels 0)" : "");
+                   ? (s_alDirectChannels && !s_alDirectChannels->integer)
+                       ? " (disabled by s_alDirectChannels 0)"
+                       : " (inactive — s_alHRTF 0)"
+                   : "");
 
     /* -----------------------------------------------------------------------
      * Streaming sources — allocated BEFORE the game source pool so they are

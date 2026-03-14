@@ -320,12 +320,10 @@ ambients.
   (controlled by `s_alOccPosBlend`).  Only `CONTENTS_SOLID` brushes are tested —
   `CONTENTS_PLAYERCLIP` is excluded so invisible movement-constraint geometry on
   slopes and ledges does not cause false muffling of nearby weapon fire.
-- **CHAN_WEAPON proximity bypass**: weapon-channel sources and any `sound/weapons/`
-  sound within `s_alOccWeaponDist` (default 160 u) of the listener skip occlusion
+- **CHAN_WEAPON proximity bypass**: weapon-channel sources within
+  `s_alOccWeaponDist` (default 160 u) of the listener skip occlusion
   entirely, covering the gun-muzzle offset (~50–100 u ahead of the player eye) that
   would otherwise trigger false filter attenuation from nearby slope/clip geometry.
-  The path-based check ensures secondary weapon layers on `CHAN_AUTO` also receive the
-  bypass (e.g. a tail layer played alongside a primary `CHAN_WEAPON` crack).
 - `s_alMaxDist 1330` is the vanilla dma maximum audible radius; sounds beyond
   this distance are inaudible regardless of wall status.
 
@@ -1277,13 +1275,12 @@ described — "wet blanket", "no punch", "lacking crack" — was preemption cutt
 
 | Change | Verdict | Reason |
 |--------|---------|--------|
-| `AL_DIRECT_CHANNELS_SOFT = AL_TRUE` for local sources | ⚠️ **AUDIT** | Bypasses HRTF centre-HRIR on head-locked sounds.  With `s_alHRTF 0` (the default since #87) this is a no-op — HRTF is off, so there is nothing to bypass.  With `s_alHRTF 1` it does prevent centre-HRIR smearing, which is a legitimate quality enhancement *for headphone users*, but it was added to fix the wrong problem.  Should be gated: only apply `AL_DIRECT_CHANNELS_SOFT` when `s_alHRTF 1`. |
-| Path-based occlusion bypass — `sound/weapons/` files on `CHAN_AUTO` | ❌ **HACK — REMOVE** | Added because "secondary weapon layers were muffled".  They were muffled because preemption killed them before they played.  With preemption fixed, secondary layers play on their own slots exactly like DMA.  This path-prefix check bypasses occlusion for any file under `sound/weapons/` within 160 u regardless of channel — incorrect for legitimate 3D weapon sounds from other players at that range. |
+| `AL_DIRECT_CHANNELS_SOFT = AL_TRUE` for local sources | ✅ **FIXED** | Now gated to `s_alHRTF 1` only — no-op when HRTF is off (default), and correctly bypasses centre-HRIR smearing for headphone users when HRTF is on. |
+| Path-based occlusion bypass — `sound/weapons/` files on `CHAN_AUTO` | ✅ **REMOVED** | Added because "secondary weapon layers were muffled".  They were muffled because preemption killed them before they played.  With preemption fixed, secondary layers play on their own slots exactly like DMA.  Path-prefix check removed; bypass is now CHAN_WEAPON-only. |
 | 3D sources start with `AL_FILTER_NULL` instead of attaching filter object | ⚠️ **AUDIT** | Motivation: "group-delay coloration on the transient of other players' weapon sounds".  That coloration was preemption.  However, the `AL_FILTER_NULL`-until-first-trace pattern does have independent merit: don't put a biquad in the signal path before you know it's needed.  Leave it for now but note the motivation was wrong. |
 
-**`s_alDirectChannels` cvar (PR #88) exists solely to make the
-`AL_DIRECT_CHANNELS_SOFT` behaviour above user-controllable.  If that
-behaviour is corrected, the cvar's scope shrinks accordingly.**
+**`s_alDirectChannels` cvar (PR #88): scope now narrowed** — only applies when
+`s_alHRTF 1` is set.  The cvar is retained as a useful knob for headphone users.
 
 ---
 
@@ -1311,7 +1308,7 @@ collateral:
 
 | Change | Verdict | Reason |
 |--------|---------|--------|
-| `s_alDirectChannels` cvar + split extension tracking | ⚠️ **AUDIT** | Added to make `AL_DIRECT_CHANNELS_SOFT` user-toggleable for diagnostic isolation of PR #86's "wet blanket" fix.  If the `AL_DIRECT_CHANNELS_SOFT` usage is corrected (gate to `s_alHRTF 1` only), this cvar may be simplified or removed. |
+| `s_alDirectChannels` cvar + split extension tracking | ✅ **RETAINED (narrowed)** | Added to make `AL_DIRECT_CHANNELS_SOFT` user-toggleable.  Now that the usage is gated to `s_alHRTF 1` only, the cvar's scope is narrowed accordingly — it controls HRTF bypass for headphone users only.  Cvar kept as a useful diagnostic and opt-out knob. |
 
 ---
 
@@ -1345,9 +1342,9 @@ collateral:
 
 | Item | File | Action |
 |------|------|--------|
-| `S_AL_WEAPON_SOUND_PREFIX` path-based occlusion bypass | `snd_openal.c` | **Remove** — revert to CHAN_WEAPON-only; the path check was added for the wrong reason |
-| `AL_DIRECT_CHANNELS_SOFT` unconditional on all local sources | `snd_openal.c` | **Narrow scope** — gate to `s_alHRTF 1` only; harmless when HRTF is off (default) but should reflect actual intent |
-| `s_alDirectChannels` cvar (PR #88) | `snd_openal.c` | **Review after above** — may simplify to a compile-time check or remove entirely |
+| `S_AL_WEAPON_SOUND_PREFIX` path-based occlusion bypass | `snd_openal.c` | ✅ **Done** — removed; occlusion bypass now CHAN_WEAPON-only |
+| `AL_DIRECT_CHANNELS_SOFT` unconditional on all local sources | `snd_openal.c` | ✅ **Done** — gated to `s_alHRTF 1` only; no-op when HRTF is off (default) |
+| `s_alDirectChannels` cvar (PR #88) | `snd_openal.c` | ✅ **Done** — description updated; cvar kept for headphone users who enable `s_alHRTF 1` |
 | 3D sources starting with `AL_FILTER_NULL` instead of filter object | `snd_openal.c` | **Leave for now** — independent merit; re-evaluate after other cleanup |
 | `alcResetDeviceSoft` Layer-3 HRTF disable | `snd_openal.c` | **Leave** — defensively correct even if motivated by wrong diagnosis |
-| Stale `SOUND.md` references to old 100 ms guard | `docs/project/SOUND.md` | ✅ **Done in this PR** |
+| Stale `SOUND.md` references to old 100 ms guard | `docs/project/SOUND.md` | ✅ **Done in prior PR** |
