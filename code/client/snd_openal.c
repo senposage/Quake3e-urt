@@ -2854,23 +2854,20 @@ static void S_AL_DisableSounds( void )
 
 static void S_AL_BeginRegistration( void )
 {
-    /* Mirror S_Base_BeginRegistration: clear the mute flag that
-     * S_AL_DisableSounds set so that sounds can play again.
-     * Without this, every map load (which calls S_DisableSounds then
-     * S_BeginRegistration) would leave the system permanently muted --
-     * causing complete audio silence in-game and on return to the menu. */
     s_al_muted = qfalse;
 
-    /* Pre-allocate slot 0 with a default sound, mirroring S_Base_BeginRegistration.
-     * The QVM checks (handle > 0) to detect a successful registration, so slot 0
-     * must be reserved as the "default/failure" placeholder.  Without this, the
-     * first sound the QVM registers gets handle 0 and is silently discarded,
-     * breaking menu music and all UI sounds on startup. */
-    if ( s_al_numSfx == 0 ) {
-        S_AL_RegisterSound( "sound/feedback/hit.wav", qfalse );
-    }
+    /* Slot 0 must be reserved as the default/failure placeholder on every
+     * registration cycle — cold start, map→menu, map→map.  The QVM checks
+     * (handle > 0) to detect a successful S_RegisterSound; if slot 0 is not
+     * pre-occupied the first real sound lands there, the QVM discards it as
+     * a failure, and the menu music / intro never starts, causing a hard lock.
+     *
+     * When s_al_numSfx == 0 (cold start) this registers the sound fresh.
+     * When s_al_numSfx > 0 (returning from a map) S_AL_FindSfx finds the
+     * existing record immediately and returns handle 0 — no reload, no cost. */
+    S_AL_RegisterSound( "sound/feedback/hit.wav", qfalse );
 
-    Com_DPrintf("S_AL: BeginRegistration -- unmuted, ready to play\n");
+    Com_DPrintf("S_AL: BeginRegistration -- slot 0 reserved\n");
 }
 
 static void S_AL_ClearSoundBuffer( void )
