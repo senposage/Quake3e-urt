@@ -4214,15 +4214,17 @@ qboolean S_AL_Init( soundInterface_t *si )
      * Any sound whose file name matches a token in s_alExtraVolList is routed
      * to SRC_CAT_EXTRAVOL and attenuated by s_alExtraVol.  The reference gain
      * is 0.70 (30 % reduction) and the cvar is clamped to 1.0 (reduce-only). */
-    s_alExtraVolList = Cvar_Get("s_alExtraVolList", "sound/feedback", CVAR_ARCHIVE_ND);
+    s_alExtraVolList = Cvar_Get("s_alExtraVolList", "sound/feedback/hit.wav,sound/feedback/kill.wav", CVAR_ARCHIVE_ND);
     Cvar_SetDescription(s_alExtraVolList,
         "Comma-separated list of sound path patterns routed to the s_alExtraVol "
         "volume group (case-insensitive substring match). "
         "Prefix a token with ! to exclude matching files from the group. "
-        "Examples: \"sound/feedback\" — all feedback sounds; "
-        "\"sound/feedback,!sound/feedback/quiet.wav\" — all feedback except quiet.wav; "
-        "\"sound/feedback/hit.wav\" — only that specific file. "
-        "Default \"sound/feedback\" (disproportionately loud feedback sounds).");
+        "Examples: \"sound/feedback/hit.wav,sound/feedback/kill.wav\" — only the two "
+        "loudest feedback sounds (default); "
+        "\"sound/feedback\" — all sounds under that directory; "
+        "\"sound/feedback,!sound/feedback/hit.wav\" — all feedback except hit.wav. "
+        "Default \"sound/feedback/hit.wav,sound/feedback/kill.wav\" "
+        "(the two disproportionately loud URT feedback sounds).");
     s_alExtraVol = Cvar_Get("s_alExtraVol", "1.0", CVAR_ARCHIVE_ND);
     Cvar_CheckRange(s_alExtraVol, "0.25", "1.0", CV_FLOAT);
     Cvar_SetDescription(s_alExtraVol,

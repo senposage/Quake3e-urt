@@ -292,13 +292,13 @@ A sound is included when at least one positive token matches **and** no `!` excl
 
 | Cvar | Default | Description |
 |------|---------|-------------|
-| `s_alExtraVolList` | `sound/feedback` | Comma-separated sound path patterns. Case-insensitive substring match against the sound file path. Prefix with `!` to exclude. Default routes all files whose path contains `sound/feedback` — the URT feedback sounds that are disproportionately loud — into the `s_alExtraVol` group. |
-| `s_alExtraVol` | `1.0` | Volume for matched sounds [0.25–1.0, reduce-only, ref 0.70]. At default (1.0) feedback sounds are already 30% quieter than unmodified playback. Floored at 0.25 so matched sounds are never fully silenced. |
+| `s_alExtraVolList` | `sound/feedback/hit.wav,sound/feedback/kill.wav` | Comma-separated sound path patterns. Case-insensitive substring match against the sound file path. Prefix with `!` to exclude. Default targets only the two disproportionately loud URT feedback sounds: `hit.wav` and `kill.wav`. Widen to `sound/feedback` to catch the whole directory. |
+| `s_alExtraVol` | `1.0` | Volume for matched sounds [0.25–1.0, reduce-only, ref 0.70]. At default (1.0) matched sounds are already 30% quieter than unmodified playback. Floored at 0.25 so matched sounds are never fully silenced. |
 
 **Examples**:
-- `s_alExtraVol 0.7` — cuts feedback to about 49% of original (power-2 curve: 0.7² × 0.70 ref ≈ −6 dB on top of the built-in reduction)
-- `s_alExtraVolList "sound/feedback,sound/misc/beep"` — group two directories together under one knob
-- `s_alExtraVolList "sound/feedback,!sound/feedback/confirm.wav"` — quiet all feedback except the kill-confirmation sound
+- `s_alExtraVol 0.7` — cuts matched sounds to about 49% of original (power-2 curve: 0.7² × 0.70 ref ≈ −6 dB on top of the built-in reduction)
+- `s_alExtraVolList "sound/feedback"` — widen the group to cover every sound under that directory
+- `s_alExtraVolList "sound/feedback,!sound/feedback/hit.wav"` — all feedback except hit.wav
 
 #### Loop-sound fade controls
 
