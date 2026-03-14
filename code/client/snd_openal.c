@@ -461,7 +461,8 @@ static cvar_t *s_alSuppressionFloor;   /* min listener gain during suppression [
 static cvar_t *s_alSuppressionMs;      /* suppression duration in ms */
 static cvar_t *s_alSuppressionHFFloor; /* min AL_LOWPASS_GAINHF during suppression [0..1] */
 static cvar_t *s_alNearMissPattern;    /* sound-name substrings that identify a near-miss bullet */
-/* Head-hit triggers (helmet and bare-head) */
+/* Head-hit triggers (helmet and bare-head) — separate gate from s_alSuppression */
+static cvar_t *s_alHeadHit;            /* 0=off, 1=head-hit disruption + tinnitus (standalone) */
 static cvar_t *s_alHelmetHitPattern;   /* sound-name substrings that identify a helmet hit */
 static cvar_t *s_alHelmetHitMs;        /* hearing-disruption duration after helmet hit (ms) */
 static cvar_t *s_alHelmetHFFloor;      /* min HF gain for helmet hit [0..1] */
@@ -495,6 +496,7 @@ static cvar_t *s_alExtraVol;    /* global volume scalar for all matched sounds [
 static cvar_t *s_alSuppressedSoundPattern; /* comma-separated substrings matched against sfx name */
 static cvar_t *s_alVolSuppressedWeapon;    /* own suppressed-weapon sounds [0..10] */
 static cvar_t *s_alVolEnemySuppressedWeapon; /* enemy suppressed-weapon sounds [0..10] */
+static cvar_t *s_alSuppressedEnemyRangeMax;  /* dist at which enemy suppressed boost drops to zero */
 static cvar_t *s_alVolSelf;      /* own player/weapon volume multiplier [0..1.5] */
 static cvar_t *s_alVolOther;     /* other entity/player volume multiplier [0..1.0] */
 static cvar_t *s_alVolEnv;       /* looping ambient volume multiplier [0..1.0] */
@@ -1521,6 +1523,27 @@ static void S_AL_SrcSetup( int idx, sfxHandle_t sfx,
     if (src->category == SRC_CAT_AMBIENT)
         catVol *= r->normGain;
 
+    /* Range-based proximity boost for enemy suppressed weapons.
+     * At point-blank range the volume scales up toward normal enemy weapon
+     * level (ref 0.70); beyond s_alSuppressedEnemyRangeMax it stays at the
+     * suppressed floor (ref 0.45). */
+    if (src->category == SRC_CAT_WORLD_SUPPRESSED && origin) {
+        float rangeMax  = s_alSuppressedEnemyRangeMax
+                          ? s_alSuppressedEnemyRangeMax->value : 400.f;
+        if (rangeMax > 0.f) {
+            float dx   = origin[0] - s_al_listener_origin[0];
+            float dy   = origin[1] - s_al_listener_origin[1];
+            float dz   = origin[2] - s_al_listener_origin[2];
+            float dist = sqrtf(dx*dx + dy*dy + dz*dz);
+            if (dist < rangeMax) {
+                float proximity  = 1.0f - dist / rangeMax;
+                /* Blend suppressed ref (0.45) up toward normal enemy ref (0.70). */
+                float rangeBoost = 1.0f + (0.70f / 0.45f - 1.0f) * proximity;
+                catVol *= rangeBoost;
+            }
+        }
+    }
+
     if (origin)
         VectorCopy(origin, src->origin);
     else
@@ -1836,21 +1859,18 @@ static void S_AL_InitEFX( void )
     qalEffecti(s_al_efx.reverbEffect, AL_EFFECT_TYPE, AL_EFFECT_EAXREVERB);
     if (qalGetError() == AL_NO_ERROR) {
         s_al_efx.hasEAXReverb = qtrue;
-        /* Medium-sized indoor room — sensible default for URT maps.
-         * Reflections gain is intentionally kept moderate so early
-         * reflections are audible but the late reverb tail does not
-         * drown out direct weapon / footstep sounds. */
+        /* Medium-sized indoor room — sensible default for URT maps. */
         qalEffectf(s_al_efx.reverbEffect, AL_EAXREVERB_DENSITY,           0.5f);
         qalEffectf(s_al_efx.reverbEffect, AL_EAXREVERB_DIFFUSION,         0.85f);
-        qalEffectf(s_al_efx.reverbEffect, AL_EAXREVERB_GAIN,              0.20f);
+        qalEffectf(s_al_efx.reverbEffect, AL_EAXREVERB_GAIN,              0.32f);
         qalEffectf(s_al_efx.reverbEffect, AL_EAXREVERB_GAINHF,            0.89f);
         qalEffectf(s_al_efx.reverbEffect, AL_EAXREVERB_GAINLF,            1.0f);
         qalEffectf(s_al_efx.reverbEffect, AL_EAXREVERB_DECAY_TIME,
                    s_alReverbDecay ? s_alReverbDecay->value : 1.49f);
         qalEffectf(s_al_efx.reverbEffect, AL_EAXREVERB_DECAY_HFRATIO,     0.83f);
-        qalEffectf(s_al_efx.reverbEffect, AL_EAXREVERB_REFLECTIONS_GAIN,  0.15f);
+        qalEffectf(s_al_efx.reverbEffect, AL_EAXREVERB_REFLECTIONS_GAIN,  0.25f);
         qalEffectf(s_al_efx.reverbEffect, AL_EAXREVERB_REFLECTIONS_DELAY, 0.007f);
-        qalEffectf(s_al_efx.reverbEffect, AL_EAXREVERB_LATE_REVERB_GAIN,  0.35f);
+        qalEffectf(s_al_efx.reverbEffect, AL_EAXREVERB_LATE_REVERB_GAIN,  0.50f);
         qalEffectf(s_al_efx.reverbEffect, AL_EAXREVERB_LATE_REVERB_DELAY, 0.011f);
         qalEffectf(s_al_efx.reverbEffect, AL_EAXREVERB_AIR_ABSORPTION_GAINHF, 0.994f);
         qalEffectf(s_al_efx.reverbEffect, AL_EAXREVERB_ROOM_ROLLOFF_FACTOR,   0.0f);
@@ -1861,13 +1881,13 @@ static void S_AL_InitEFX( void )
         qalGetError();
         qalEffectf(s_al_efx.reverbEffect, AL_REVERB_DENSITY,    0.5f);
         qalEffectf(s_al_efx.reverbEffect, AL_REVERB_DIFFUSION,  0.85f);
-        qalEffectf(s_al_efx.reverbEffect, AL_REVERB_GAIN,       0.20f);
+        qalEffectf(s_al_efx.reverbEffect, AL_REVERB_GAIN,       0.32f);
         qalEffectf(s_al_efx.reverbEffect, AL_REVERB_GAINHF,     0.89f);
         qalEffectf(s_al_efx.reverbEffect, AL_REVERB_DECAY_TIME,
                    s_alReverbDecay ? s_alReverbDecay->value : 1.49f);
-        qalEffectf(s_al_efx.reverbEffect, AL_REVERB_REFLECTIONS_GAIN,  0.15f);
+        qalEffectf(s_al_efx.reverbEffect, AL_REVERB_REFLECTIONS_GAIN,  0.25f);
         qalEffectf(s_al_efx.reverbEffect, AL_REVERB_REFLECTIONS_DELAY, 0.007f);
-        qalEffectf(s_al_efx.reverbEffect, AL_REVERB_LATE_REVERB_GAIN,  0.35f);
+        qalEffectf(s_al_efx.reverbEffect, AL_REVERB_LATE_REVERB_GAIN,  0.50f);
         qalEffectf(s_al_efx.reverbEffect, AL_REVERB_LATE_REVERB_DELAY, 0.011f);
     }
     qalGenAuxiliaryEffectSlots(1, &s_al_efx.reverbSlot);
@@ -1875,7 +1895,7 @@ static void S_AL_InitEFX( void )
                             (ALint)s_al_efx.reverbEffect);
     /* Apply initial reverb slot gain from cvar */
     {
-        float slotGain = s_alReverbGain ? s_alReverbGain->value : 0.20f;
+        float slotGain = s_alReverbGain ? s_alReverbGain->value : 0.35f;
         if (slotGain < 0.0f) slotGain = 0.0f;
         if (slotGain > 1.0f) slotGain = 1.0f;
         qalAuxiliaryEffectSlotf(s_al_efx.reverbSlot, AL_EFFECTSLOT_GAIN, slotGain);
@@ -2324,10 +2344,11 @@ static void S_AL_StartSound( const vec3_t origin, int entnum,
      * hearing-disruption event with its configured HF floor and duration,
      * then play the synthesised tinnitus ring.
      *
-     * Wire-up uses only the sound name — no cgame access required.
-     * Both patterns default to the known URT sound file names so the
-     * feature works out of the box with s_alSuppression 1. */
-    if (s_alSuppression && s_alSuppression->integer
+     * Gated by s_alHeadHit (standalone toggle, default 1) OR s_alSuppression.
+     * This allows head-hit feedback to be active without enabling the full
+     * near-miss / incoming-fire suppression system. */
+    if ((   (s_alHeadHit   && s_alHeadHit->integer)
+         || (s_alSuppression && s_alSuppression->integer))
             && isLocal
             && entchannel == CHAN_BODY
             && sfx >= 0 && sfx < s_al_numSfx) {
@@ -2946,9 +2967,9 @@ static void S_AL_UpdateEntityPosition( int entityNum, const vec3_t origin )
  * A movement cache skips re-tracing when the listener hasn't moved more than
  * S_AL_ENV_MOVE_THRESH units, saving CM traces for stationary players.
  *
- * EFX parameter targets are intentionally conservative (late-gain max 0.35,
- * decay max 2.5 s) so the reverb colours the space without drowning the direct
- * signal or causing layered weapon sounds to sound muffled.
+ * EFX parameter targets (late-gain max 0.53, decay max 3.0 s) are tuned
+ * to give URT maps a clearly audible acoustic character while leaving the
+ * direct signal intelligible.
  *
  * Performance: 14 traces / S_AL_ENV_RATE frames ≈ 0.9 traces/frame average
  *              (zero traces when movement cache is active).
@@ -3360,38 +3381,29 @@ static void S_AL_UpdateDynamicReverb( void )
 
     /* --- Derive target EFX parameters ------------------------------------ */
     baseGain = (s_alReverbGain && s_alReverbGain->value > 0.f)
-               ? s_alReverbGain->value : 0.20f;
+               ? s_alReverbGain->value : 0.35f;
 
-    /* Decay: short room (0.4 s) up to medium-large space (2.5 s), killed
-     * outdoors.  Max reduced from 4.0 s to 2.5 s — the longer decay was the
-     * main contributor to the "muffled / smeared" complaints, especially in
-     * the reverb send shared by all simultaneous layers of a compound sound. */
-    targetDecay = 0.4f + sizeFactor * 2.1f;
+    /* Decay: short room (0.5 s) up to large space (3.0 s), killed outdoors. */
+    targetDecay = 0.5f + sizeFactor * 2.5f;
     targetDecay *= (1.f - openFrac * 0.85f);
     if (targetDecay < 0.1f) targetDecay = 0.1f;
 
-    /* Late reverb tail: scaled way back so it colours the space rather than
-     * drowning the direct signal.  Max 0.35 (was 0.90).  Lower ceiling is
-     * especially important when multiple WAV layers share the same reverb
-     * slot — the tail compounds across all simultaneous sources. */
-    targetLate = 0.05f + sizeFactor * 0.30f;
+    /* Late reverb tail: max 0.53 — clearly audible in enclosed spaces. */
+    targetLate = 0.08f + sizeFactor * 0.45f;
     targetLate *= (1.f - openFrac * 0.85f);
     if (targetLate < 0.f) targetLate = 0.f;
     if (targetLate > 1.f) targetLate = 1.f;
 
-    /* Early reflections: corridor-boosted but overall reduced.
-     * Max 0.28 (was 0.60) to avoid masking the direct signal.
-     * Corridor threshold tightened (< 150 u, ratio ≥ 1.5×) so doorways
-     * and arches no longer trigger full corridor reflection levels. */
-    targetRefl = 0.03f + corrFactor * 0.25f;
+    /* Early reflections: corridor-boosted.  Max 0.40. */
+    targetRefl = 0.05f + corrFactor * 0.35f;
     targetRefl *= (1.f - openFrac * 0.75f);
     if (targetRefl < 0.f) targetRefl = 0.f;
     if (targetRefl > 1.f) targetRefl = 1.f;
 
     /* Slot gain: scales with enclosure; outdoor → near-dry.
-     * Kill factor reduced from 0.90 to 0.80 — less aggressive zero-out in
-     * semi-open areas so the transition feels gradual, not switched. */
-    targetSlot = baseGain * (1.f - openFrac * 0.80f);
+     * Kill factor 0.70 — gradual transition so semi-open areas retain
+     * some reverb character. */
+    targetSlot = baseGain * (1.f - openFrac * 0.70f);
     if (targetSlot < 0.f) targetSlot = 0.f;
     if (targetSlot > 1.f) targetSlot = 1.f;
 
@@ -3780,7 +3792,7 @@ static void S_AL_Update( int msec )
                 if (s_al_bloomExpiry == 0) {
                     /* Read current slot gain so we spike ABOVE it, not to an
                      * absolute value — prevents fighting with dynamic reverb. */
-                    float curGain = s_alReverbGain ? s_alReverbGain->value : 0.20f;
+                    float curGain = s_alReverbGain ? s_alReverbGain->value : 0.35f;
                     s_al_bloomPeak   = curGain + bGain;
                     if (s_al_bloomPeak > 1.0f) s_al_bloomPeak = 1.0f;
                 }
@@ -3823,7 +3835,7 @@ static void S_AL_Update( int msec )
         if (s_alEcho && s_alEcho->integer && s_al_efx.echoSlot) {
             static float lastEchoGain = -1.f;
             float echoGainTarget = 0.f;
-            float echoGainMax = s_alEchoGain ? s_alEchoGain->value : 0.06f;
+            float echoGainMax = s_alEchoGain ? s_alEchoGain->value : 0.10f;
             if (echoGainMax < 0.f) echoGainMax = 0.f;
             if (echoGainMax > 0.3f) echoGainMax = 0.3f;
             if (!s_al_inwater
@@ -3831,7 +3843,7 @@ static void S_AL_Update( int msec )
                     && s_alDynamicReverb && s_alDynamicReverb->integer) {
                 /* Use current slot gain as a proxy for enclosure level */
                 float slotGain = 0.f;
-                float reverbGainRef = s_alReverbGain ? s_alReverbGain->value : 0.20f;
+                float reverbGainRef = s_alReverbGain ? s_alReverbGain->value : 0.35f;
                 if (reverbGainRef > 0.001f && qalGetAuxiliaryEffectSlotf) {
                     qalGetAuxiliaryEffectSlotf(s_al_efx.reverbSlot,
                                                AL_EFFECTSLOT_GAIN, &slotGain);
@@ -4409,7 +4421,7 @@ static void S_AL_SoundInfo( void )
     Com_Printf("    s_musicVolume %.2f  (map background music)\n",
         s_musicVolume ? s_musicVolume->value : 0.25f);
     Com_Printf("    s_alReverbGain    %.2f  (reverb wet level)\n",
-        s_alReverbGain  ? s_alReverbGain->value  : 0.20f);
+        s_alReverbGain  ? s_alReverbGain->value  : 0.35f);
     Com_Printf("    s_alReverbDecay   %.2f s  (decay, LATCH)\n",
         s_alReverbDecay ? s_alReverbDecay->value : 1.49f);
     Com_Printf("    s_alMaxDist       %.0f  (attenuation distance)\n",
@@ -4489,44 +4501,44 @@ qboolean S_AL_Init( soundInterface_t *si )
     s_alMaxDist = Cvar_Get("s_alMaxDist", "1330", CVAR_ARCHIVE_ND);
     Cvar_CheckRange(s_alMaxDist, "1330", "4096", CV_FLOAT);
     Cvar_SetDescription(s_alMaxDist, "Maximum attenuation distance for OpenAL sound sources (game units). Matches vanilla dma range of 1330 at default.");
-    /* Reverb is OFF by default to match vanilla dma (no reverb). */
-    s_alReverb = Cvar_Get("s_alReverb", "0", CVAR_ARCHIVE_ND);
+    /* Reverb is ON by default — gives URT maps clear acoustic character. */
+    s_alReverb = Cvar_Get("s_alReverb", "1", CVAR_ARCHIVE_ND);
     Cvar_CheckRange(s_alReverb, "0", "1", CV_INTEGER);
-    Cvar_SetDescription(s_alReverb, "Enable EFX environmental reverb (requires ALC_EXT_EFX). Default 0 matches vanilla dma behaviour.");
-    s_alReverbGain = Cvar_Get("s_alReverbGain", "0.20", CVAR_ARCHIVE_ND);
+    Cvar_SetDescription(s_alReverb, "Enable EFX environmental reverb (requires ALC_EXT_EFX). Default 1.");
+    s_alReverbGain = Cvar_Get("s_alReverbGain", "0.35", CVAR_ARCHIVE_ND);
     Cvar_CheckRange(s_alReverbGain, "0", "1", CV_FLOAT);
     Cvar_SetDescription(s_alReverbGain, "EFX reverb auxiliary slot gain (wet level). Lower values reduce echo relative to direct sound. Acts as the ceiling when s_alDynamicReverb is on.");
     s_alReverbDecay = Cvar_Get("s_alReverbDecay", "1.49", CVAR_ARCHIVE_ND | CVAR_LATCH);
     Cvar_CheckRange(s_alReverbDecay, "0.1", "10.0", CV_FLOAT);
     Cvar_SetDescription(s_alReverbDecay, "EFX reverb decay time in seconds. Used when s_alDynamicReverb 0. Requires map reload (LATCH).");
-    /* Dynamic reverb is OFF by default (opt-in feature, not vanilla). */
-    s_alDynamicReverb = Cvar_Get("s_alDynamicReverb", "0", CVAR_ARCHIVE_ND);
+    /* Dynamic reverb is ON by default. */
+    s_alDynamicReverb = Cvar_Get("s_alDynamicReverb", "1", CVAR_ARCHIVE_ND);
     Cvar_CheckRange(s_alDynamicReverb, "0", "1", CV_INTEGER);
-    Cvar_SetDescription(s_alDynamicReverb, "Ray-traced acoustic environment detection. Casts 14 probes from the listener every 16 frames to measure room size, corridor shape, and openness, then adjusts EFX reverb decay/reflections accordingly. Default 0.");
+    Cvar_SetDescription(s_alDynamicReverb, "Ray-traced acoustic environment detection. Casts 14 probes from the listener every 16 frames to measure room size, corridor shape, and openness, then adjusts EFX reverb decay/reflections accordingly. Default 1.");
     s_alDebugReverb = Cvar_Get("s_alDebugReverb", "0", CVAR_TEMP);
     Cvar_CheckRange(s_alDebugReverb, "0", "2", CV_INTEGER);
     Cvar_SetDescription(s_alDebugReverb, "Dynamic reverb debug output. 1 = print env label + smoothed EFX params every probe cycle. 2 = also print raw probe metrics and filter-reset events. Default 0 (off). Not archived.");
-    s_alEcho = Cvar_Get("s_alEcho", "0", CVAR_ARCHIVE_ND);
+    s_alEcho = Cvar_Get("s_alEcho", "1", CVAR_ARCHIVE_ND);
     Cvar_CheckRange(s_alEcho, "0", "1", CV_INTEGER);
     Cvar_SetDescription(s_alEcho,
         "Geometry-driven echo effect on EFX auxiliary send 1. "
-        "When on, adds a subtle discrete reflection layer to 3D sources in "
+        "When on, adds a discrete reflection layer to 3D sources in "
         "enclosed spaces. Slot gain is driven automatically by room size "
-        "from s_alDynamicReverb. Default 0 (off).");
-    s_alEchoGain = Cvar_Get("s_alEchoGain", "0.06", CVAR_ARCHIVE_ND);
+        "from s_alDynamicReverb. Default 1 (on).");
+    s_alEchoGain = Cvar_Get("s_alEchoGain", "0.10", CVAR_ARCHIVE_ND);
     Cvar_CheckRange(s_alEchoGain, "0", "0.3", CV_FLOAT);
     Cvar_SetDescription(s_alEchoGain,
         "Maximum wet gain for the echo aux slot [0–0.3]. "
         "Only applies when s_alEcho 1. Actual gain is scaled by room enclosure. "
-        "Default 0.06 (subtle single-reflection layer).");
-    s_alFireImpactReverb = Cvar_Get("s_alFireImpactReverb", "0", CVAR_ARCHIVE_ND);
+        "Default 0.10.");
+    s_alFireImpactReverb = Cvar_Get("s_alFireImpactReverb", "1", CVAR_ARCHIVE_ND);
     Cvar_CheckRange(s_alFireImpactReverb, "0", "1", CV_INTEGER);
     Cvar_SetDescription(s_alFireImpactReverb,
         "Fire-direction impact reverb boost. When the local player fires a weapon, "
         "3 short rays are cast in the aim direction. A nearby wall within 400 units "
         "transiently boosts early reflections and decay in the EFX reverb — simulating "
         "the sharp acoustic echo of a muzzle blast off a hard surface. Requires "
-        "s_alDynamicReverb 1. Default 0 (off).");
+        "s_alDynamicReverb 1. Default 1 (on).");
     s_alFireImpactMaxBoost = Cvar_Get("s_alFireImpactMaxBoost", "0.25", CVAR_ARCHIVE_ND);
     Cvar_CheckRange(s_alFireImpactMaxBoost, "0", "0.5", CV_FLOAT);
     Cvar_SetDescription(s_alFireImpactMaxBoost,
@@ -4535,14 +4547,13 @@ qboolean S_AL_Init( soundInterface_t *si )
     s_alSuppression = Cvar_Get("s_alSuppression", "0", CVAR_ARCHIVE_ND);
     Cvar_CheckRange(s_alSuppression, "0", "1", CV_INTEGER);
     Cvar_SetDescription(s_alSuppression,
-        "Master toggle for all hearing-disruption effects. When 1, enables: "
+        "Master toggle for near-miss and incoming-fire hearing disruption. When 1, enables: "
         "(A) near-miss HF muffling when whiz1/whiz2 sounds play, "
-        "(B) additional HF muffling from nearby enemy CHAN_WEAPON fire, "
-        "(C) helmet-hit HF muffling + tinnitus ring (sound/helmethit.wav), "
-        "(D) bare-head-hit HF muffling + tinnitus (sound/headshot.wav). "
+        "(B) additional HF muffling from nearby enemy CHAN_WEAPON fire. "
         "Effects apply a per-source AL_LOWPASS_GAINHF cut that creates a "
         "convincing muffled/concussed hearing feel rather than a simple volume duck. "
         "Teammates and suppressed weapons are excluded automatically. "
+        "Head-hit disruption (helmet/bare-head) has its own toggle: s_alHeadHit. "
         "Default 0 (opt-in).");
     s_alSuppressionRadius = Cvar_Get("s_alSuppressionRadius", "180", CVAR_ARCHIVE_ND);
     Cvar_CheckRange(s_alSuppressionRadius, "50", "400", CV_FLOAT);
@@ -4579,14 +4590,22 @@ qboolean S_AL_Init( soundInterface_t *si )
         "plays, the hearing-disruption effect fires immediately — this is the precise "
         "trigger path (vs the radius fallback). URT uses sound/weapons/whiz1.wav and "
         "whiz2.wav. Default 'whiz1,whiz2'. Empty = disable name-based trigger.");
-    /* Head-hit triggers */
+    /* Head-hit triggers — standalone toggle, independent of s_alSuppression */
+    s_alHeadHit = Cvar_Get("s_alHeadHit", "1", CVAR_ARCHIVE_ND);
+    Cvar_CheckRange(s_alHeadHit, "0", "1", CV_INTEGER);
+    Cvar_SetDescription(s_alHeadHit,
+        "Enable head-hit hearing disruption + tinnitus independently of s_alSuppression. "
+        "When 1, a CHAN_BODY sound matching s_alHelmetHitPattern or s_alBareHeadHitPattern "
+        "on the local player entity triggers HF muffling and the tinnitus ring. "
+        "s_alSuppression 1 also enables this feature; s_alHeadHit lets you enable "
+        "head-hit feedback alone without the near-miss/incoming-fire system. Default 1.");
     s_alHelmetHitPattern = Cvar_Get("s_alHelmetHitPattern", "helmethit", CVAR_ARCHIVE_ND);
     Cvar_SetDescription(s_alHelmetHitPattern,
         "Comma-separated sound-name substrings for helmet-hit detection. "
         "When the local player's entity plays a CHAN_BODY sound matching this pattern, "
         "a hearing-disruption event fires (HF muffling + tinnitus ring). "
         "URT uses sound/helmethit.wav. Default 'helmethit'. "
-        "Requires s_alSuppression 1.");
+        "Active when s_alHeadHit 1 or s_alSuppression 1.");
     s_alHelmetHitMs = Cvar_Get("s_alHelmetHitMs", "350", CVAR_ARCHIVE_ND);
     Cvar_CheckRange(s_alHelmetHitMs, "50", "1000", CV_INTEGER);
     Cvar_SetDescription(s_alHelmetHitMs,
@@ -4603,7 +4622,7 @@ qboolean S_AL_Init( soundInterface_t *si )
         "Comma-separated sound-name substrings for bare-head (no helmet) hit detection. "
         "When matched on the local player entity CHAN_BODY, fires the strongest "
         "disruption tier. URT uses sound/headshot.wav for unprotected headshots. "
-        "Default 'headshot'. Requires s_alSuppression 1.");
+        "Default 'headshot'. Active when s_alHeadHit 1 or s_alSuppression 1.");
     s_alBareHeadHitMs = Cvar_Get("s_alBareHeadHitMs", "500", CVAR_ARCHIVE_ND);
     Cvar_CheckRange(s_alBareHeadHitMs, "50", "1500", CV_INTEGER);
     Cvar_SetDescription(s_alBareHeadHitMs,
@@ -4651,7 +4670,7 @@ qboolean S_AL_Init( soundInterface_t *si )
         "HF filter gradually reduces below s_alHealthFadeThreshold HP — "
         "the world grows muffled as the player nears death. Zero effect at "
         "or above the threshold so normal gameplay is unaffected. Default 0.");
-    s_alHealthFadeThreshold = Cvar_Get("s_alHealthFadeThreshold", "30", CVAR_ARCHIVE_ND);
+    s_alHealthFadeThreshold = Cvar_Get("s_alHealthFadeThreshold", "10", CVAR_ARCHIVE_ND);
     Cvar_CheckRange(s_alHealthFadeThreshold, "5", "100", CV_INTEGER);
     Cvar_SetDescription(s_alHealthFadeThreshold,
         "HP level below which the health-based HF fade activates [5–100]. "
@@ -4663,7 +4682,7 @@ qboolean S_AL_Init( soundInterface_t *si )
         "Minimum HF gain at 1 HP when health-fade is active [0–1]. "
         "0.35 ≈ −9 dB HF at death's door — noticeably muffled but footsteps "
         "and shots remain identifiable. Default 0.35.");
-    s_alGrenadeBloom = Cvar_Get("s_alGrenadeBloom", "0", CVAR_ARCHIVE_ND);
+    s_alGrenadeBloom = Cvar_Get("s_alGrenadeBloom", "1", CVAR_ARCHIVE_ND);
     Cvar_CheckRange(s_alGrenadeBloom, "0", "1", CV_INTEGER);
     Cvar_SetDescription(s_alGrenadeBloom,
         "Grenade-blast concussion effect. Combines two components: "
@@ -4741,6 +4760,14 @@ qboolean S_AL_Init( soundInterface_t *si )
         "reflects that inherent quietness. Capped at 2× (anti-cheat). "
         "Default 1.0 (reference level). Reduce to make suppressed enemies even "
         "harder to detect; raise to compensate if suppressors feel inaudible.");
+    s_alSuppressedEnemyRangeMax = Cvar_Get("s_alSuppressedEnemyRangeMax", "400", CVAR_ARCHIVE_ND);
+    Cvar_CheckRange(s_alSuppressedEnemyRangeMax, "0", "1330", CV_FLOAT);
+    Cvar_SetDescription(s_alSuppressedEnemyRangeMax,
+        "Distance (game units) within which enemy suppressed weapon volume scales up "
+        "toward normal enemy weapon level. At 0 units the volume equals the normal "
+        "enemy reference (ref 0.70); at this distance and beyond it stays at the "
+        "suppressed floor (ref 0.45). Set to 0 to disable range scaling entirely. "
+        "Default 400.");
     /* Extra-vol slots — one cvar per entry, always written to config (CVAR_ARCHIVE,
      * no CVAR_NODEFAULT) so every slot appears in the config file for easy editing.
      * Each slot holds one pattern: optional "!" prefix to exclude, optional ":-N"
@@ -4859,27 +4886,27 @@ qboolean S_AL_Init( soundInterface_t *si )
     Cvar_SetDescription(s_alOccWeaponDist, "Occlusion: CHAN_WEAPON sources within this distance of the listener bypass occlusion tracing entirely. Covers gun-muzzle origin offsets (~50-100 u) and prevents PLAYERCLIP slope geometry from muffling your own weapon fire. Default 160.");
 
     /* Loop-sound fade timing.  All live-tunable; type /s_alReset to hear changes. */
-    s_alLoopFadeInMs = Cvar_Get("s_alLoopFadeInMs", "600", CVAR_ARCHIVE_ND);
+    s_alLoopFadeInMs = Cvar_Get("s_alLoopFadeInMs", "800", CVAR_ARCHIVE_ND);
     Cvar_CheckRange(s_alLoopFadeInMs, "0", "3000", CV_INTEGER);
     Cvar_SetDescription(s_alLoopFadeInMs,
         "Loop-sound fade-in duration in milliseconds when an ambient source first "
-        "enters range (entity enters PVS). 0 = instant (no fade). Default 600.");
-    s_alLoopFadeOutMs = Cvar_Get("s_alLoopFadeOutMs", "500", CVAR_ARCHIVE_ND);
+        "enters range (entity enters PVS). 0 = instant (no fade). Default 800.");
+    s_alLoopFadeOutMs = Cvar_Get("s_alLoopFadeOutMs", "800", CVAR_ARCHIVE_ND);
     Cvar_CheckRange(s_alLoopFadeOutMs, "0", "3000", CV_INTEGER);
     Cvar_SetDescription(s_alLoopFadeOutMs,
         "Loop-sound fade-out duration in milliseconds when an ambient source leaves "
-        "range (entity leaves PVS). 0 = instant cut. Default 500. "
+        "range (entity leaves PVS). 0 = instant cut. Default 800. "
         "The fade-out always starts from the source's current gain level — if the "
         "source was still fading in when it was removed, the fade-out begins from "
         "that partial level, never jumping to full volume first.");
-    s_alLoopFadeDist = Cvar_Get("s_alLoopFadeDist", "200", CVAR_ARCHIVE_ND);
+    s_alLoopFadeDist = Cvar_Get("s_alLoopFadeDist", "400", CVAR_ARCHIVE_ND);
     Cvar_CheckRange(s_alLoopFadeDist, "0", "1000", CV_FLOAT);
     Cvar_SetDescription(s_alLoopFadeDist,
         "Distance zone (game units) inside the maximum audible range within which "
         "new loop sources start at a distance-proportional gain instead of silence. "
         "Eliminates the 'fade-in from zero' artefact for sources that appear while "
         "already audible: a source appearing at half the fade zone gets half gain "
-        "immediately. 0 = always start from silence (old behaviour). Default 200.");
+        "immediately. 0 = always start from silence (old behaviour). Default 400.");
 
     /* Occlusion filter tuning CVars.
      * All live-tunable — type /s_alReset after changing to hear the effect.
