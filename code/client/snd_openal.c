@@ -2860,6 +2860,16 @@ static void S_AL_BeginRegistration( void )
      * S_BeginRegistration) would leave the system permanently muted --
      * causing complete audio silence in-game and on return to the menu. */
     s_al_muted = qfalse;
+
+    /* Pre-allocate slot 0 with a default sound, mirroring S_Base_BeginRegistration.
+     * The QVM checks (handle > 0) to detect a successful registration, so slot 0
+     * must be reserved as the "default/failure" placeholder.  Without this, the
+     * first sound the QVM registers gets handle 0 and is silently discarded,
+     * breaking menu music and all UI sounds on startup. */
+    if ( s_al_numSfx == 0 ) {
+        S_AL_RegisterSound( "sound/feedback/hit.wav", qfalse );
+    }
+
     Com_DPrintf("S_AL: BeginRegistration -- unmuted, ready to play\n");
 }
 
