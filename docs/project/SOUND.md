@@ -289,19 +289,42 @@ Looping ambient sources fade in when an entity enters the player's PVS and fade 
 
 | Cvar | Default | Description |
 |------|---------|-------------|
-| `s_alEcho` | `0` | Geometry-driven echo on EFX auxiliary send 1. Adds a subtle discrete reflection layer to 3D sources in enclosed spaces. Slot gain is driven automatically by `s_alDynamicReverb` room classification. Requires `maxSends >= 2` (`s_alDynamicReverb` must be on for gain to vary; otherwise the slot stays at zero). Default 0 (opt-in). |
-| `s_alEchoGain` | `0.06` | Maximum wet gain for the echo slot [0–0.3]. Actual gain is scaled by enclosure. Default 0.06 (single subtle reflection). |
-| `s_alFireImpactReverb` | `0` | Transient early-reflection boost on weapon fire. Casts 3 rays in the aim direction; a wall within 400 units boosts `targetRefl` and `targetDecay` in the dynamic reverb for one probe cycle — simulating the sharp echo of a muzzle blast off a hard surface. Requires `s_alDynamicReverb 1`. Default 0. |
-| `s_alFireImpactMaxBoost` | `0.25` | Maximum reflections gain added by the fire-impact boost [0–0.5]. Default 0.25. |
+| `s_alEcho` | `0` | Geometry-driven echo on EFX auxiliary send 1. Adds a subtle discrete reflection layer to 3D sources in enclosed spaces. Slot gain is driven automatically by `s_alDynamicReverb` room classification. Requires `maxSends >= 2`. Default 0 (opt-in). |
+| `s_alEchoGain` | `0.06` | Maximum wet gain for the echo slot [0–0.3]. Actual gain is scaled by enclosure. Default 0.06. |
+| `s_alFireImpactReverb` | `0` | Transient early-reflection boost on weapon fire — **own fire and incoming enemy fire**. Own fire: casts 3 rays in aim direction; a wall within 400 units boosts `targetRefl`/`targetDecay`. Incoming enemy fire: uses the normalised distance to scale a proportional boost (half the own-fire max) without ray casting. Suppressed weapons are excluded from both paths. Requires `s_alDynamicReverb 1`. Default 0. |
+| `s_alFireImpactMaxBoost` | `0.25` | Maximum reflections gain for own-fire boost [0–0.5]. Incoming-enemy boost is capped at half this value. Default 0.25. |
 
-#### Audio suppression (near-miss / incoming fire)
+#### Grenade-concussion EFX bloom
+
+URT grenades are already loud enough to produce natural perceptual ducking via OpenAL's gain model. The bloom effect adds **acoustic character** (a brief reverb surge) without reducing audio clarity.
 
 | Cvar | Default | Description |
 |------|---------|-------------|
-| `s_alSuppression` | `0` | When enabled, briefly ducks the listener gain when an **enemy** fires a `CHAN_WEAPON` sound within `s_alSuppressionRadius` units. Simulates the concussive audio suppression of incoming fire. **Teammates are automatically excluded**: in team modes (TDM/CTF), the shooter's team is read from the player configstring and compared to your own — no cgame changes needed. Default 0 (opt-in). |
-| `s_alSuppressionRadius` | `180` | Detection radius in game units. Default 180 ≈ one room width. |
-| `s_alSuppressionFloor` | `0.55` | Minimum listener gain at peak suppression [0–0.95]. `0.55` ≈ −5 dB — noticeable but not disorienting. Lower values for stronger suppression effect. |
-| `s_alSuppressionMs` | `220` | Suppression duration in ms. Gain recovers linearly from floor to full over this window. Default 220 ms — short enough not to impede combat awareness. |
+| `s_alGrenadeBloom` | `0` | EFX reverb slot gain spike when an **enemy** grenade explodes within `s_alGrenadeBloomRadius`. No listener-gain reduction — footsteps and shots remain at full clarity. Teammates excluded via configstring team check. Requires `s_alReverb 1`. Default 0 (opt-in). |
+| `s_alGrenadeBloomRadius` | `400` | Blast radius (game units) that triggers the bloom. Default 400. |
+| `s_alGrenadeBloomGain` | `0.12` | Peak reverb slot gain boost above current level [0–0.3]. Default 0.12. |
+| `s_alGrenadeBloomMs` | `180` | Bloom decay duration in ms. Default 180. |
+| `s_alGrenadeBloomDuck` | `0` | **Opt-in** mild listener-gain duck alongside the bloom. URT's natural grenade loudness is usually sufficient — this is a subtle supplement. Hard-floored at 0.5 (competitive safety). Requires `s_alGrenadeBloom 1`. Default 0. |
+| `s_alGrenadeBloomDuckFloor` | `0.82` | Minimum listener gain during grenade duck [0.5–0.95]. 0.82 ≈ −1.7 dB. Default 0.82. |
+
+#### Audio suppression (near-miss incoming fire)
+
+| Cvar | Default | Description |
+|------|---------|-------------|
+| `s_alSuppression` | `0` | When enabled, briefly ducks the listener gain when an **enemy** fires a `CHAN_WEAPON` sound within `s_alSuppressionRadius`. **Teammates automatically excluded** (configstring team check, no cgame changes needed). **Suppressed weapons automatically excluded** (sound-name pattern check via `s_alSuppressedSoundPattern`). Default 0 (opt-in). |
+| `s_alSuppressionRadius` | `180` | Detection radius (game units). Default 180 ≈ one room width. |
+| `s_alSuppressionFloor` | `0.55` | Minimum listener gain at peak suppression [0–0.95]. 0.55 ≈ −5 dB. |
+| `s_alSuppressionMs` | `220` | Suppression duration in ms, linear recovery. Default 220. |
+
+#### Suppressed-weapon audio tuning
+
+Suppressors in URT are weapon **attachments** — the weapon ID is unchanged; the game selects a different audio asset for suppressed shots. Detection is therefore based on the sound **file name**, not the weapon ID.
+
+| Cvar | Default | Description |
+|------|---------|-------------|
+| `s_alSuppressedSoundPattern` | `silenced,_sd_,_sd.,suppressed,suppressor` | Comma-separated substrings matched case-insensitively against the sound file path. A match classifies the sound as suppressed, which: (1) routes it through `s_alVolSuppressedWeapon`, (2) skips the near-miss suppression duck, (3) skips the incoming-fire reverb boost. Covers common URT and Q3-mod naming conventions out of the box. |
+| `s_alVolSuppressedWeapon` | `1.0` | Volume for sounds matching the pattern [0–10, ref 0.55]. The 0.55 reference gain reflects suppressed weapons being inherently quieter. Power-2 curve below 1.0. Default 1.0. |
+
 
 #### Diagnosing weapon-sound quality with `s_alDebugPlayback`
 

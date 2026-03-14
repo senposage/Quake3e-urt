@@ -265,9 +265,10 @@ typedef enum {
                            * volume can be tuned without affecting footsteps. */
     SRC_CAT_IMPACT  = 5,  /* ENTITYNUM_WORLD one-shots: bullet impacts, brass,
                            * explosions, debris — often disproportionately loud. */
-    SRC_CAT_WEAPON_SUPPRESSED = 6, /* own suppressed weapon fire (MP5SD, etc.)
-                                    * — quieter than unsuppressed; IDs configured
-                                    * via s_alSuppressedWeaponIds. */
+    SRC_CAT_WEAPON_SUPPRESSED = 6, /* own suppressed-attachment weapon fire
+                                    * (e.g. M4/MP5 with silencer fitted).
+                                    * Detected by sound-file name pattern:
+                                    * see s_alSuppressedSoundPattern. */
 } alSrcCat_t;
 
 /* Per-active-sound source */
@@ -306,9 +307,10 @@ typedef struct {
     float       oldDopplerScale;
     int         fadeStartMs;        /* Com_Milliseconds() when fade-in began (0 = not fading in) */
     int         fadeOutStartMs;     /* Com_Milliseconds() when fade-out began (0 = not fading out) */
-    float       fadeOutStartGain;   /* normalised gain [0..1] at the moment fade-out was triggered;
-                                     * used so fade-out always continues from current level rather
-                                     * than jumping to full gain and fading from there (pop fix). */
+    float       fadeOutStartGain;   /* fade-in progress factor [0..1] at the moment fade-out was
+                                     * triggered — used so fade-out always ramps down from the
+                                     * actual in-progress level rather than jumping to full gain
+                                     * first (pop fix when fade-out interrupts a fade-in). */
 } alLoop_t;
 
 static alLoop_t s_al_loops[MAX_GENTITIES];
@@ -429,7 +431,7 @@ static cvar_t *s_alGrenadeBloomMs;      /* bloom decay duration in ms */
 static cvar_t *s_alGrenadeBloomDuck;       /* 0=off, 1=also apply mild listener-gain duck with bloom */
 static cvar_t *s_alGrenadeBloomDuckFloor;  /* min listener gain during grenade duck [0.5..0.95] */
 /* Suppressed weapons: separate volume knob + exclusion from suppression/reverb effects */
-static cvar_t *s_alSuppressedWeaponIds;    /* space/comma-separated weapon IDs treated as suppressed */
+static cvar_t *s_alSuppressedSoundPattern; /* comma-separated substrings matched against sfx name */
 static cvar_t *s_alVolSuppressedWeapon;    /* volume for suppressed-weapon sounds [0..10] */
 static cvar_t *s_alVolSelf;      /* own player/weapon volume multiplier [0..1.5] */
 static cvar_t *s_alVolOther;     /* other entity/player volume multiplier [0..1.0] */
@@ -942,41 +944,50 @@ static float S_AL_GetMasterVol( void )
  * Reference gains (baked in, not in the default cvar value):
  *   WORLD   0.70  · WEAPON  1.00  · IMPACT  0.55
  *   LOCAL   1.00  · AMBIENT 0.30  · UI      0.80
+ */
+
+/* Return qtrue when the sound file name contains any of the comma-separated
+ * substrings in s_alSuppressedSoundPattern.
  *
-/* Return qtrue when the entity's current weapon is in the s_alSuppressedWeaponIds
- * list.  Scans cl.parseEntities for the entity, reads entityState_t.weapon, then
- * tokenises the cvar string.  Returns qfalse for non-player entities, unknown
- * entities, or when the cvar is empty (default — all weapons unsuppressed). */
-static qboolean S_AL_IsWeaponSuppressed( int entnum )
+ * Why name-based rather than weapon-ID based: in URT (and most tactical
+ * shooters) a suppressor is a WEAPON ATTACHMENT — the weapon ID remains the
+ * same whether the suppressor is fitted or not.  What changes is the audio
+ * asset: the game selects a different wav file for suppressed shots (typically
+ * containing "silenced", "_sd_", "suppressor", etc.).  Matching against the
+ * sfx name is therefore the only engine-side approach that correctly handles
+ * attachment-based suppression without needing game-module changes.
+ *
+ * Case-insensitive.  Returns qfalse when the pattern cvar is empty (default). */
+static qboolean S_AL_IsSoundSuppressed( sfxHandle_t sfx )
 {
-    const char   *ids;
-    int           weaponId = -1;
-    int           k;
-    char          tok[16];
-    const char   *p;
+    const char *pat;
+    const char *name;
+    char        tok[64];
+    const char *p;
 
-    if (!s_alSuppressedWeaponIds) return qfalse;
-    ids = s_alSuppressedWeaponIds->string;
-    if (!ids || !ids[0]) return qfalse;
-    if (entnum < 0 || entnum >= MAX_CLIENTS) return qfalse;
+    if (!s_alSuppressedSoundPattern) return qfalse;
+    pat = s_alSuppressedSoundPattern->string;
+    if (!pat || !pat[0]) return qfalse;
+    if (sfx < 0 || sfx >= s_al_numSfx) return qfalse;
 
-    /* Look up the entity's weapon in the current snapshot */
-    for (k = 0; k < cl.snap.numEntities; k++) {
-        entityState_t *es = &cl.parseEntities[
-            (cl.snap.parseEntitiesNum + k) & (MAX_PARSE_ENTITIES - 1)];
-        if (es->number == entnum) { weaponId = es->weapon; break; }
-    }
-    if (weaponId < 0) return qfalse;
+    name = s_al_sfx[sfx].name;
+    if (!name || !name[0]) return qfalse;
 
-    /* Tokenise and match */
-    p = ids;
+    p = pat;
     while (*p) {
         int i = 0;
-        while (*p && *p != ' ' && *p != ',' && i < (int)sizeof(tok) - 1)
+        while (*p && *p != ',' && i < (int)sizeof(tok) - 1)
             tok[i++] = *p++;
         tok[i] = '\0';
-        if (i > 0 && atoi(tok) == weaponId) return qtrue;
-        while (*p == ' ' || *p == ',') p++;
+        if (*p == ',') p++;
+        /* Trim leading/trailing spaces from token */
+        {
+            char *s = tok, *e;
+            while (*s == ' ') s++;
+            e = s + strlen(s);
+            while (e > s && *(e-1) == ' ') *--e = '\0';
+            if (s[0] && Q_stristr(name, s)) return qtrue;
+        }
     }
     return qfalse;
 }
@@ -1286,7 +1297,7 @@ static void S_AL_SrcSetup( int idx, sfxHandle_t sfx,
     if (isLocal && entnum == 0)
         src->category = SRC_CAT_UI;
     else if (isLocal && entchannel == CHAN_WEAPON)
-        src->category = S_AL_IsWeaponSuppressed(entnum)
+        src->category = S_AL_IsSoundSuppressed(sfx)
                         ? SRC_CAT_WEAPON_SUPPRESSED : SRC_CAT_WEAPON;
     else if (isLocal)
         src->category = SRC_CAT_LOCAL;
@@ -1295,7 +1306,7 @@ static void S_AL_SrcSetup( int idx, sfxHandle_t sfx,
     else if (s_al_listener_entnum >= 0 && entnum == s_al_listener_entnum) {
         /* Own entity in 3D mode — split weapon fire from movement */
         if (entchannel == CHAN_WEAPON)
-            src->category = S_AL_IsWeaponSuppressed(entnum)
+            src->category = S_AL_IsSoundSuppressed(sfx)
                             ? SRC_CAT_WEAPON_SUPPRESSED : SRC_CAT_WEAPON;
         else
             src->category = SRC_CAT_LOCAL;
@@ -1894,7 +1905,7 @@ static void S_AL_StartSound( const vec3_t origin, int entnum,
                     isFriendly = qtrue;
             }
         }
-        if (!isFriendly && !S_AL_IsWeaponSuppressed(entnum)) {
+        if (!isFriendly && !S_AL_IsSoundSuppressed(sfx)) {
             float radius = s_alSuppressionRadius ? s_alSuppressionRadius->value : 180.f;
             vec3_t d;
             VectorSubtract(sndOrigin, s_al_listener_origin, d);
@@ -1926,7 +1937,7 @@ static void S_AL_StartSound( const vec3_t origin, int entnum,
             && !isLocal
             && entchannel == CHAN_WEAPON
             && entnum != s_al_listener_entnum
-            && !S_AL_IsWeaponSuppressed(entnum)) {
+            && !S_AL_IsSoundSuppressed(sfx)) {
         qboolean friendly = qfalse;
         {
             int ourTeam = (int)cl.snap.ps.persistant[PERS_TEAM];
@@ -3275,20 +3286,22 @@ static void S_AL_Update( int msec )
             }
 
             /* Drive the bloom decay: interpolate slot gain from peak back to
-             * the normal target gain over the remaining duration. */
+             * the normal target gain over the remaining duration.
+             * Query the actual current slot gain rather than the cvar so the
+             * base is correct even when s_alDynamicReverb has modified it. */
             if (s_al_bloomExpiry > 0) {
-                int   now3    = Com_Milliseconds();
-                float baseGain = s_alReverbGain ? s_alReverbGain->value : 0.20f;
+                int   now3     = Com_Milliseconds();
+                float baseGain = 0.0f;
                 float slotGain;
+                qalGetAuxiliaryEffectSlotf(s_al_efx.reverbSlot,
+                                           AL_EFFECTSLOT_GAIN, &baseGain);
                 if (now3 >= s_al_bloomExpiry) {
                     s_al_bloomExpiry = 0;
                     slotGain = baseGain;
                 } else {
-                    int   bMsNow = s_alGrenadeBloomMs
-                                   ? (int)s_alGrenadeBloomMs->value : 180;
                     int   remain = s_al_bloomExpiry - now3;
-                    float t      = (bMsNow > 0) ? (float)remain / (float)bMsNow
-                                                : 0.f;
+                    /* Reuse bMs already computed above for the trigger check */
+                    float t = (bMs > 0) ? (float)remain / (float)bMs : 0.f;
                     if (t > 1.f) t = 1.f;
                     /* t=1 at trigger → peak gain; t=0 at expiry → base gain */
                     slotGain = baseGain + (s_al_bloomPeak - baseGain) * t;
@@ -4040,21 +4053,26 @@ qboolean S_AL_Init( soundInterface_t *si )
         "Minimum listener gain during the optional grenade duck [0.5–0.95]. "
         "0.82 ≈ −1.7 dB — barely perceptible but adds physical impact. "
         "Hard minimum 0.5 for competitive safety. Default 0.82.");
-    s_alSuppressedWeaponIds = Cvar_Get("s_alSuppressedWeaponIds", "", CVAR_ARCHIVE_ND);
-    Cvar_SetDescription(s_alSuppressedWeaponIds,
-        "Space or comma-separated list of weapon integer IDs (from entityState_t.weapon) "
-        "to treat as suppressed/silenced. Suppressed weapons: "
-        "(1) use s_alVolSuppressedWeapon instead of s_alVolWeapon, "
-        "(2) do NOT trigger the near-miss suppression duck (s_alSuppression), "
-        "(3) do NOT trigger the incoming-fire reverb boost (s_alFireImpactReverb). "
-        "Example for a hypothetical URT: \"14 17\". Default empty (all weapons normal).");
+    s_alSuppressedSoundPattern = Cvar_Get("s_alSuppressedSoundPattern",
+                                          "silenced,_sd_,_sd.,suppressed,suppressor",
+                                          CVAR_ARCHIVE_ND);
+    Cvar_SetDescription(s_alSuppressedSoundPattern,
+        "Comma-separated substrings matched (case-insensitive) against the sound "
+        "file name to detect suppressed-weapon audio. "
+        "In URT a silencer/suppressor is a weapon ATTACHMENT — the weapon ID is "
+        "unchanged; only the audio asset differs (e.g. 'rifle_silenced_fire.wav'). "
+        "Matching the filename is therefore the correct engine-side detection method. "
+        "Matched sounds: (1) use s_alVolSuppressedWeapon, "
+        "(2) skip the near-miss suppression duck, "
+        "(3) skip the incoming-fire reverb boost. "
+        "Default patterns cover typical naming conventions. Empty = all unsuppressed.");
     s_alVolSuppressedWeapon = Cvar_Get("s_alVolSuppressedWeapon", "1.0", CVAR_ARCHIVE_ND);
     Cvar_CheckRange(s_alVolSuppressedWeapon, "0", "10.0", CV_FLOAT);
     Cvar_SetDescription(s_alVolSuppressedWeapon,
         "Volume multiplier for suppressed/silenced weapon fire [0–10, ref 0.55]. "
-        "Applies only to weapons listed in s_alSuppressedWeaponIds. "
-        "Reference gain 0.55 reflects suppressed weapons being inherently quieter. "
-        "Below 1.0 uses power-2 curve. Default 1.0.");
+        "Applies to sounds matching s_alSuppressedSoundPattern. "
+        "Reference gain 0.55 reflects that suppressed weapons are inherently quieter. "
+        "Below 1.0 uses power-2 curve for perceptual linearity. Default 1.0.");
     s_alOcclusion = Cvar_Get("s_alOcclusion", "1", CVAR_ARCHIVE_ND);
     Cvar_CheckRange(s_alOcclusion, "0", "1", CV_INTEGER);
     Cvar_SetDescription(s_alOcclusion, "Per-source occlusion tracing. Sounds behind walls are gain-attenuated and their apparent HRTF direction is corrected to the nearest audible gap. Close sources (<300 u) update every frame; distant sources update less often. Default 1.");
