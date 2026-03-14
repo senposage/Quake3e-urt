@@ -176,7 +176,7 @@ All EFX entry points are loaded via `alcGetProcAddress(device, ...)` at runtime 
 
 **Indoor reverb preset** (EAX parameters, tuned for URT urban maps):
 - Density 0.5, Diffusion 0.85, Gain 0.32, Decay 1.49s, HF ratio 0.83
-- Reflections delay 7ms, Late reverb delay 11ms, Air absorption 0.994
+- Reflections gain 0.25, Reflections delay 7ms, Late reverb gain 0.50, Late reverb delay 11ms, Air absorption 0.994
 
 **Per-source occlusion filters**: One `AL_FILTER_LOWPASS` is allocated per source slot at init. The filter is updated by the occlusion trace and attached via `AL_DIRECT_FILTER`.  When a source slot is reused, the filter is **explicitly reset to pass-through** before being attached so that stale attenuation from a previous (possibly occluded) sound never bleeds into the new sound — this was the cause of the sporadic "suppressor" effect on multi-layer weapon events.
 
@@ -248,10 +248,10 @@ Background music is streamed via a dedicated AL source and `S_AL_MUSIC_BUFFERS` 
 | `s_alEFX` | `1` | Enable ALC_EXT_EFX (occlusion filters, reverb aux slots). Set to 0 to skip EFX entirely for diagnostic isolation. (LATCH) |
 | `s_alDirectChannels` | `1` | Route own-player (local) sources directly to the stereo output, bypassing the HRTF centre-HRIR convolution. Only active when `s_alHRTF 1` — has no effect when HRTF is off (default). Requires `AL_SOFT_direct_channels` extension. (LATCH) |
 | `s_alMaxDist` | `1330` | Max attenuation distance in game units; matches vanilla dma range |
-| `s_alReverb` | `0` | Master EFX reverb toggle. **Default 0 = vanilla dma behaviour** |
-| `s_alReverbGain` | `0.20` | EFX wet slot gain [0–1]. Ceiling when `s_alDynamicReverb 1` |
+| `s_alReverb` | `1` | Master EFX reverb toggle. **Default 1 = on** |
+| `s_alReverbGain` | `0.35` | EFX wet slot gain [0–1]. Ceiling when `s_alDynamicReverb 1` |
 | `s_alReverbDecay` | `1.49` | Reverb decay in seconds; used when `s_alDynamicReverb 0` (LATCH) |
-| `s_alDynamicReverb` | `0` | Ray-traced acoustic environment. **Default 0 = opt-in** |
+| `s_alDynamicReverb` | `1` | Ray-traced acoustic environment. **Default 1 = on** |
 | `s_alDebugReverb` | `0` | Debug output for dynamic reverb. `1` = env label + smoothed params every probe cycle. `2` = also raw probe data and filter-reset events. Not archived. |
 | `s_alOcclusion` | `1` | Wall-occlusion tracing with HRTF direction correction |
 | `s_alOccGainFloor` | `0.55` | Floor of `AL_LOWPASS_GAIN` for fully-blocked sources [0–1]. `1.0` = no volume change through walls (vanilla-like). `0.0` = can go fully silent. Default 0.55 keeps occluded sounds audible with a modest volume jump at line-of-sight. |
@@ -321,17 +321,17 @@ Looping ambient sources fade in when an entity enters the player's PVS and fade 
 
 | Cvar | Default | Description |
 |------|---------|-------------|
-| `s_alLoopFadeInMs` | `600` | Fade-in duration in ms for new loop sources. `0` = instant (no fade). |
-| `s_alLoopFadeOutMs` | `500` | Fade-out duration in ms when a source leaves PVS. `0` = instant cut. The fade always starts from the source's **current gain level** — if it was still fading in when removed, it fades out from there (not from full volume), preventing pops. |
-| `s_alLoopFadeDist` | `200` | Distance zone (game units) inside the hearing boundary within which new sources start at a **distance-proportional gain** rather than silence. Eliminates the "ramp-in from zero" artefact for sources appearing while already audible. `0` = always start from silence (old behaviour). |
+| `s_alLoopFadeInMs` | `800` | Fade-in duration in ms for new loop sources. `0` = instant (no fade). |
+| `s_alLoopFadeOutMs` | `800` | Fade-out duration in ms when a source leaves PVS. `0` = instant cut. The fade always starts from the source's **current gain level** — if it was still fading in when removed, it fades out from there (not from full volume), preventing pops. |
+| `s_alLoopFadeDist` | `400` | Distance zone (game units) inside the hearing boundary within which new sources start at a **distance-proportional gain** rather than silence. Eliminates the "ramp-in from zero" artefact for sources appearing while already audible. `0` = always start from silence (old behaviour). |
 
 #### EFX additions: echo, chorus, fire-impact reverb
 
 | Cvar | Default | Description |
 |------|---------|-------------|
-| `s_alEcho` | `0` | Geometry-driven echo on EFX auxiliary send 1. Adds a subtle discrete reflection layer to 3D sources in enclosed spaces. Slot gain is driven automatically by `s_alDynamicReverb` room classification. Requires `maxSends >= 2`. Default 0 (opt-in). |
-| `s_alEchoGain` | `0.06` | Maximum wet gain for the echo slot [0–0.3]. Actual gain is scaled by enclosure. Default 0.06. |
-| `s_alFireImpactReverb` | `0` | Transient early-reflection boost on weapon fire — **own fire and incoming enemy fire**. Own fire: casts 3 rays in aim direction; a wall within 400 units boosts `targetRefl`/`targetDecay`. Incoming enemy fire: uses the normalised distance to scale a proportional boost (half the own-fire max) without ray casting. Suppressed weapons are excluded from both paths. Requires `s_alDynamicReverb 1`. Default 0. |
+| `s_alEcho` | `1` | Geometry-driven echo on EFX auxiliary send 1. Adds a discrete reflection layer to 3D sources in enclosed spaces. Slot gain is driven automatically by `s_alDynamicReverb` room classification. Requires `maxSends >= 2`. Default 1 (on). |
+| `s_alEchoGain` | `0.10` | Maximum wet gain for the echo slot [0–0.3]. Actual gain is scaled by enclosure. Default 0.10. |
+| `s_alFireImpactReverb` | `1` | Transient early-reflection boost on weapon fire — **own fire and incoming enemy fire**. Own fire: casts 3 rays in aim direction; a wall within 400 units boosts `targetRefl`/`targetDecay`. Incoming enemy fire: uses the normalised distance to scale a proportional boost (half the own-fire max) without ray casting. Suppressed weapons are excluded from both paths. Requires `s_alDynamicReverb 1`. Default 1 (on). |
 | `s_alFireImpactMaxBoost` | `0.25` | Maximum reflections gain for own-fire boost [0–0.5]. Incoming-enemy boost is capped at half this value. Default 0.25. |
 
 #### Grenade-concussion EFX bloom
@@ -340,7 +340,7 @@ URT grenades are already loud enough to produce natural perceptual ducking via O
 
 | Cvar | Default | Description |
 |------|---------|-------------|
-| `s_alGrenadeBloom` | `0` | Grenade-blast concussion effect: (1) EFX reverb slot gain spike that makes the room sound momentarily bigger; (2) per-source HF lowpass cut (`s_alGrenadeBloomHFFloor`) that turns the event from "volume went down" into "something just exploded 15 feet from me". Enemy grenades only. Requires `s_alReverb 1` for reverb component. Default 0 (opt-in). |
+| `s_alGrenadeBloom` | `1` | Grenade-blast concussion effect: (1) EFX reverb slot gain spike that makes the room sound momentarily bigger; (2) per-source HF lowpass cut (`s_alGrenadeBloomHFFloor`) that turns the event from "volume went down" into "something just exploded 15 feet from me". Enemy grenades only. Requires `s_alReverb 1` for reverb component. Default 1 (on). |
 | `s_alGrenadeBloomRadius` | `400` | Blast radius (game units) that triggers the bloom + HF effect. Default 400. |
 | `s_alGrenadeBloomGain` | `0.12` | Peak reverb slot gain boost above current level [0–0.3]. Default 0.12. |
 | `s_alGrenadeBloomMs` | `350` | Recovery time for both the reverb bloom decay and the HF muffling in ms. Default 350. |
@@ -361,21 +361,25 @@ Multiple triggers can overlap; the system always takes the later expiry and the 
 
 | Cvar | Default | Description |
 |------|---------|-------------|
-| `s_alSuppression` | `0` | Master toggle for all hearing-disruption effects. Enables: (A) near-miss HF muffling triggered by whiz sounds (`s_alNearMissPattern`); (B) radius-fallback from nearby enemy `CHAN_WEAPON` fire; (C) helmet-hit disruption + tinnitus (`sound/helmethit.wav`); (D) bare-head-hit disruption + tinnitus (`sound/headshot.wav`). Teammates and suppressed weapons excluded automatically. Default 0 (opt-in). |
+| `s_alSuppression` | `0` | Toggle for near-miss and incoming-fire hearing disruption. Enables: (A) near-miss HF muffling triggered by whiz sounds (`s_alNearMissPattern`); (B) radius-fallback from nearby enemy `CHAN_WEAPON` fire. The HF cut is **directional** — applied only within the cone toward the fire source (front) plus a softer rear contribution, so you retain clarity from sources beside you. Teammates and suppressed weapons excluded automatically. Head-hit disruption has its own toggle: `s_alHeadHit`. Default 0 (opt-in). |
 | `s_alSuppressionRadius` | `180` | Fallback trigger radius for enemy weapon fire (game units). The primary trigger is the whiz-sound name match which is more precise. Default 180 ≈ one room width. |
-| `s_alSuppressionFloor` | `0.55` | Minimum listener `AL_GAIN` (volume) during suppression [0–0.95]. Secondary to the HF filter — provides the physical "jolt". Default 0.55 (≈ −6 dB). |
+| `s_alSuppressionFloor` | `0.45` | Minimum listener `AL_GAIN` (volume) during suppression [0–0.95]. Secondary to the HF filter — provides the physical "jolt". Default 0.45 (≈ −7 dB). |
 | `s_alSuppressionMs` | `220` | Duration of near-miss / incoming-fire hearing disruption in ms. Both the volume duck and the HF muffling recover linearly. Default 220. |
-| `s_alSuppressionHFFloor` | `0.15` | Minimum `AL_LOWPASS_GAINHF` at peak suppression [0–1]. **Primary cue**: 0.15 ≈ −17 dB HF, making all sounds momentarily muffled/bassy. Applied per-source. Default 0.15. |
+| `s_alSuppressionHFFloor` | `0.08` | Minimum `AL_LOWPASS_GAINHF` at peak suppression [0–1]. **Primary cue**: 0.08 ≈ −22 dB HF — sources in the fire direction go noticeably bassy/distorted. Applied per-source within the directional cone. Default 0.08. |
+| `s_alSuppressionConeAngle` | `120` | Full cone angle (degrees) of the directional HF suppression [10–360]. Sources within ±half-angle of the incoming fire direction get the full cut; sources outside get none (except the rear partial). 360 = omnidirectional. Default 120 (±60°). Pairs naturally with `s_alHRTF 1` for maximum directional accuracy. |
+| `s_alSuppressionRearGain` | `0.35` | Fraction of the HF suppression applied behind the listener (opposite the fire direction) [0–1]. Secondary cue: reinforces the direction of fire without muffling side-facing sounds. 0 = strict cone only. Default 0.35. |
+| `s_alSuppressionReverbBoost` | `0.18` | Reverb slot gain spike added when suppression triggers [0–0.5]. Briefly boosts the wet reverb tail so the acoustic space "splashes" with the concussion, then decays back over `s_alSuppressionMs`. Default 0.18. |
 | `s_alNearMissPattern` | `whiz1,whiz2` | Comma-separated sound-name substrings identifying near-miss bullet whiz sounds. Matched case-insensitively. URT uses `sound/weapons/whiz1.wav` and `whiz2.wav`. When matched, immediately triggers the suppression event — more precise than the radius fallback. |
 
 #### Head-hit triggers
 
 | Cvar | Default | Description |
 |------|---------|-------------|
-| `s_alHelmetHitPattern` | `helmethit` | Sound-name substrings for helmet-hit detection. When the local player's entity plays a `CHAN_BODY` sound matching this, fires a hearing-disruption event + tinnitus ring. URT uses `sound/helmethit.wav`. Requires `s_alSuppression 1`. |
+| `s_alHeadHit` | `1` | Standalone toggle for head-hit hearing disruption + tinnitus. Active independently of `s_alSuppression` — enables helmet/bare-head hit feedback without enabling the near-miss/incoming-fire system. Default 1 (on). |
+| `s_alHelmetHitPattern` | `helmethit` | Sound-name substrings for helmet-hit detection. When the local player's entity plays a `CHAN_BODY` sound matching this, fires a hearing-disruption event + tinnitus ring. URT uses `sound/helmethit.wav`. Active when `s_alHeadHit 1` or `s_alSuppression 1`. |
 | `s_alHelmetHitMs` | `350` | Duration of helmet-hit hearing disruption (ms). Longer than a near-miss — you were actually struck. Default 350. |
 | `s_alHelmetHFFloor` | `0.10` | Minimum HF gain for helmet-hit disruption [0–1]. Deeper than incoming-fire (0.10 vs 0.15). Default 0.10 (≈ −20 dB HF at peak). |
-| `s_alBareHeadHitPattern` | `headshot` | Sound-name substrings for bare-head (no helmet) hit detection. URT uses `sound/headshot.wav` for unprotected headshots. Fires the strongest disruption tier. Requires `s_alSuppression 1`. |
+| `s_alBareHeadHitPattern` | `headshot` | Sound-name substrings for bare-head (no helmet) hit detection. URT uses `sound/headshot.wav` for unprotected headshots. Fires the strongest disruption tier. Active when `s_alHeadHit 1` or `s_alSuppression 1`. |
 | `s_alBareHeadHitMs` | `500` | Duration of bare-head hit disruption (ms). Longest tier. Default 500. |
 | `s_alBareHeadHFFloor` | `0.03` | Minimum HF gain for bare-head hit [0–1]. Most severe: 0.03 ≈ −30 dB HF, nearly bass-only at peak. Default 0.03. |
 
@@ -395,7 +399,7 @@ A pure sine tone generated entirely from PCM at init — **no sound file require
 | Cvar | Default | Description |
 |------|---------|-------------|
 | `s_alHealthFade` | `0` | Opt-in health-based audio fade. Below `s_alHealthFadeThreshold` HP, the per-source HF filter gradually reduces — the world grows muffled as the player nears death. Zero effect at or above the threshold. Default 0. |
-| `s_alHealthFadeThreshold` | `30` | HP below which the fade activates [5–100]. Filter is flat at this HP and reaches `s_alHealthFadeFloor` at 1 HP. Default 30. |
+| `s_alHealthFadeThreshold` | `10` | HP below which the fade activates [5–100]. Filter is flat at this HP and reaches `s_alHealthFadeFloor` at 1 HP. Default 10. |
 | `s_alHealthFadeFloor` | `0.35` | Minimum HF gain at 1 HP [0–1]. 0.35 ≈ −9 dB HF at death's door — noticeably muffled but footsteps and shots remain identifiable. Default 0.35. |
 
 
@@ -467,9 +471,9 @@ system-default device name (resolved at runtime after the library loads).
 
 ```
 s_alReverb 0  s_alOcclusion 0  →  vanilla dma: distance-only, no wall effects
-s_alReverb 0  s_alOcclusion 1  →  occlusion + HRTF direction fix (default)
+s_alReverb 0  s_alOcclusion 1  →  occlusion + HRTF direction fix
 s_alReverb 1  s_alOcclusion 1  →  + static EFX reverb room
-s_alReverb 1  s_alDynamicReverb 1  →  + dynamic ray-traced reverb environment
+s_alReverb 1  s_alDynamicReverb 1  →  + dynamic ray-traced reverb environment (default)
 ```
 
 #### Channel preemption / slot model
@@ -481,7 +485,7 @@ completion exactly as in the DMA backend.
 
 #### Vanilla-behaviour notes
 
-- **`s_alReverb 0` (default)**: no EFX reverb, matches plain dma/Q3 audio.
+- **`s_alReverb 1` (default)**: EFX reverb enabled with dynamic ray-traced environment.
 - **`s_alOcclusion 1` (default)**: sources behind walls are gain-attenuated and their
   apparent HRTF direction is partially redirected towards the nearest audible gap
   (controlled by `s_alOccPosBlend`).  Only `CONTENTS_SOLID` brushes are tested —
@@ -631,12 +635,12 @@ Parameters blend smoothly via IIR pole `s_alEnvSmoothPole` (default 0.92, ≈ 3.
 
 | Environment | `openFrac` | Target `decayTime` | Target late-gain |
 |---|---|---|---|
-| Tight room | low | ~0.4 s | very low |
-| Normal indoor | low | ~1.2 s | low |
-| Large hall/cave | low | ~2.0–2.5 s | moderate |
-| Corridor | low + asymmetric | medium | low + moderate reflections |
-| Semi-open / urban | ~0.30–0.55 | ~0.6–1.0 s | low |
-| Open outdoor | > 0.55 | < 0.4 s | near-zero |
+| Tight room | low | ~0.5 s | low |
+| Normal indoor | low | ~1.5 s | moderate |
+| Large hall/cave | low | ~2.5–3.0 s | moderate–high |
+| Corridor | low + asymmetric | medium | moderate + strong reflections |
+| Semi-open / urban | ~0.30–0.55 | ~0.8–1.3 s | low–moderate |
+| Open outdoor | > 0.55 | < 0.5 s | near-zero |
 
 #### Live tuning with `/s_alReset`
 
@@ -1302,11 +1306,14 @@ When the OpenAL backend is active (`USE_OPENAL=1` and `libopenal.so.1` present):
 
 | Cvar | Default | Notes |
 |---|---|---|
-| `s_alSuppression` | `0` | Master toggle for all hearing-disruption effects (near-miss, hit, tinnitus). |
+| `s_alSuppression` | `0` | Near-miss and incoming-fire hearing disruption toggle |
 | `s_alSuppressionRadius` | `180` | Enemy weapon fire radius that triggers suppression fallback (units) |
-| `s_alSuppressionFloor` | `0.55` | Min listener gain during suppression [0–0.95] |
+| `s_alSuppressionFloor` | `0.45` | Min listener gain during suppression [0–0.95] |
 | `s_alSuppressionMs` | `220` | Duration of near-miss / incoming-fire disruption (ms) |
-| `s_alSuppressionHFFloor` | `0.15` | Min AL_LOWPASS_GAINHF at peak suppression [0–1] |
+| `s_alSuppressionHFFloor` | `0.08` | Min AL_LOWPASS_GAINHF at peak suppression (directional cone only) [0–1] |
+| `s_alSuppressionConeAngle` | `120` | Full cone angle (deg) of directional HF suppression around fire direction |
+| `s_alSuppressionRearGain` | `0.35` | Fraction of HF suppression applied behind listener (opposite fire) [0–1] |
+| `s_alSuppressionReverbBoost` | `0.18` | Reverb slot gain spike on suppression trigger [0–0.5] |
 | `s_alNearMissPattern` | `whiz1,whiz2` | Sound-name substrings that trigger a near-miss suppression event |
 | `s_alHelmetHitPattern` | `helmethit` | CHAN_BODY sound name triggering helmet-hit disruption + tinnitus |
 | `s_alHelmetHitMs` | `350` | Helmet-hit disruption duration (ms) |
@@ -1319,10 +1326,11 @@ When the OpenAL backend is active (`USE_OPENAL=1` and `libopenal.so.1` present):
 | `s_alTinnitusVol` | `0.45` | Tinnitus playback volume [0–1] |
 | `s_alTinnitusCooldown` | `800` | Min gap between successive tinnitus plays (ms) |
 | `s_alHealthFade` | `0` | Enable health-based HF fade (audio degrades as HP drops). Default off. |
-| `s_alHealthFadeThreshold` | `30` | HP below which health-fade activates |
+| `s_alHealthFadeThreshold` | `10` | HP below which health-fade activates |
 | `s_alHealthFadeFloor` | `0.35` | Min HF gain at 1 HP [0–1] |
-| `s_alGrenadeBloom` | `0` | Grenade-blast concussion effect (reverb spike + HF muffling). Default off. |
+| `s_alGrenadeBloom` | `1` | Grenade-blast concussion effect (reverb spike + HF muffling). Default on. |
 | `s_alGrenadeBloomRadius` | `400` | Blast radius that triggers the bloom effect (units) |
+| `s_alHeadHit` | `1` | Standalone helmet/bare-head hit disruption + tinnitus. Default on. |
 | `s_alSuppressedSoundPattern` | `silenced,-sil,_sil,...` | Filename substrings identifying suppressed weapons |
 
 > **Full suppression documentation:** See the [Hearing Disruption](#hearing-disruption--incoming-fire-head-hits-and-health-fade) section above.
