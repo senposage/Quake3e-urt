@@ -265,6 +265,9 @@ typedef enum {
                            * volume can be tuned without affecting footsteps. */
     SRC_CAT_IMPACT  = 5,  /* ENTITYNUM_WORLD one-shots: bullet impacts, brass,
                            * explosions, debris — often disproportionately loud. */
+    SRC_CAT_WEAPON_SUPPRESSED = 6, /* own suppressed weapon fire (MP5SD, etc.)
+                                    * — quieter than unsuppressed; IDs configured
+                                    * via s_alSuppressedWeaponIds. */
 } alSrcCat_t;
 
 /* Per-active-sound source */
@@ -354,12 +357,26 @@ static vec3_t s_al_listener_forward;  /* axis[0] — direction listener is facin
 static vec3_t s_al_fire_dir;          /* normalised aim direction at last weapon fire */
 static int    s_al_fire_frame = -9999;/* s_al_loopFrame when last shot was fired */
 
-/* Audio suppression state: a near-miss tracer or damage event temporarily
- * ducks the listener gain and bumps reverb to simulate concussive disruption.
- * suppressExpiry: Com_Milliseconds() timestamp when the effect expires (0=off).
- * suppressStrength: [0..1] — 0 = no duck, 1 = full duck to suppressFloor. */
-static int   s_al_suppressExpiry   = 0;
-static float s_al_suppressStrength = 0.f;
+/* Incoming-enemy-fire reverb: set in S_AL_StartSound for nearby non-friendly
+ * CHAN_WEAPON sounds; consumed by S_AL_UpdateDynamicReverb. */
+static int   s_al_incoming_fire_frame = -9999; /* s_al_loopFrame when last enemy shot detected */
+static float s_al_incoming_fire_dist  =  1.0f; /* normalised dist from listener [0=close,1=at range] */
+
+/* Grenade-concussion bloom state.
+ * When an enemy grenade explodes near the listener, a brief EFX reverb boost
+ * is applied — the reverb slot gain spikes then decays back over bloomMs.
+ * No listener-gain duck: competitive audio clarity is preserved at all times.
+ * bloomExpiry: Com_Milliseconds() when the bloom expires (0 = idle).
+ * bloomPeak:   reverb slot gain at the moment of trigger. */
+static int   s_al_bloomExpiry = 0;
+static float s_al_bloomPeak   = 0.f;
+
+/* Audio suppression state: a near-miss tracer briefly ducks the listener
+ * gain to simulate the concussive disruption of incoming fire.
+ * suppressExpiry: Com_Milliseconds() timestamp when the duck expires (0=off).
+ * Depth and duration are controlled entirely by s_alSuppressionFloor and
+ * s_alSuppressionMs — no separate strength variable needed. */
+static int s_al_suppressExpiry = 0;
 
 /* Per-entity origin cache — updated by S_AL_UpdateEntityPosition and
  * S_AL_Respatialize.  Used by S_AL_StartSound when origin is NULL so that
@@ -404,6 +421,16 @@ static cvar_t *s_alSuppression;        /* 0=off, 1=near-miss tracer detection */
 static cvar_t *s_alSuppressionRadius;  /* near-miss detection radius (units) */
 static cvar_t *s_alSuppressionFloor;   /* min listener gain during suppression [0..0.8] */
 static cvar_t *s_alSuppressionMs;      /* suppression duration in ms */
+/* Grenade-concussion EFX bloom — reverb-only, no gain duck, competitive-safe */
+static cvar_t *s_alGrenadeBloom;        /* 0=off, 1=EFX reverb bloom on nearby enemy grenade */
+static cvar_t *s_alGrenadeBloomRadius;  /* blast radius that triggers the bloom effect (units) */
+static cvar_t *s_alGrenadeBloomGain;    /* peak reverb slot gain boost [0..0.3] */
+static cvar_t *s_alGrenadeBloomMs;      /* bloom decay duration in ms */
+static cvar_t *s_alGrenadeBloomDuck;       /* 0=off, 1=also apply mild listener-gain duck with bloom */
+static cvar_t *s_alGrenadeBloomDuckFloor;  /* min listener gain during grenade duck [0.5..0.95] */
+/* Suppressed weapons: separate volume knob + exclusion from suppression/reverb effects */
+static cvar_t *s_alSuppressedWeaponIds;    /* space/comma-separated weapon IDs treated as suppressed */
+static cvar_t *s_alVolSuppressedWeapon;    /* volume for suppressed-weapon sounds [0..10] */
 static cvar_t *s_alVolSelf;      /* own player/weapon volume multiplier [0..1.5] */
 static cvar_t *s_alVolOther;     /* other entity/player volume multiplier [0..1.0] */
 static cvar_t *s_alVolEnv;       /* looping ambient volume multiplier [0..1.0] */
@@ -916,7 +943,45 @@ static float S_AL_GetMasterVol( void )
  *   WORLD   0.70  · WEAPON  1.00  · IMPACT  0.55
  *   LOCAL   1.00  · AMBIENT 0.30  · UI      0.80
  *
- * Anti-cheat: SRC_CAT_WORLD and SRC_CAT_IMPACT are capped at 2.0 so that
+/* Return qtrue when the entity's current weapon is in the s_alSuppressedWeaponIds
+ * list.  Scans cl.parseEntities for the entity, reads entityState_t.weapon, then
+ * tokenises the cvar string.  Returns qfalse for non-player entities, unknown
+ * entities, or when the cvar is empty (default — all weapons unsuppressed). */
+static qboolean S_AL_IsWeaponSuppressed( int entnum )
+{
+    const char   *ids;
+    int           weaponId = -1;
+    int           k;
+    char          tok[16];
+    const char   *p;
+
+    if (!s_alSuppressedWeaponIds) return qfalse;
+    ids = s_alSuppressedWeaponIds->string;
+    if (!ids || !ids[0]) return qfalse;
+    if (entnum < 0 || entnum >= MAX_CLIENTS) return qfalse;
+
+    /* Look up the entity's weapon in the current snapshot */
+    for (k = 0; k < cl.snap.numEntities; k++) {
+        entityState_t *es = &cl.parseEntities[
+            (cl.snap.parseEntitiesNum + k) & (MAX_PARSE_ENTITIES - 1)];
+        if (es->number == entnum) { weaponId = es->weapon; break; }
+    }
+    if (weaponId < 0) return qfalse;
+
+    /* Tokenise and match */
+    p = ids;
+    while (*p) {
+        int i = 0;
+        while (*p && *p != ' ' && *p != ',' && i < (int)sizeof(tok) - 1)
+            tok[i++] = *p++;
+        tok[i] = '\0';
+        if (i > 0 && atoi(tok) == weaponId) return qtrue;
+        while (*p == ' ' || *p == ',') p++;
+    }
+    return qfalse;
+}
+
+/* Anti-cheat: SRC_CAT_WORLD and SRC_CAT_IMPACT are capped at 2.0 so that
  * other players/impacts cannot be amplified to wallhack-level volume. */
 static float S_AL_GetCategoryVol( alSrcCat_t cat )
 {
@@ -929,6 +994,10 @@ static float S_AL_GetCategoryVol( alSrcCat_t cat )
     case SRC_CAT_WEAPON:
         v    = s_alVolWeapon ? s_alVolWeapon->value : 1.0f;
         ref  = 1.00f;  maxV = 10.0f;
+        break;
+    case SRC_CAT_WEAPON_SUPPRESSED:
+        v    = s_alVolSuppressedWeapon ? s_alVolSuppressedWeapon->value : 1.0f;
+        ref  = 0.55f;  maxV = 10.0f;   /* suppressed: 0.55 ref reflects quieter audio */
         break;
     case SRC_CAT_UI:
         v    = s_alVolUI     ? s_alVolUI->value     : 1.0f;
@@ -1217,15 +1286,19 @@ static void S_AL_SrcSetup( int idx, sfxHandle_t sfx,
     if (isLocal && entnum == 0)
         src->category = SRC_CAT_UI;
     else if (isLocal && entchannel == CHAN_WEAPON)
-        src->category = SRC_CAT_WEAPON;  /* own weapon fire */
+        src->category = S_AL_IsWeaponSuppressed(entnum)
+                        ? SRC_CAT_WEAPON_SUPPRESSED : SRC_CAT_WEAPON;
     else if (isLocal)
         src->category = SRC_CAT_LOCAL;
     else if (isAmbient)
         src->category = SRC_CAT_AMBIENT;
     else if (s_al_listener_entnum >= 0 && entnum == s_al_listener_entnum) {
         /* Own entity in 3D mode — split weapon fire from movement */
-        src->category = (entchannel == CHAN_WEAPON)
-                        ? SRC_CAT_WEAPON : SRC_CAT_LOCAL;
+        if (entchannel == CHAN_WEAPON)
+            src->category = S_AL_IsWeaponSuppressed(entnum)
+                            ? SRC_CAT_WEAPON_SUPPRESSED : SRC_CAT_WEAPON;
+        else
+            src->category = SRC_CAT_LOCAL;
     } else if (entnum == ENTITYNUM_WORLD)
         src->category = SRC_CAT_IMPACT;  /* bullet impacts, brass, debris */
     else
@@ -1793,21 +1866,43 @@ static void S_AL_StartSound( const vec3_t origin, int entnum,
     if (srcIdx < 0) return;
 
     /* Feature D — Audio suppression: near-miss tracer detection.
-     * When another entity fires a CHAN_WEAPON sound very close to the listener,
-     * briefly duck the listener gain and bump reverb (simulates suppression /
-     * concussive disruption).  Own sounds (entnum == s_al_listener_entnum)
-     * are excluded — only incoming fire triggers suppression. */
+     * When an ENEMY fires a CHAN_WEAPON sound very close to the listener,
+     * briefly duck the listener gain to simulate the concussive disruption of
+     * incoming fire ("suppression effect").
+     *
+     * Own sounds and TEAMMATE sounds are both excluded:
+     *   • Own sounds: entnum == s_al_listener_entnum (already caught by !isLocal
+     *     but guarded explicitly for clarity).
+     *   • Teammates: determined by comparing the shooter's player configstring
+     *     team field ("t") against the local player's persistant[PERS_TEAM].
+     *     Both must be on a real team (TEAM_RED/TEAM_BLUE, not TEAM_FREE / FFA).
+     *     Configstrings are in cl.gameState which is always up-to-date — no
+     *     cgame access required. */
     if (s_alSuppression && s_alSuppression->integer && !isLocal
             && entchannel == CHAN_WEAPON
             && entnum != s_al_listener_entnum) {
-        float radius = s_alSuppressionRadius ? s_alSuppressionRadius->value : 180.f;
-        vec3_t d;
-        VectorSubtract(sndOrigin, s_al_listener_origin, d);
-        if (DotProduct(d, d) < radius * radius) {
-            int durationMs = s_alSuppressionMs ? (int)s_alSuppressionMs->value : 220;
-            if (durationMs < 50)  durationMs = 50;
-            s_al_suppressExpiry   = Com_Milliseconds() + durationMs;
-            s_al_suppressStrength = 0.35f;   /* 35% duck — noticeable but not deaf */
+        /* --- Friendly-fire guard ------------------------------------------ */
+        qboolean isFriendly = qfalse;
+        {
+            int ourTeam = (int)cl.snap.ps.persistant[PERS_TEAM];
+            /* Only meaningful in a team game (RED or BLUE); skip in FFA. */
+            if (ourTeam != TEAM_FREE && entnum >= 0 && entnum < MAX_CLIENTS) {
+                const char *csStr = cl.gameState.stringData
+                                    + cl.gameState.stringOffsets[CS_PLAYERS + entnum];
+                int shooterTeam = atoi(Info_ValueForKey(csStr, "t"));
+                if (shooterTeam == ourTeam)
+                    isFriendly = qtrue;
+            }
+        }
+        if (!isFriendly && !S_AL_IsWeaponSuppressed(entnum)) {
+            float radius = s_alSuppressionRadius ? s_alSuppressionRadius->value : 180.f;
+            vec3_t d;
+            VectorSubtract(sndOrigin, s_al_listener_origin, d);
+            if (DotProduct(d, d) < radius * radius) {
+                int durationMs = s_alSuppressionMs ? (int)s_alSuppressionMs->value : 220;
+                if (durationMs < 50) durationMs = 50;
+                s_al_suppressExpiry   = Com_Milliseconds() + durationMs;
+            }
         }
     }
 
@@ -1820,6 +1915,39 @@ static void S_AL_StartSound( const vec3_t origin, int entnum,
             && entchannel == CHAN_WEAPON) {
         VectorCopy(s_al_listener_forward, s_al_fire_dir);
         s_al_fire_frame = s_al_loopFrame;
+    }
+
+    /* Incoming-enemy-fire reverb: when an enemy fires CHAN_WEAPON within range,
+     * record the normalised distance so S_AL_UpdateDynamicReverb can apply a
+     * proportional early-reflection boost — giving their muzzle blast acoustic
+     * weight in the listener's local environment.
+     * Suppressed weapons are excluded (they don't produce a significant blast). */
+    if (s_alFireImpactReverb && s_alFireImpactReverb->integer
+            && !isLocal
+            && entchannel == CHAN_WEAPON
+            && entnum != s_al_listener_entnum
+            && !S_AL_IsWeaponSuppressed(entnum)) {
+        qboolean friendly = qfalse;
+        {
+            int ourTeam = (int)cl.snap.ps.persistant[PERS_TEAM];
+            if (ourTeam != TEAM_FREE && entnum >= 0 && entnum < MAX_CLIENTS) {
+                const char *csStr = cl.gameState.stringData
+                    + cl.gameState.stringOffsets[CS_PLAYERS + entnum];
+                if (atoi(Info_ValueForKey(csStr, "t")) == ourTeam)
+                    friendly = qtrue;
+            }
+        }
+        if (!friendly) {
+            float  inRange = 700.f;
+            vec3_t d;
+            float  dist;
+            VectorSubtract(sndOrigin, s_al_listener_origin, d);
+            dist = sqrtf(DotProduct(d, d));
+            if (dist < inRange) {
+                s_al_incoming_fire_dist  = dist / inRange;
+                s_al_incoming_fire_frame = s_al_loopFrame;
+            }
+        }
     }
 
     vol = S_AL_GetMasterVol();
@@ -2129,15 +2257,12 @@ static void S_AL_UpdateLoops( void )
                     lp->fadeOutStartMs = 0;
                     lp->fadeStartMs    = 0;
                 } else {
-                    int   fadeOutMs = s_alLoopFadeOutMs
-                                      ? (int)s_alLoopFadeOutMs->value
-                                      : S_AL_LOOP_FADEOUT_MS;
                     float t;
                     alSrc_t *src    = &s_al_src[lp->srcIdx];
                     float    catVol = S_AL_GetCategoryVol(SRC_CAT_AMBIENT);
-                    if (fadeOutMs < 1) fadeOutMs = 1;
+                    /* foMs already computed above — reuse it. */
                     t = lp->fadeOutStartGain *
-                        (1.0f - (float)elapsed / (float)fadeOutMs);
+                        (1.0f - (float)elapsed / (float)foMs);
                     if (lp->sfx >= 0 && lp->sfx < s_al_numSfx)
                         catVol *= s_al_sfx[lp->sfx].normGain;
                     qalSourcef(src->source, AL_GAIN,
@@ -2901,6 +3026,27 @@ static void S_AL_UpdateDynamicReverb( void )
         }
     }
 
+    /* --- Incoming-enemy-fire reverb boost -----------------------------------
+     * Complements Feature C by applying a proportional boost when an enemy
+     * fires near the listener.  Half the own-fire max boost since the shooter
+     * is typically further away; no ray cast needed because we already have
+     * the distance-normalised proximity from the trigger in StartSound.
+     * Excluded for suppressed weapons and teammates (both filtered at capture). */
+    if (s_alFireImpactReverb && s_alFireImpactReverb->integer
+            && (s_al_loopFrame - s_al_incoming_fire_frame) <= S_AL_ENV_RATE * 2
+            && CM_NumInlineModels() > 0) {
+        float maxBoost  = s_alFireImpactMaxBoost
+                          ? s_alFireImpactMaxBoost->value * 0.5f : 0.125f;
+        float proximity = 1.0f - s_al_incoming_fire_dist;  /* 0=edge, 1=at listener */
+        float boost;
+        if (maxBoost > 0.25f) maxBoost = 0.25f;
+        boost = maxBoost * proximity;
+        targetRefl += boost;
+        if (targetRefl > 1.f) targetRefl = 1.f;
+        targetDecay += boost * 0.2f;
+        if (targetDecay > 2.5f) targetDecay = 2.5f;
+    }
+
     /* --- Push to EFX effect and re-upload to slot ------------------------- */
     if (s_al_efx.hasEAXReverb) {
         qalEffectf(s_al_efx.reverbEffect, AL_EAXREVERB_DECAY_TIME,       curDecay);
@@ -2978,6 +3124,27 @@ static void S_AL_Update( int msec )
     /* Handle mute */
     masterGain = s_al_muted ? 0.0f : (s_volume ? s_volume->value : 0.8f);
 
+    /* Grenade-bloom optional gain duck (s_alGrenadeBloomDuck).
+     * A very mild supplement to the natural loudness-based ducking that
+     * grenade explosions already produce in URT.  Hard-floored at 0.5 so it
+     * can never silence gameplay-critical audio.  Default OFF. */
+    if (!s_al_muted && s_alGrenadeBloomDuck && s_alGrenadeBloomDuck->integer
+            && s_al_bloomExpiry > 0) {
+        int   nowGD  = Com_Milliseconds();
+        int   bMsGD  = s_alGrenadeBloomMs ? (int)s_alGrenadeBloomMs->value : 180;
+        float dFloor = s_alGrenadeBloomDuckFloor
+                       ? s_alGrenadeBloomDuckFloor->value : 0.82f;
+        if (dFloor < 0.5f)  dFloor = 0.5f;   /* hard floor — competitive safety */
+        if (dFloor > 0.98f) dFloor = 0.98f;
+        if (bMsGD < 1) bMsGD = 1;
+        if (nowGD < s_al_bloomExpiry) {
+            int   remain = s_al_bloomExpiry - nowGD;
+            float t      = (float)remain / (float)bMsGD;
+            if (t > 1.f) t = 1.f;
+            masterGain *= (dFloor + (1.0f - dFloor) * (1.0f - t));
+        }
+    }
+
     /* Suppression duck: briefly reduce listener gain on near-miss or damage.
      * The duck is a smooth ramp — full strength at the trigger, linearly
      * recovering to 1.0 by the expiry time. */
@@ -2991,8 +3158,7 @@ static void S_AL_Update( int msec )
         if (floor < 0.f) floor = 0.f;
         if (floor > 0.95f) floor = 0.95f;
         if (now2 >= s_al_suppressExpiry) {
-            s_al_suppressExpiry   = 0;
-            s_al_suppressStrength = 0.f;
+            s_al_suppressExpiry = 0;
             t = 1.0f;
         } else {
             int remain = s_al_suppressExpiry - now2;
@@ -3035,8 +3201,105 @@ static void S_AL_Update( int msec )
         /* Dynamic acoustic environment: updates EFX params + slot gain */
         S_AL_UpdateDynamicReverb();
 
-        /* Drive echo slot gain based on current environment.
-         * Echo is audible only in enclosed spaces (low openFrac).
+        /* Grenade-concussion EFX bloom: scan snapshot entities once per frame.
+         *
+         * Design goal — competitive-safe:
+         *   The effect boosts the reverb slot gain briefly (making the room sound
+         *   momentarily "bigger/boomer") then decays.  It does NOT reduce listener
+         *   gain, so weapon fire, footsteps and callouts remain at full clarity.
+         *   Default off; useful as a subtle immersion layer for non-competitive play.
+         *
+         * Detection:
+         *   Iterate cl.snap.entities, looking for ET_MISSILE entities that are
+         *   carrying an explosion event (EV_MISSILE_HIT or EV_MISSILE_MISS*) within
+         *   s_alGrenadeBloomRadius units of the listener.  Team attribution uses the
+         *   same configstring path as the near-miss suppression: the entity's
+         *   clientNum maps to CS_PLAYERS + clientNum → "t" field.  Only enemy
+         *   grenades trigger the bloom — teammate grenades are silently ignored. */
+        if (s_alGrenadeBloom && s_alGrenadeBloom->integer
+                && s_al_efx.reverbSlot
+                && s_alReverb && s_alReverb->integer) {
+            float  bRadius = s_alGrenadeBloomRadius
+                             ? s_alGrenadeBloomRadius->value : 400.f;
+            float  bGain   = s_alGrenadeBloomGain
+                             ? s_alGrenadeBloomGain->value   : 0.12f;
+            int    bMs     = s_alGrenadeBloomMs
+                             ? (int)s_alGrenadeBloomMs->value : 180;
+            int    ourTeam = (int)cl.snap.ps.persistant[PERS_TEAM];
+            int    k;
+
+            if (bGain  > 0.3f) bGain  = 0.3f;
+            if (bGain  < 0.0f) bGain  = 0.0f;
+            if (bMs    < 1)    bMs    = 1;
+            if (bRadius < 1.f) bRadius = 1.f;
+
+            for (k = 0; k < cl.snap.numEntities; k++) {
+                entityState_t *es;
+                int            ev;
+                vec3_t         d;
+                es = &cl.parseEntities[
+                    (cl.snap.parseEntitiesNum + k) & (MAX_PARSE_ENTITIES - 1)];
+
+                /* Only care about missile entities */
+                if (es->eType != ET_MISSILE) continue;
+
+                /* Only explosion events */
+                ev = es->event & ~EV_EVENT_BITS;
+                if (ev != EV_MISSILE_HIT && ev != EV_MISSILE_MISS
+                        && ev != EV_MISSILE_MISS_METAL) continue;
+
+                /* Distance check */
+                VectorSubtract(es->pos.trBase, s_al_listener_origin, d);
+                if (DotProduct(d, d) > bRadius * bRadius) continue;
+
+                /* Friendly-fire exclusion: same configstring path as suppression */
+                if (ourTeam != TEAM_FREE
+                        && es->clientNum >= 0 && es->clientNum < MAX_CLIENTS) {
+                    const char *csStr = cl.gameState.stringData
+                        + cl.gameState.stringOffsets[CS_PLAYERS + es->clientNum];
+                    int throwerTeam = atoi(Info_ValueForKey(csStr, "t"));
+                    if (throwerTeam == ourTeam) continue;   /* teammate — skip */
+                }
+
+                /* Trigger bloom: record current slot gain as the base to spike from */
+                if (s_al_bloomExpiry == 0) {
+                    /* Read current slot gain so we spike ABOVE it, not to an
+                     * absolute value — prevents fighting with dynamic reverb. */
+                    float curGain = s_alReverbGain ? s_alReverbGain->value : 0.20f;
+                    s_al_bloomPeak   = curGain + bGain;
+                    if (s_al_bloomPeak > 1.0f) s_al_bloomPeak = 1.0f;
+                }
+                /* Extend/restart the expiry on each additional hit this frame */
+                s_al_bloomExpiry = Com_Milliseconds() + bMs;
+                break;   /* one bloom trigger per frame is enough */
+            }
+
+            /* Drive the bloom decay: interpolate slot gain from peak back to
+             * the normal target gain over the remaining duration. */
+            if (s_al_bloomExpiry > 0) {
+                int   now3    = Com_Milliseconds();
+                float baseGain = s_alReverbGain ? s_alReverbGain->value : 0.20f;
+                float slotGain;
+                if (now3 >= s_al_bloomExpiry) {
+                    s_al_bloomExpiry = 0;
+                    slotGain = baseGain;
+                } else {
+                    int   bMsNow = s_alGrenadeBloomMs
+                                   ? (int)s_alGrenadeBloomMs->value : 180;
+                    int   remain = s_al_bloomExpiry - now3;
+                    float t      = (bMsNow > 0) ? (float)remain / (float)bMsNow
+                                                : 0.f;
+                    if (t > 1.f) t = 1.f;
+                    /* t=1 at trigger → peak gain; t=0 at expiry → base gain */
+                    slotGain = baseGain + (s_al_bloomPeak - baseGain) * t;
+                }
+                qalAuxiliaryEffectSlotf(s_al_efx.reverbSlot,
+                                        AL_EFFECTSLOT_GAIN, slotGain);
+            }
+        }
+
+
+        /* Echo is audible only in enclosed spaces (low openFrac).
          * In open/outdoor environments the slot gain is held near-zero.
          * We don't have openFrac directly here, so approximate from the
          * current reverb decay: longer decay → more enclosed → more echo. */
@@ -3112,21 +3375,28 @@ static void S_AL_Update( int msec )
         static float lastVolUI     = -1.f;
         static float lastVolWeapon = -1.f;
         static float lastVolImpact = -1.f;
+        static float lastVolSupWpn = -1.f;
         float vSelf   = S_AL_GetCategoryVol(SRC_CAT_LOCAL);
         float vOther  = S_AL_GetCategoryVol(SRC_CAT_WORLD);
         float vEnv    = S_AL_GetCategoryVol(SRC_CAT_AMBIENT);
         float vUI     = S_AL_GetCategoryVol(SRC_CAT_UI);
         float vWeapon = S_AL_GetCategoryVol(SRC_CAT_WEAPON);
         float vImpact = S_AL_GetCategoryVol(SRC_CAT_IMPACT);
+        float vSupWpn = S_AL_GetCategoryVol(SRC_CAT_WEAPON_SUPPRESSED);
 
-        if (vSelf   != lastVolSelf  || vOther  != lastVolOther ||
-            vEnv    != lastVolEnv   || vUI     != lastVolUI    ||
-            vWeapon != lastVolWeapon || vImpact != lastVolImpact) {
+        if (vSelf   != lastVolSelf  || vOther  != lastVolOther  ||
+            vEnv    != lastVolEnv   || vUI     != lastVolUI     ||
+            vWeapon != lastVolWeapon || vImpact != lastVolImpact ||
+            vSupWpn != lastVolSupWpn) {
             int j;
             for (j = 0; j < s_al_numSrc; j++) {
                 float catGain;
                 if (!s_al_src[j].isPlaying) continue;
-                /* Skip loop sources mid-fade — S_AL_UpdateLoops owns their gain. */
+                /* Skip ALL loop sources — S_AL_UpdateLoops runs after this
+                 * block and writes the correct gain (including fade-in/out
+                 * ramps) for every active loop source on every frame, so
+                 * there is no need to update them here, and doing so would
+                 * reset a loop that is mid-fade back to its full target gain. */
                 if (s_al_src[j].loopSound) continue;
                 catGain = S_AL_GetCategoryVol(s_al_src[j].category);
                 /* Re-apply per-sample normalisation for ambient sources */
@@ -3142,6 +3412,7 @@ static void S_AL_Update( int msec )
             lastVolUI     = vUI;
             lastVolWeapon = vWeapon;
             lastVolImpact = vImpact;
+            lastVolSupWpn = vSupWpn;
         }
     }
 
@@ -3709,10 +3980,12 @@ qboolean S_AL_Init( soundInterface_t *si )
     s_alSuppression = Cvar_Get("s_alSuppression", "0", CVAR_ARCHIVE_ND);
     Cvar_CheckRange(s_alSuppression, "0", "1", CV_INTEGER);
     Cvar_SetDescription(s_alSuppression,
-        "Near-miss audio suppression. When another player fires a CHAN_WEAPON "
-        "sound within s_alSuppressionRadius units of the listener, the overall "
-        "listener gain is briefly ducked to simulate the concussive audio "
-        "suppression of incoming fire. Default 0 (off — opt-in feature).");
+        "Near-miss audio suppression. When an ENEMY fires a CHAN_WEAPON sound "
+        "within s_alSuppressionRadius units of the listener, the overall listener "
+        "gain is briefly ducked to simulate the concussive disruption of incoming "
+        "fire. Teammates are automatically excluded: in team modes (TDM/CTF), "
+        "the shooter's team is read from the player configstring and compared to "
+        "your own team — no cgame changes required. Default 0 (off, opt-in).");
     s_alSuppressionRadius = Cvar_Get("s_alSuppressionRadius", "180", CVAR_ARCHIVE_ND);
     Cvar_CheckRange(s_alSuppressionRadius, "50", "400", CV_FLOAT);
     Cvar_SetDescription(s_alSuppressionRadius,
@@ -3730,6 +4003,58 @@ qboolean S_AL_Init( soundInterface_t *si )
         "Duration of the suppression duck in milliseconds. "
         "The gain recovers linearly from floor to full over this time. "
         "Default 220 ms — short enough to not impede combat awareness.");
+    s_alGrenadeBloom = Cvar_Get("s_alGrenadeBloom", "0", CVAR_ARCHIVE_ND);
+    Cvar_CheckRange(s_alGrenadeBloom, "0", "1", CV_INTEGER);
+    Cvar_SetDescription(s_alGrenadeBloom,
+        "EFX reverb bloom on nearby enemy grenade explosions. "
+        "When enabled, a brief spike in the reverb slot gain gives the blast "
+        "acoustic weight without any listener-gain reduction — no competitive "
+        "disadvantage. Teammate grenades are excluded via configstring team check. "
+        "Requires s_alReverb 1. Default 0 (opt-in).");
+    s_alGrenadeBloomRadius = Cvar_Get("s_alGrenadeBloomRadius", "400", CVAR_ARCHIVE_ND);
+    Cvar_CheckRange(s_alGrenadeBloomRadius, "50", "1200", CV_FLOAT);
+    Cvar_SetDescription(s_alGrenadeBloomRadius,
+        "Blast radius (game units) within which a grenade explosion triggers the "
+        "reverb bloom. Default 400 ≈ medium room width.");
+    s_alGrenadeBloomGain = Cvar_Get("s_alGrenadeBloomGain", "0.12", CVAR_ARCHIVE_ND);
+    Cvar_CheckRange(s_alGrenadeBloomGain, "0", "0.3", CV_FLOAT);
+    Cvar_SetDescription(s_alGrenadeBloomGain,
+        "Peak reverb slot gain boost added by the grenade bloom [0–0.3]. "
+        "Stacks on top of the current slot gain — actual peak = base + this value. "
+        "Default 0.12 (subtle but audible reverb surge).");
+    s_alGrenadeBloomMs = Cvar_Get("s_alGrenadeBloomMs", "180", CVAR_ARCHIVE_ND);
+    Cvar_CheckRange(s_alGrenadeBloomMs, "50", "600", CV_INTEGER);
+    Cvar_SetDescription(s_alGrenadeBloomMs,
+        "Duration of the grenade reverb bloom decay in ms. Default 180.");
+    s_alGrenadeBloomDuck = Cvar_Get("s_alGrenadeBloomDuck", "0", CVAR_ARCHIVE_ND);
+    Cvar_CheckRange(s_alGrenadeBloomDuck, "0", "1", CV_INTEGER);
+    Cvar_SetDescription(s_alGrenadeBloomDuck,
+        "Add a mild listener-gain duck alongside the grenade reverb bloom. "
+        "URT grenades are already loud enough that they produce natural perceptual "
+        "ducking — this is a very subtle optional supplement. Hard-floored at 0.5 "
+        "so gameplay-critical audio (footsteps, shots) is never silenced. "
+        "Requires s_alGrenadeBloom 1. Default 0 (opt-in).");
+    s_alGrenadeBloomDuckFloor = Cvar_Get("s_alGrenadeBloomDuckFloor", "0.82", CVAR_ARCHIVE_ND);
+    Cvar_CheckRange(s_alGrenadeBloomDuckFloor, "0.5", "0.95", CV_FLOAT);
+    Cvar_SetDescription(s_alGrenadeBloomDuckFloor,
+        "Minimum listener gain during the optional grenade duck [0.5–0.95]. "
+        "0.82 ≈ −1.7 dB — barely perceptible but adds physical impact. "
+        "Hard minimum 0.5 for competitive safety. Default 0.82.");
+    s_alSuppressedWeaponIds = Cvar_Get("s_alSuppressedWeaponIds", "", CVAR_ARCHIVE_ND);
+    Cvar_SetDescription(s_alSuppressedWeaponIds,
+        "Space or comma-separated list of weapon integer IDs (from entityState_t.weapon) "
+        "to treat as suppressed/silenced. Suppressed weapons: "
+        "(1) use s_alVolSuppressedWeapon instead of s_alVolWeapon, "
+        "(2) do NOT trigger the near-miss suppression duck (s_alSuppression), "
+        "(3) do NOT trigger the incoming-fire reverb boost (s_alFireImpactReverb). "
+        "Example for a hypothetical URT: \"14 17\". Default empty (all weapons normal).");
+    s_alVolSuppressedWeapon = Cvar_Get("s_alVolSuppressedWeapon", "1.0", CVAR_ARCHIVE_ND);
+    Cvar_CheckRange(s_alVolSuppressedWeapon, "0", "10.0", CV_FLOAT);
+    Cvar_SetDescription(s_alVolSuppressedWeapon,
+        "Volume multiplier for suppressed/silenced weapon fire [0–10, ref 0.55]. "
+        "Applies only to weapons listed in s_alSuppressedWeaponIds. "
+        "Reference gain 0.55 reflects suppressed weapons being inherently quieter. "
+        "Below 1.0 uses power-2 curve. Default 1.0.");
     s_alOcclusion = Cvar_Get("s_alOcclusion", "1", CVAR_ARCHIVE_ND);
     Cvar_CheckRange(s_alOcclusion, "0", "1", CV_INTEGER);
     Cvar_SetDescription(s_alOcclusion, "Per-source occlusion tracing. Sounds behind walls are gain-attenuated and their apparent HRTF direction is corrected to the nearest audible gap. Close sources (<300 u) update every frame; distant sources update less often. Default 1.");

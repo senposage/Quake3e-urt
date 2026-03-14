@@ -259,10 +259,49 @@ Background music is streamed via a dedicated AL source and `S_AL_MUSIC_BUFFERS` 
 | `s_alOccPosBlend` | `0.25` | How far to redirect HRTF apparent-source position towards the nearest acoustic gap [0–1]. `0.0` = always true source position (best direction accuracy). `1.0` = full gap redirect (old behaviour — confused weapon direction). Default 0.25: subtle gap hint that aids "around the corner" perception without sacrificing localizability. |
 | `s_alDebugOcc` | `0` | Print per-source occlusion state each frame. Each occluded source shows entity, distance, trace target, smoothed gain, GAIN and GAINHF values. Use to identify which sounds are being filtered and by how much. Not archived. |
 | `s_alDebugPlayback` | `0` | Playback diagnostics for isolating audio quality issues. **`1`** = log every **PREEMPT** (sound cut short by a new sound on the same channel) and every **rate-mismatch** at load time (file Hz ≠ device Hz, which forces the internal resampler). **`2`** = also log every natural completion. Each line shows sound name, samples played / total, % consumed, file rate, and device rate. Use `1` to determine whether the DE-50 boom is being **truncated** (preempt line, low %) or **degraded** by the resampler (rate-mismatch lines at registration). Not archived — set before loading a map to catch registration warnings. |
-| `s_alVolSelf` | `1.0` | Own player/weapon/breath volume multiplier **[0–1.5]**.  Applies to own-entity sounds in both spatialized (`s_alLocalSelf 0`, default) and non-spatialized (`s_alLocalSelf 1`) modes. |
-| `s_alVolOther` | `0.7` | Other player/entity volume multiplier **[0–1.0]** — capped, anti-cheat |
-| `s_alVolEnv` | `0.3` | Looping ambient/environmental volume multiplier **[0–1.0]** — capped |
-| `s_alVolUI` | `0.8` | Hit-marker/kill-confirmation/UI sound multiplier **[0–1.0]** — `StartLocalSound` (entnum=0) only, independent of weapon volume |
+
+#### Volume mixer — per-category controls (0–10 scale)
+
+All volume cvars use a **0–10 scale** where **1.0 = reference** (the historically tuned default level for that category). A **power-2 curve** is applied below 1.0 so that small reductions feel proportional to loudness perception (0.5 input → ≈ −12 dB, clearly audible; 0.1 input → ≈ −40 dB, nearly silent). Above 1.0 the scale is linear.
+
+| Cvar | Default | Ref gain | Max | Description |
+|------|---------|----------|-----|-------------|
+| `s_alVolSelf` | `1.0` | 1.00 | 10 | Own player movement, breath, general entity sounds |
+| `s_alVolWeapon` | `1.0` | 1.00 | 10 | Own weapon fire (CHAN_WEAPON from listener entity) — split from movement so weapon loudness is tunable independently |
+| `s_alVolOther` | `1.0` | 0.70 | 2 | Other players/entities. Capped at 2× (anti-cheat — prevents wallhack-level amplification) |
+| `s_alVolImpact` | `1.0` | 0.55 | 2 | World entity impacts: bullet hits, brass casings, explosions. Often disproportionately loud; capped at 2× (anti-cheat) |
+| `s_alVolEnv` | `1.0` | 0.30 | 10 | Looping ambient/environmental sounds |
+| `s_alVolUI` | `1.0` | 0.80 | 10 | Hit-markers, kill-confirmations, menu sounds (`StartLocalSound` with entnum=0) |
+
+**Example**: `s_alVolEnv 0.5` reduces ambient volume to 25% of reference (−12 dB); `s_alVolEnv 2.0` doubles it (+6 dB).
+
+#### Loop-sound fade controls
+
+Looping ambient sources fade in when an entity enters the player's PVS and fade out when it leaves, preventing sudden audio pops.
+
+| Cvar | Default | Description |
+|------|---------|-------------|
+| `s_alLoopFadeInMs` | `600` | Fade-in duration in ms for new loop sources. `0` = instant (no fade). |
+| `s_alLoopFadeOutMs` | `500` | Fade-out duration in ms when a source leaves PVS. `0` = instant cut. The fade always starts from the source's **current gain level** — if it was still fading in when removed, it fades out from there (not from full volume), preventing pops. |
+| `s_alLoopFadeDist` | `200` | Distance zone (game units) inside the hearing boundary within which new sources start at a **distance-proportional gain** rather than silence. Eliminates the "ramp-in from zero" artefact for sources appearing while already audible. `0` = always start from silence (old behaviour). |
+
+#### EFX additions: echo, chorus, fire-impact reverb
+
+| Cvar | Default | Description |
+|------|---------|-------------|
+| `s_alEcho` | `0` | Geometry-driven echo on EFX auxiliary send 1. Adds a subtle discrete reflection layer to 3D sources in enclosed spaces. Slot gain is driven automatically by `s_alDynamicReverb` room classification. Requires `maxSends >= 2` (`s_alDynamicReverb` must be on for gain to vary; otherwise the slot stays at zero). Default 0 (opt-in). |
+| `s_alEchoGain` | `0.06` | Maximum wet gain for the echo slot [0–0.3]. Actual gain is scaled by enclosure. Default 0.06 (single subtle reflection). |
+| `s_alFireImpactReverb` | `0` | Transient early-reflection boost on weapon fire. Casts 3 rays in the aim direction; a wall within 400 units boosts `targetRefl` and `targetDecay` in the dynamic reverb for one probe cycle — simulating the sharp echo of a muzzle blast off a hard surface. Requires `s_alDynamicReverb 1`. Default 0. |
+| `s_alFireImpactMaxBoost` | `0.25` | Maximum reflections gain added by the fire-impact boost [0–0.5]. Default 0.25. |
+
+#### Audio suppression (near-miss / incoming fire)
+
+| Cvar | Default | Description |
+|------|---------|-------------|
+| `s_alSuppression` | `0` | When enabled, briefly ducks the listener gain when an **enemy** fires a `CHAN_WEAPON` sound within `s_alSuppressionRadius` units. Simulates the concussive audio suppression of incoming fire. **Teammates are automatically excluded**: in team modes (TDM/CTF), the shooter's team is read from the player configstring and compared to your own — no cgame changes needed. Default 0 (opt-in). |
+| `s_alSuppressionRadius` | `180` | Detection radius in game units. Default 180 ≈ one room width. |
+| `s_alSuppressionFloor` | `0.55` | Minimum listener gain at peak suppression [0–0.95]. `0.55` ≈ −5 dB — noticeable but not disorienting. Lower values for stronger suppression effect. |
+| `s_alSuppressionMs` | `220` | Suppression duration in ms. Gain recovers linearly from floor to full over this window. Default 220 ms — short enough not to impede combat awareness. |
 
 #### Diagnosing weapon-sound quality with `s_alDebugPlayback`
 
