@@ -797,18 +797,18 @@ int trap_GeneticParentsAndChildSelection(int numranks, float *ranks, int *parent
 	return syscall( BOTLIB_AI_GENETIC_PARENTS_AND_CHILD_SELECTION, numranks, ranks, parent1, parent2, child );
 }
 
-int trap_PC_LoadSource( const char *filename ) {
+int trap_BotLibLoadSource( const char *filename ) {
 	return syscall( BOTLIB_PC_LOAD_SOURCE, filename );
 }
 
-int trap_PC_FreeSource( int handle ) {
+int trap_BotLibFreeSource( int handle ) {
 	return syscall( BOTLIB_PC_FREE_SOURCE, handle );
 }
 
-int trap_PC_ReadToken( int handle, pc_token_t *pc_token ) {
+int trap_BotLibReadToken( int handle, pc_token_t *pc_token ) {
 	return syscall( BOTLIB_PC_READ_TOKEN, handle, pc_token );
 }
 
-int trap_PC_SourceFileAndLine( int handle, char *filename, int *line ) {
+int trap_BotLibSourceFileAndLine( int handle, char *filename, int *line ) {
 	return syscall( BOTLIB_PC_SOURCE_FILE_AND_LINE, handle, filename, line );
 }

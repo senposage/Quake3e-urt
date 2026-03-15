@@ -41,9 +41,12 @@ void CG_FreezeTagDrawFrozenOverlay( void ) {
 	alpha = 0.5f + 0.2f * sin( cg.time * 0.005f );
 
 	/* blue tint overlay */
-	trap_R_SetColor( NULL );
-	CG_FillRect( 0, 0, 640, 480,
-		(vec4_t){ 0.0f, 0.2f, 0.8f, alpha * 0.35f } );
+	{
+		vec4_t freezeColor = { 0.0f, 0.2f, 0.8f, 0.0f };
+		freezeColor[3] = alpha * 0.35f;
+		trap_R_SetColor( NULL );
+		CG_FillRect( 0, 0, 640, 480, freezeColor );
+	}
 
 	/* "FROZEN" centred text */
 	CG_CenterPrint( "FROZEN", 180, BIGCHAR_WIDTH );
