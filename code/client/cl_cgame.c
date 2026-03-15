@@ -974,6 +974,13 @@ void CL_InitCGame( void ) {
 			interpret = VMI_COMPILED;
 	}
 
+	// Register UrT 4.3 cgame patch cvar before loading the VM so
+	// VM_ReplaceInstructions sees the correct default value.
+	// CVAR_PROTECTED prevents the QVM from disabling its own patches.
+	// Bitmask: bit0=frameInterpolation clamp, bit1=nextSnap null crash fix,
+	//          bit2=TR_INTERPOLATE velocity extrapolation
+	Cvar_Get( "cl_urt43cgPatches", "7", CVAR_ARCHIVE | CVAR_PROTECTED );
+
 	cgvm = VM_Create( VM_CGAME, CL_CgameSystemCalls, CL_DllSyscall, interpret );
 	if ( !cgvm ) {
 		Com_Error( ERR_DROP, "VM_Create on cgame failed" );
