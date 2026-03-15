@@ -514,9 +514,9 @@ void G_InitWorldSession(void)
 	trap_SetConfigstring(CS_ROUNDCOUNT,
 				 va("%i", level.g_roundcount));
 	trap_SetConfigstring(CS_BOMBPLANTTIME,
-				 va("%i", g_BombPlantTime.integer));
+				 va("%i", g_bombPlantTime.integer));
 	bg_weaponlist[UT_WP_BOMB].modes[0].fireTime =
-		g_BombPlantTime.integer * 1000;
+		g_bombPlantTime.integer * 1000;
 }
 
 /**

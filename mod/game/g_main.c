@@ -217,6 +217,7 @@ vmCvar_t  g_nextMap;
 vmCvar_t  g_refNoExec;
 vmCvar_t  g_teamScores;
 vmCvar_t  g_spSkill;
+vmCvar_t  g_mrsentry;
 
 cvarTable_t  gameCvarTable[] = {
     // don't override the cheat state set by the system
@@ -396,6 +397,7 @@ cvarTable_t  gameCvarTable[] = {
     { &g_refNoExec,                "g_refNoExec",                 "0",                    CVAR_ARCHIVE,                                       0, qfalse   },
     { &g_teamScores,               "g_teamScores",                "0",                    CVAR_SERVERINFO | CVAR_ROM,                         0, qfalse   },
     { &g_spSkill,                  "g_spSkill",                   "2",                    CVAR_ARCHIVE,                                       0, qfalse   },
+    { &g_mrsentry,                 "ut_mrsentry",                 "0",                    CVAR_ARCHIVE | CVAR_SERVERINFO,                     0, qfalse   },
 
     #ifdef USE_AUTH
 

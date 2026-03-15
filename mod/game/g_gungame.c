@@ -49,14 +49,15 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
  * Reconstructed from QVM weapon strings and typical UrT Gun Game rules.
  * Starts from knife, progresses through standard weapons to the SR8 at top. */
 static const weapon_t gg_weaponLevels[] = {
+	/* 4.3.4 Gun Game weapon progression table (11 levels) */
 	UT_WP_KNIFE,	    /* level  0 */
 	UT_WP_BERETTA,	    /* level  1 */
 	UT_WP_DEAGLE,	    /* level  2 */
-	UT_WP_SPAS,		    /* level  3 */
+	UT_WP_SPAS12,	    /* level  3 */
 	UT_WP_MP5K,		    /* level  4 */
 	UT_WP_UMP45,	    /* level  5 */
 	UT_WP_HK69,		    /* level  6 */
-	UT_WP_LR300,	    /* level  7 */
+	UT_WP_LR,		    /* level  7 */
 	UT_WP_G36,		    /* level  8 */
 	UT_WP_PSG1,		    /* level  9 */
 	UT_WP_SR8,		    /* level 10 — final level */
