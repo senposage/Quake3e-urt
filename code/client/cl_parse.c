@@ -588,6 +588,12 @@ static void CL_ParseServerInfo( void )
 	// cl.vanillaServer is determined, so it is always current before the cgame
 	// VM is created.  The cvar is CVAR_TEMP so it never persists to config.
 	Cvar_SetValue( "cl_urt43serverIsVanilla", cl.vanillaServer ? 1 : 0 );
+	Com_DPrintf( "CL_ParseServerInfo: vanillaServer=%d (sv_snapshotFps='%s') "
+		"-> cl_urt43serverIsVanilla=%d, QVM patches will use %s\n",
+		cl.vanillaServer,
+		Info_ValueForKey( serverInfo, "sv_snapshotFps" ),
+		cl.vanillaServer ? 1 : 0,
+		cl.vanillaServer ? "cl_qvmPatchVanilla" : "cl_urt43cgPatches" );
 
 	// Disable all adaptive timing when:
 	//   - the server is vanilla (lacks sv_snapshotFps, so our protocol is unsupported), or

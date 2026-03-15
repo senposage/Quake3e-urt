@@ -1638,6 +1638,8 @@ static void VM_URT43_CgamePatches( vm_t *vm, instruction_t *buf ) {
 	qboolean isVanilla;
 	const char *patchCvar;
 
+	Com_Printf( S_COLOR_CYAN "VM_URT43_CgamePatches: entered (CRC=%08X)\n", vm->crc32sum );
+
 	/* Select the patch bitmask based on server type.
 	 * cl_urt43serverIsVanilla is a CVAR_TEMP set by CL_ParseServerInfo each
 	 * time a gamestate is received.  It is 1 for vanilla servers (no
@@ -1647,7 +1649,7 @@ static void VM_URT43_CgamePatches( vm_t *vm, instruction_t *buf ) {
 	patchCvar  = isVanilla ? "cl_qvmPatchVanilla" : "cl_urt43cgPatches";
 	cgPatches  = Cvar_VariableIntegerValue( patchCvar );
 
-	Com_Printf( S_COLOR_CYAN "UrT43 cgame patch: CRC=%08X ic=%d dl=%d flags=0x%x (%s → %s)\n",
+	Com_Printf( S_COLOR_CYAN "UrT43 cgame patch: CRC=%08X ic=%d dl=%d flags=0x%x (%s -> %s)\n",
 		vm->crc32sum, vm->instructionCount, vm->exactDataLength, cgPatches,
 		isVanilla ? "vanilla server" : "custom server", patchCvar );
 
