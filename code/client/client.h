@@ -605,7 +605,7 @@ void	SCR_LogConnectInfo( const char *svFps, const char *snapFps,
                              const char *allowAt, int snapshotMsec,
                              qboolean vanilla, qboolean forbids );
 void	SCR_LogServerCmd( int seq, int storedSeq, const char *text );
-void	SCR_LogSnapState( int snapTime, int ping, int msgSeq,
+void	SCR_LogSnapState( int snapTime, int ping, int cmdTime, int msgSeq,
                           int cmdSeq, int relSeq, int relAck );
 void	SCR_LogTimeout( int count, int elapsed, int limit );
 void	SCR_LogNote( const char *tag, const char *msg );
