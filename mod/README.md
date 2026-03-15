@@ -53,4 +53,4 @@ See `docs/project/URT43_QVM_RECONSTRUCTION.md` for the full analysis and stage b
 | 7 | ✅ | New game modes (Tier 3) — `g_freezetag.c` (freeze/thaw/meltdown), `g_gungame.c` (weapon progression), `g_sentry.c` (Mr. Sentry turret entity) |
 | 8 | ✅ | cgame reconstruction — Tier-2 cgame files updated; `cg_freezetag.c`, `cg_gungame.c` written |
 | 9 | ✅ | UI reconstruction — `ui_gameinfo.c` updated for GT_FREEZE/GT_GUNGAME map type bits |
-| 10 | ⬜ | Build verification — compile all three QVMs |
+| 10 | ✅ | Build verification — all three QVMs compile with 0 errors using 4.2 tools from qsource.zip |

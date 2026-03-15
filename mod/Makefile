@@ -1,18 +1,28 @@
 # Urban Terror 4.3.4 QVM Build System
 #
-# Requires:
-#   Q3LCC   = path to q3lcc (lcc QVM C compiler)
-#   Q3ASM   = path to q3asm (QVM assembler)
+# tools/  = q3lcc + q3asm pre-built Linux binaries from UrbanTerror 4.2 source (primary)
+#           Also contains ec-/q3lcc source tree as a fallback build system.
+# tools2/ = Windows .exe equivalents (for reference / Windows builds)
+#
+# Override with:   make Q3LCC=/path/to/q3lcc Q3ASM=/path/to/q3asm
 #
 # Usage:
 #   make              - build all three QVMs
 #   make game         - build qagame.qvm only
 #   make cgame        - build cgame.qvm only
 #   make ui           - build ui.qvm only
-#   make clean        - remove build artifacts
+#   make tools        - (re)build ec-/q3lcc + ec-/q3asm from source in tools/
+#   make clean        - remove QVM build artifacts
+#   make clean-tools  - remove compiled ec- tool binaries
 
-Q3LCC   ?= q3lcc
-Q3ASM   ?= q3asm
+TOOLSDIR  = $(shell pwd)/tools
+TOOLS2DIR = $(shell pwd)/tools2
+
+# Primary compiler: ec-/q3lcc (64-bit, built from source in tools/)
+# The 4.2 pre-built q3lcc/q3asm in tools/ are 32-bit Linux binaries kept for reference.
+# Primary assembler: 4.2 q3asm (32-bit but works fine here)
+Q3LCC   ?= $(TOOLSDIR)/build--/q3lcc
+Q3ASM   ?= $(TOOLSDIR)/q3asm
 
 BASEDIR  = $(shell pwd)
 GAMEDIR  = $(BASEDIR)/game
@@ -116,9 +126,9 @@ CGAME_SOURCES = \
 	$(CGAMEDIR)/cg_weapons.c \
 	$(UIDIR)/ui_shared.c \
 	$(GAMEDIR)/bg_slidemove.c \
-	$(CGAMEDIR)/bg_pmove.c \
+	$(GAMEDIR)/bg_pmove.c \
 	$(GAMEDIR)/bg_lib.c \
-	$(CGAMEDIR)/bg_misc.c \
+	$(GAMEDIR)/bg_misc.c \
 	$(GAMEDIR)/q_math.c \
 	$(GAMEDIR)/q_shared.c \
 	$(COMMONDIR)/zdecrypt.c \
@@ -136,19 +146,31 @@ UI_SOURCES = \
 	$(UIDIR)/ui_players.c \
 	$(UIDIR)/ui_shared.c \
 	$(UIDIR)/ui_gameinfo.c \
-	$(UIDIR)/bg_misc.c \
+	$(GAMEDIR)/bg_misc.c \
 	$(GAMEDIR)/bg_lib.c \
-	$(UIDIR)/bg_gear.c \
+	$(GAMEDIR)/bg_gear.c \
 	$(GAMEDIR)/q_math.c \
 	$(GAMEDIR)/q_shared.c \
 	$(COMMONDIR)/zdecrypt.c \
 	$(COMMONDIR)/zzz_last.c
 
-GAME_OBJS   = $(patsubst %.c,$(BUILDDIR)/game/%.asm,$(notdir $(GAME_SOURCES)))
-CGAME_OBJS  = $(patsubst %.c,$(BUILDDIR)/cgame/%.asm,$(notdir $(CGAME_SOURCES)))
-UI_OBJS     = $(patsubst %.c,$(BUILDDIR)/ui/%.asm,$(notdir $(UI_SOURCES)))
+GAME_OBJS   = $(GAMEDIR)/g_syscalls.asm \
+              $(patsubst %.c,$(BUILDDIR)/game/%.asm,$(notdir $(GAME_SOURCES)))
+CGAME_OBJS  = $(CGAMEDIR)/cg_syscalls.asm \
+              $(patsubst %.c,$(BUILDDIR)/cgame/%.asm,$(notdir $(CGAME_SOURCES)))
+UI_OBJS     = $(UIDIR)/ui_syscalls.asm \
+              $(patsubst %.c,$(BUILDDIR)/ui/%.asm,$(notdir $(UI_SOURCES)))
 
-.PHONY: all game cgame ui clean
+.PHONY: all game cgame ui tools clean clean-tools
+
+# tools/ has pre-built 4.2 binaries; 'make tools' (re)builds the ec- versions from source
+tools:
+	$(MAKE) -C $(TOOLSDIR)
+	$(MAKE) -C $(TOOLS2DIR)
+
+clean-tools:
+	$(MAKE) -C $(TOOLSDIR) clean
+	$(MAKE) -C $(TOOLS2DIR) clean
 
 all: game cgame ui
 
@@ -158,14 +180,15 @@ cgame: $(BUILDDIR)/cgame.qvm
 
 ui: $(BUILDDIR)/ui.qvm
 
+# 4.2 q3asm link steps: pass all .asm files directly
 $(BUILDDIR)/qagame.qvm: $(GAME_OBJS)
-	$(Q3ASM) -o $@ $(GAMEDIR)/game.q3asm
+	$(Q3ASM) -o $(BUILDDIR)/qagame $(GAME_OBJS)
 
 $(BUILDDIR)/cgame.qvm: $(CGAME_OBJS)
-	$(Q3ASM) -o $@ $(CGAMEDIR)/cgame.q3asm
+	$(Q3ASM) -o $(BUILDDIR)/cgame $(CGAME_OBJS)
 
 $(BUILDDIR)/ui.qvm: $(UI_OBJS)
-	$(Q3ASM) -o $@ $(UIDIR)/ui.q3asm
+	$(Q3ASM) -o $(BUILDDIR)/ui $(UI_OBJS)
 
 $(BUILDDIR)/game/%.asm: $(GAMEDIR)/%.c | $(BUILDDIR)/game
 	$(Q3LCC) $(Q3LCCFLAGS) -S -o $@ $<
@@ -179,10 +202,19 @@ $(BUILDDIR)/cgame/%.asm: $(CGAMEDIR)/%.c | $(BUILDDIR)/cgame
 $(BUILDDIR)/cgame/%.asm: $(COMMONDIR)/%.c | $(BUILDDIR)/cgame
 	$(Q3LCC) $(Q3LCCFLAGS) -S -o $@ $<
 
+$(BUILDDIR)/cgame/%.asm: $(UIDIR)/%.c | $(BUILDDIR)/cgame
+	$(Q3LCC) $(Q3LCCFLAGS) -S -o $@ $<
+
+$(BUILDDIR)/cgame/%.asm: $(GAMEDIR)/%.c | $(BUILDDIR)/cgame
+	$(Q3LCC) $(Q3LCCFLAGS) -S -o $@ $<
+
 $(BUILDDIR)/ui/%.asm: $(UIDIR)/%.c | $(BUILDDIR)/ui
 	$(Q3LCC) $(Q3LCCFLAGS) -S -o $@ $<
 
 $(BUILDDIR)/ui/%.asm: $(COMMONDIR)/%.c | $(BUILDDIR)/ui
+	$(Q3LCC) $(Q3LCCFLAGS) -S -o $@ $<
+
+$(BUILDDIR)/ui/%.asm: $(GAMEDIR)/%.c | $(BUILDDIR)/ui
 	$(Q3LCC) $(Q3LCCFLAGS) -S -o $@ $<
 
 $(BUILDDIR)/game $(BUILDDIR)/cgame $(BUILDDIR)/ui:
