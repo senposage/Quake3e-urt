@@ -45,12 +45,12 @@ See `docs/project/URT43_QVM_RECONSTRUCTION.md` for the full analysis and stage b
 | Stage | Status | Description |
 |-------|--------|-------------|
 | 1 | ✅ | Scaffold — directory structure, Makefile, `.q3asm` lists, syscall ASM |
-| 2 | ✅ | Shared headers — `bg_public.h`, `q_shared.h`, `g_local.h`, `cg_local.h` |
-| 3 | ✅ | Tier-1 common files — hash-identical utility/math/lib files |
-| 4 | ✅ | Tier-1 bot/AI files — all hash-identical bot AI |
-| 5 | ✅ | Tier-1 game infrastructure — mostly-unchanged game files |
-| 6 | 🔄 | Core game logic (Tier 2) — modified functions |
-| 7 | ⬜ | New game modes — Freeze Tag, Gun Game, Mr. Sentry |
-| 8 | ⬜ | cgame reconstruction |
-| 9 | ⬜ | UI reconstruction |
-| 10 | ⬜ | Build verification |
+| 2 | ✅ | Shared headers — `bg_public.h` (GT_FREEZE/GT_GUNGAME, new EV_/CS_/PMF flags), `g_local.h` (freeze/GunGame struct fields + 26 new cvar externs) |
+| 3 | ✅ | Tier-1 common files — hash-identical: `q_shared.c`, `q_math.c`, `bg_lib.c`, `bg_slidemove.c`, all `c_*` common files |
+| 4 | ✅ | Tier-1 bot/AI files — all hash-identical bot AI: `ai_main.c` through `ai_vcmd.c` |
+| 5 | ✅ | Tier-1 game infrastructure — `g_antilag.c`, `g_arenas.c`, `g_bot.c`, `g_misc.c`, `g_mover.c`, `g_rankings.c`, `g_session.c`, `g_target.c`, `g_trigger.c` |
+| 6 | ✅ | Core game logic (Tier 2) — `g_main.c` (+26 cvars, cvar renames, v4.3.4), `g_combat.c` (instagib, freeze immunity, UT_MOD_MELT/FREEZE), all other game C files patched |
+| 7 | ✅ | New game modes (Tier 3) — `g_freezetag.c` (freeze/thaw/meltdown), `g_gungame.c` (weapon progression), `g_sentry.c` (Mr. Sentry turret entity) |
+| 8 | ✅ | cgame reconstruction — Tier-2 cgame files updated; `cg_freezetag.c`, `cg_gungame.c` written |
+| 9 | ✅ | UI reconstruction — `ui_gameinfo.c` updated for GT_FREEZE/GT_GUNGAME map type bits |
+| 10 | ⬜ | Build verification — compile all three QVMs |

@@ -256,8 +256,7 @@ typedef enum {
 #define UT_PMF_READY_FIRE		(1 << 14)
 #define UT_PMF_WEAPON_MODE_HELD (1 << 15)
 
-/* New in 4.3 — Freeze Tag state */
-#define UT_PMF_FROZEN			(1 << 16)	/* player is currently frozen */
+/* UT_PMF_FROZEN (1 << 8) is already defined above — used by Freeze Tag (4.3) */
 
 //Fenix
 #define UT_PMF_CRASHED          (1 << 0)
@@ -743,6 +742,8 @@ typedef enum {
 	UT_MOD_MAC11,
 	UT_MOD_FLAG,
 	UT_MOD_GOOMBA,
+	UT_MOD_MELT,		/* frozen player melted — new in 4.3 Freeze Tag */
+	UT_MOD_FREEZE,		/* killed by being frozen (via g_combat freeze kill) */
 	/*UT_MOD_P90,
 	UT_MOD_BENELLI,
 	UT_MOD_MAGNUM,*/
