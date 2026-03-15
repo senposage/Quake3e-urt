@@ -1609,10 +1609,11 @@ extern vmCvar_t  g_nextCycleMap;	/* next map queued in cycle */
 extern vmCvar_t  g_nextMap;			/* override next map */
 extern vmCvar_t  g_refNoExec;		/* prevent referee from exec-ing configs */
 extern vmCvar_t  g_teamScores;		/* publish team scores configstring */
-extern vmCvar_t  g_bombDefuseTime) */
-extern vmCvar_t  g_bombExplodeTime) */
-extern vmCvar_t  g_bombPlantTime) */
+extern vmCvar_t  g_bombDefuseTime;	/* bomb defuse time in seconds */
+extern vmCvar_t  g_bombExplodeTime;	/* bomb explode time in seconds */
+extern vmCvar_t  g_bombPlantTime;	/* bomb plant time in seconds */
 extern vmCvar_t  g_spSkill;			/* single player skill level */
+extern vmCvar_t  g_mrsentry;		/* enable Mr. Sentry turret entities */
 
 void	 trap_Printf( const char *fmt );
 void	 trap_Error( const char *fmt );

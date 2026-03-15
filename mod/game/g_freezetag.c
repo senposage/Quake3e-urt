@@ -138,13 +138,12 @@ void G_FreezePlayer( gentity_t *targ, gentity_t *attacker, int mod ) {
 	G_AddEvent( targ, EV_UT_FREEZE, 0 );
 
 	/* Log: Freeze: targNum attackerNum mod: targName froze via weapon */
-	G_LogPrintf( "Freeze: %i %i %i: %s froze %s by %s\n",
+	G_LogPrintf( "Freeze: %i %i %i: %s froze %s\n",
 		targNum,
 		attackerNum,
 		mod,
 		attacker ? attacker->client->pers.netname : "world",
-		cl->pers.netname,
-		modNames[mod] );
+		cl->pers.netname );
 
 	/* ccprint for clients: ccprint "%d" "%d" */
 	trap_SendServerCommand( -1, va( "ccprint \"%d\" \"%d\"",

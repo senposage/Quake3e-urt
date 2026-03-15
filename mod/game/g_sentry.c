@@ -65,7 +65,7 @@ static gentity_t *MrSentry_FindTarget( gentity_t *sentry ) {
 	trace_t		tr;
 
 	best     = NULL;
-	bestDist = SENTRY_RANGE * SENTRY_RANGE;
+	bestDist = SENTRY_RANGE;
 
 	for ( i = 0; i < level.maxclients; i++ ) {
 		ent = &g_entities[i];
@@ -78,13 +78,13 @@ static gentity_t *MrSentry_FindTarget( gentity_t *sentry ) {
 		if ( ent->client->ps.pm_type == PM_DEAD ) {
 			continue;
 		}
-		/* skip same team */
-		if ( ent->client->sess.sessionTeam == sentry->s.teamNum ) {
+		/* skip same team (team stored in s.generic1 for non-client entities) */
+		if ( ent->client->sess.sessionTeam == sentry->s.generic1 ) {
 			continue;
 		}
 
 		VectorSubtract( ent->r.currentOrigin, sentry->r.currentOrigin, dir );
-		dist = VectorLengthSquared( dir );
+		dist = VectorLength( dir );
 		if ( dist >= bestDist ) {
 			continue;
 		}
@@ -116,7 +116,7 @@ static void MrSentry_Think( gentity_t *self ) {
 
 	self->nextthink = level.time + SENTRY_FIRE_RATE;
 
-	if ( !ut_mrsentry.integer ) {
+	if ( !g_mrsentry.integer ) {
 		return;
 	}
 
@@ -127,13 +127,17 @@ static void MrSentry_Think( gentity_t *self ) {
 
 	/* rotate to face target */
 	VectorSubtract( target->r.currentOrigin, self->r.currentOrigin, dir );
-	VectorNormalize( dir );
+	{
+		float _len;
+		VectorNormalize( dir, _len );
+		(void)_len;
+	}
 	vectoangles( dir, angles );
 	VectorCopy( angles, self->s.apos.trBase );
 
 	/* fire at target */
 	G_Damage( target, self, self, dir, target->r.currentOrigin,
-		SENTRY_DAMAGE, 0, MOD_MACHINEGUN, HL_UNKNOWN );
+		SENTRY_DAMAGE, 0, UT_MOD_LR, HL_UNKNOWN );
 }
 
 /*
@@ -143,13 +147,13 @@ static void MrSentry_Think( gentity_t *self ) {
  * Place a Mr. Sentry turret at the entity's origin.
  */
 void SP_ut_mrsentry( gentity_t *ent ) {
-	if ( !ut_mrsentry.integer ) {
+	if ( !g_mrsentry.integer ) {
 		G_FreeEntity( ent );
 		return;
 	}
 
-	ent->s.eType     = ET_MR_SENTRY;
-	ent->s.teamNum   = ent->spawnflags & 1 ? TEAM_BLUE : TEAM_RED;
+	ent->s.eType    = ET_MR_SENTRY;
+	ent->s.generic1 = ent->spawnflags & 1 ? TEAM_BLUE : TEAM_RED;  /* team stored in generic1 */
 	ent->takedamage  = qfalse;	/* sentries are indestructible in base 4.3 */
 	ent->think       = MrSentry_Think;
 	ent->nextthink   = level.time + SENTRY_SPIN_UP_TIME;

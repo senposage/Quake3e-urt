@@ -3,6 +3,12 @@
 #ifndef _G_RANKINGS_H_
 #define _G_RANKINGS_H_
 
+/* grank_status_t: Q3 global rankings stub type (was in the Q3 game SDK) */
+#ifndef GRANK_STATUS_T_DEFINED
+#define GRANK_STATUS_T_DEFINED
+typedef int grank_status_t;
+#endif
+
 /*
 ==============================================================================
 
@@ -372,4 +378,29 @@ Key digits:
 #define QGR_KEY_FLAG_PICKUP 				1111110000
 #define QGR_KEY_FLAG_CAPTURE				1111110001
 
-#endif // _G_RANKINGS_H_
+/* Stubs for Q3 global rankings SDK symbols not present in Urban Terror.
+ * The global rankings system was never shipped in UrT; these are dead stubs. */
+#define GR_GAMEKEY						0
+#define trap_RankCheckInit()			0
+#define trap_RankBegin(k)				((void)0)
+#define trap_RankPoll()					((void)0)
+#define trap_RankActive()				0
+#define trap_RankClientBegin(n)			((void)0)
+#define trap_RankClientEnd(n)			((void)0)
+#define trap_RankUserInfo(a,b,c)		((void)0)
+#define trap_RankReportInt(a,b,c,d)		((void)0)
+#define trap_RankReportFloat(a,b,c,d)	((void)0)
+#define trap_RankEnd()					((void)0)
+#define trap_RankQuery(a,b,c,d)			((void)0)
+#define trap_RankError(a)				((void)0)
+#define trap_RankGetStatus(a,b)			0
+/* client_status was part of the removed global rankings clientSession extension */
+#define client_status					ps.pm_type
+
+/* grank_status_t: was in the Q3 global rankings SDK */
+#ifndef GRANK_STATUS_T_DEFINED
+#define GRANK_STATUS_T_DEFINED
+typedef int grank_status_t;
+#endif
+
+#endif /* _G_RANKINGS_H_ */
