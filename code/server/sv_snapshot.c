@@ -936,6 +936,17 @@ static void SV_BuildCommonSnapshot( void )
 					if ( es->pos.trType == TR_INTERPOLATE ) {
 						es->pos.trTime = usedBuffer ? sv.time - bufMs : sv.time;
 					}
+
+					/* Sync es->origin to the resolved es->pos.trBase so that cgame
+					   code that reads currentState.origin directly (e.g. the UrT 4.3
+					   cgame spot-shadow trace which uses cent->currentState.origin
+					   instead of BG_EvaluateTrajectory) sees the same extrapolated
+					   position as the trajectory.  Without this, pos.trBase and origin
+					   diverge: the player body renders at the extrapolated position
+					   while the shadow is traced from the original snapshot origin,
+					   causing the spot shadow to teleport in front of / behind the
+					   player during movement. */
+					VectorCopy( es->pos.trBase, es->origin );
 				}
 			} else {
 				/* Anchor trTime for TR_INTERPOLATE client entities even when
