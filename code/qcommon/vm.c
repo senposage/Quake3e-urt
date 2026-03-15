@@ -1577,6 +1577,208 @@ __noJTS:
 
 /*
 =================
+VM_URT43_CgamePatches
+
+Apply runtime memory patches to the official UrbanTerror 4.3 cgame QVM.
+Gated behind the cl_urt43cgPatches bitmask cvar (default 7 = all enabled):
+
+  Bit 0 (1): Patch 2 — fix frameInterpolation clamp bounds.
+             The QVM's existing clamp is wrong: lower threshold is 0.1f instead
+             of 0.0f (clips valid small fractions), and the upper clamp value is
+             ~0.99f instead of 1.0f.  Two constant-value fixes at instr 0xa688
+             and 0xa692.
+
+  Bit 1 (2): Patch 3 — prevent CG_InterpolateEntityPosition crash when
+             cg.nextSnap == NULL.  The QVM calls CG_Error() (fatal crash) when
+             the next snapshot pointer is NULL during high-latency spikes.
+             Replace the 5-instruction error path with CONST+JUMP to the
+             function's PUSH+LEAVE so it returns silently instead.
+
+  Bit 2 (4): Patch 1 — BG_EvaluateTrajectory TR_INTERPOLATE uses velocity
+             extrapolation.  The switch-table entry for trType==TR_INTERPOLATE
+             (case 1) currently falls through to TR_STATIONARY (VectorCopy only).
+             Redirect it to the TR_LINEAR case so entities use velocity-based
+             forward extrapolation when the next snapshot is unavailable.
+
+Target QVM: UrbanTerror 4.3 official binary
+  CRC32:            0x1289DB6B
+  instructionCount: 258563
+  exactDataLength:  38055548
+=================
+*/
+/* Named offsets for the BG_EvaluateTrajectory switch jump table in the
+   UrbanTerror 4.3 cgame data segment.  The switch covers trType values 0-11;
+   each entry is a 4-byte instruction index. */
+#define URT43_JT_BASE              0xdbb0   /* base data address of the table          */
+#define URT43_JT_TR_STATIONARY     (URT43_JT_BASE + 0*4)  /* case 0 (TR_STATIONARY)   */
+#define URT43_JT_TR_INTERPOLATE    (URT43_JT_BASE + 1*4)  /* case 1 (TR_INTERPOLATE)  */
+#define URT43_JT_TR_LINEAR         (URT43_JT_BASE + 2*4)  /* case 2 (TR_LINEAR)       */
+
+/* Expected instruction indices inside BG_EvaluateTrajectory */
+#define URT43_INSTR_TR_STATIONARY_CASE  0x3ab0c  /* VectorCopy handler (cases 0 & 1)  */
+#define URT43_INSTR_TR_LINEAR_CASE      0x3ab15  /* velocity extrapolation handler     */
+
+static void VM_URT43_CgamePatches( vm_t *vm, instruction_t *buf ) {
+	int cgPatches;
+	int applied = 0;
+	int skipped = 0;
+
+	cgPatches = Cvar_VariableIntegerValue( "cl_urt43cgPatches" );
+
+	Com_Printf( S_COLOR_CYAN "UrT43 cgame patch: CRC=%08X ic=%d dl=%d flags=0x%x\n",
+		vm->crc32sum, vm->instructionCount, vm->exactDataLength, cgPatches );
+
+	/* ---------------------------------------------------------------
+	   Patch 2 (bit 0): Fix frameInterpolation clamp bounds
+	   Instruction 0xa688: lower threshold   0x3dcccccd (0.1f)  -> 0x00000000 (0.0f)
+	   Instruction 0xa692: upper clamp value 0x3f7d70a4 (~0.99f) -> 0x3f800000 (1.0f)
+	   --------------------------------------------------------------- */
+	if ( cgPatches & 1 ) {
+		qboolean ok_lo, ok_hi;
+
+		Com_Printf( S_COLOR_CYAN "  [Patch2] frameInterpolation clamp:\n" );
+		Com_Printf( "    [0xa688] op=0x%02x val=0x%08x (expect op=0x%02x val=0x%08x)\n",
+			buf[0xa688].op, (unsigned)buf[0xa688].value,
+			OP_CONST, 0x3dcccccdU );
+		Com_Printf( "    [0xa692] op=0x%02x val=0x%08x (expect op=0x%02x val=0x%08x)\n",
+			buf[0xa692].op, (unsigned)buf[0xa692].value,
+			OP_CONST, 0x3f7d70a4U );
+
+		ok_lo = ( buf[0xa688].op == OP_CONST && (unsigned)buf[0xa688].value == 0x3dcccccdU );
+		ok_hi = ( buf[0xa692].op == OP_CONST && (unsigned)buf[0xa692].value == 0x3f7d70a4U );
+
+		if ( ok_lo && ok_hi ) {
+			buf[0xa688].value = 0;           /* lower bound: 0.1f -> 0.0f */
+			buf[0xa692].value = 0x3f800000;  /* upper clamp value: ~0.99f -> 1.0f */
+			applied |= 1;
+			Com_Printf( S_COLOR_CYAN "    [Patch2] APPLIED: lower=0.0f upper=1.0f\n" );
+		} else {
+			skipped |= 1;
+			if ( !ok_lo )
+				Com_Printf( S_COLOR_YELLOW "    [Patch2] SKIP: instr 0xa688 mismatch"
+					" (op=%d val=0x%08x)\n",
+					buf[0xa688].op, (unsigned)buf[0xa688].value );
+			if ( !ok_hi )
+				Com_Printf( S_COLOR_YELLOW "    [Patch2] SKIP: instr 0xa692 mismatch"
+					" (op=%d val=0x%08x)\n",
+					buf[0xa692].op, (unsigned)buf[0xa692].value );
+		}
+	} else {
+		Com_Printf( S_COLOR_YELLOW "  [Patch2] DISABLED by cvar (bit 0 not set)\n" );
+	}
+
+	/* ---------------------------------------------------------------
+	   Patch 3 (bit 1): CG_InterpolateEntityPosition null-nextSnap crash fix
+	   Instructions 0x15894-0x15898: replace CG_Error path with early return.
+	   0x15894: OP_CONST 0x1594d  (address of PUSH+LEAVE)
+	   0x15895: OP_JUMP
+	   0x15896-0x15898: OP_IGNORE x3
+	   Also mark 0x1594d (PUSH before LEAVE) as a jump target for JIT.
+	   --------------------------------------------------------------- */
+	if ( cgPatches & 2 ) {
+		qboolean ok;
+
+		Com_Printf( S_COLOR_CYAN "  [Patch3] CG_InterpolateEntityPosition null crash:\n" );
+		Com_Printf( "    [0x15893] op=0x%02x val=0x%08x (expect NE=0x%02x target=0x%08x)\n",
+			buf[0x15893].op, (unsigned)buf[0x15893].value,
+			OP_NE, 0x00015899U );
+		Com_Printf( "    [0x15894] op=0x%02x val=0x%08x (expect CONST=0x%02x val=0x%08x)\n",
+			buf[0x15894].op, (unsigned)buf[0x15894].value,
+			OP_CONST, 0x000142ffU );
+		Com_Printf( "    [0x15895] op=0x%02x       (expect ARG=0x%02x)\n",
+			buf[0x15895].op, OP_ARG );
+		Com_Printf( "    [0x15896] op=0x%02x val=0x%08x (expect CONST=0x%02x val=0x%08x)\n",
+			buf[0x15896].op, (unsigned)buf[0x15896].value,
+			OP_CONST, 0x000006f8U );
+		Com_Printf( "    [0x15897] op=0x%02x       (expect CALL=0x%02x)\n",
+			buf[0x15897].op, OP_CALL );
+		Com_Printf( "    [0x15898] op=0x%02x       (expect POP=0x%02x)\n",
+			buf[0x15898].op, OP_POP );
+		Com_Printf( "    [0x1594d] op=0x%02x       (expect PUSH=0x%02x) [early-return target]\n",
+			buf[0x1594d].op, OP_PUSH );
+		Com_Printf( "    [0x1594e] op=0x%02x val=0x%08x (expect LEAVE=0x%02x val=0x%08x)\n",
+			buf[0x1594e].op, (unsigned)buf[0x1594e].value,
+			OP_LEAVE, 0x00000040U );
+
+		ok = ( buf[0x15893].op == OP_NE
+			&& (unsigned)buf[0x15893].value == 0x00015899U
+			&& buf[0x15894].op == OP_CONST
+			&& (unsigned)buf[0x15894].value == 0x000142ffU
+			&& buf[0x15897].op == OP_CALL
+			&& buf[0x15898].op == OP_POP
+			&& buf[0x1594d].op == OP_PUSH
+			&& buf[0x1594e].op == OP_LEAVE
+			&& (unsigned)buf[0x1594e].value == 0x00000040U );
+
+		if ( ok ) {
+			/* Replace the 5-slot CG_Error path with: CONST <return_addr> + JUMP + 3x IGNORE */
+			buf[0x15894].op    = OP_CONST;
+			buf[0x15894].value = 0x1594d;  /* PUSH+LEAVE early-return point */
+			buf[0x15895].op    = OP_JUMP;
+			buf[0x15895].value = 0;
+			VM_IgnoreInstructions( buf + 0x15896, 3 );
+			/* Mark early-return target as a jump target so JIT emits a native label */
+			buf[0x1594d].jused = 1;
+			applied |= 2;
+			Com_Printf( S_COLOR_CYAN "    [Patch3] APPLIED: CG_Error->early return at instr 0x1594d\n" );
+		} else {
+			skipped |= 2;
+			Com_Printf( S_COLOR_YELLOW "    [Patch3] SKIP: instruction pattern mismatch\n" );
+		}
+	} else {
+		Com_Printf( S_COLOR_YELLOW "  [Patch3] DISABLED by cvar (bit 1 not set)\n" );
+	}
+
+	/* ---------------------------------------------------------------
+	   Patch 1 (bit 2): BG_EvaluateTrajectory TR_INTERPOLATE -> TR_LINEAR
+	   The jump table at data address 0xdbb0 has 12 entries (cases 0-11).
+	   Entry 1 (TR_INTERPOLATE, at data offset 0xdbb4) currently points to
+	   the TR_STATIONARY case (0x3ab0c, VectorCopy only).  Redirect it to
+	   the TR_LINEAR case (0x3ab15) so velocity extrapolation is used.
+	   --------------------------------------------------------------- */
+	if ( cgPatches & 4 ) {
+		int32_t *jt_case0 = (int32_t *)(vm->dataBase + URT43_JT_TR_STATIONARY);
+		int32_t *jt_case1 = (int32_t *)(vm->dataBase + URT43_JT_TR_INTERPOLATE);
+		int32_t *jt_case2 = (int32_t *)(vm->dataBase + URT43_JT_TR_LINEAR);
+
+		Com_Printf( S_COLOR_CYAN "  [Patch1] BG_EvaluateTrajectory TR_INTERPOLATE->TR_LINEAR:\n" );
+		Com_Printf( "    data[0x%05x] case0(TR_STATIONARY) =0x%05x (expect 0x%05x)\n",
+			URT43_JT_TR_STATIONARY,  *jt_case0, URT43_INSTR_TR_STATIONARY_CASE );
+		Com_Printf( "    data[0x%05x] case1(TR_INTERPOLATE)=0x%05x (expect 0x%05x -> patch to 0x%05x)\n",
+			URT43_JT_TR_INTERPOLATE, *jt_case1,
+			URT43_INSTR_TR_STATIONARY_CASE, URT43_INSTR_TR_LINEAR_CASE );
+		Com_Printf( "    data[0x%05x] case2(TR_LINEAR)     =0x%05x (expect 0x%05x)\n",
+			URT43_JT_TR_LINEAR,      *jt_case2, URT43_INSTR_TR_LINEAR_CASE );
+
+		/* Guard: only patch if the table still contains the original values.
+		   If already patched (e.g. on VM restart) the check for case1==STATIONARY_CASE
+		   will fail, so we skip safely rather than double-patching. */
+		if ( *jt_case0 == URT43_INSTR_TR_STATIONARY_CASE
+			&& *jt_case1 == URT43_INSTR_TR_STATIONARY_CASE
+			&& *jt_case2 == URT43_INSTR_TR_LINEAR_CASE ) {
+			*jt_case1 = URT43_INSTR_TR_LINEAR_CASE;  /* TR_INTERPOLATE -> TR_LINEAR */
+			applied |= 4;
+			Com_Printf( S_COLOR_CYAN "    [Patch1] APPLIED: TR_INTERPOLATE now uses TR_LINEAR extrapolation\n" );
+		} else {
+			skipped |= 4;
+			Com_Printf( S_COLOR_YELLOW "    [Patch1] SKIP: jump table mismatch"
+				" (case0=0x%05x case1=0x%05x case2=0x%05x)\n",
+				*jt_case0, *jt_case1, *jt_case2 );
+		}
+	} else {
+		Com_Printf( S_COLOR_YELLOW "  [Patch1] DISABLED by cvar (bit 2 not set)\n" );
+	}
+
+	if ( applied ) {
+		Com_Printf( S_COLOR_CYAN  "UrT43 cgame patch: applied=0x%x skipped=0x%x\n", applied, skipped );
+	} else {
+		Com_Printf( S_COLOR_YELLOW "UrT43 cgame patch: applied=0x%x skipped=0x%x (no patches applied)\n", applied, skipped );
+	}
+}
+
+
+/*
+=================
 VM_ReplaceInstructions
 =================
 */
@@ -1615,6 +1817,15 @@ void VM_ReplaceInstructions( vm_t *vm, instruction_t *buf ) {
 			if ( ip->value == 70943 ) {
 				VM_IgnoreInstructions( ip, 8 );
 			}
+		} else
+		/* UrbanTerror 4.3 official cgame binary */
+		if ( vm->crc32sum == 0x1289DB6B && vm->instructionCount == 258563 && vm->exactDataLength == 38055548 ) {
+			VM_URT43_CgamePatches( vm, buf );
+		} else {
+			/* Log a VMINFO line for any unrecognised cgame so patch dev can identify future versions */
+			Com_DPrintf( S_COLOR_YELLOW "UrT43 cgame patch: unrecognised cgame CRC=%08X ic=%d dl=%d"
+				" (patches not applied)\n",
+				vm->crc32sum, vm->instructionCount, vm->exactDataLength );
 		}
 	}
 
