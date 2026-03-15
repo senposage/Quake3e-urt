@@ -37,7 +37,7 @@ the moment of disconnect.
 |-----|-------|---------|
 | `CONNECT` | 1 | Gamestate received: sv_fps, sv_snapshotFps, seeded snapshotMsec, vanilla/forbids flags |
 | `SVCMD` | 1 | Every new server command — seq numbers + first 80 chars of text |
-| `SNAP` | 2 | Per-snapshot reliable-cmd sequence state (cmdSeq, relSeq, relAck) |
+| `SNAP` | 2 | Per-snapshot state: serverTime, ping, cmdTime (ps.commandTime), msgSeq, cmdSeq, relSeq, relAck |
 | `DROP` | 1 | Netchan gap: server UDP packets that never arrived (maps to lagometer black bars) |
 | `SNAP:DELTA_INVALID` | 1 | Delta-base snapshot was already invalid — should never happen |
 | `SNAP:DELTA_OLD` | 1 | Delta-base too old to reconstruct — usually follows a DROP |
@@ -78,7 +78,7 @@ the moment of disconnect.
 | Field | What to look for |
 |-------|-----------------|
 | `reason` | Server-supplied string — should identify why the server dropped us |
-| `ping=999` | Client-side ping calculation failure (can happen when a snap is late and the safety cap is active — **does not necessarily mean server-side negative-ping kick**) |
+| `ping=999` | `ps.commandTime` frozen — server has stopped processing our usercmds (see §2h). **This is a symptom of a server-side kick decision, not a cause.** It appears in the log one snap before the OOB disconnect flood begins. |
 | `ping` high (>400) | High-ping kick if `sv_maxPing` is set on the server |
 | `silenceMs` large | Server stopped sending packets before the disconnect — network outage or server-side kick |
 | `silenceMs` small | Server sent the disconnect recently — deliberate server action (possibly spurious) |
@@ -171,11 +171,13 @@ whether adding a tighter client-side hitch guard (e.g. 200 ms) when `cl_maxfps`
 is set would reduce transient ping spikes — **but only change this once we
 have log evidence that hitches are the cause**.
 
-> **Note on ping=0 / ping=999 in logs:** When a snapshot arrives late (SNAP LATE)
-> while the safety cap is active, the client-side ping calculation may return 0 ms
-> (same-frame command match) or 999 (no match). These are calculation artefacts,
-> **not** evidence of a server-side negative-ping kick. Check `OOB:DISCONNECT` and
-> `SVCMD:DISCONNECT` events to identify the actual disconnect trigger.
+> **Note on ping=0 in logs:** `ping=0` (same-frame command match) can appear when
+> a snapshot arrives late while the safety cap is active — that specific case is a
+> calculation artefact.  `ping=999` is **not** an artefact: it means
+> `ps.commandTime` has frozen and is a reliable indicator that the server has
+> stopped processing our commands (see §2h).  Check the `cmdTime` field in
+> adjacent SNAP lines — a frozen value confirms the freeze.  Then look for
+> `OOB:DISCONNECT` or `SVCMD:DISCONNECT` to identify the kick mechanism.
 
 #### 2c. QVM cvar intercept side-effects  
 Our engine silently ignores `trap_Cvar_Set("snaps", …)` calls from the cgame
@@ -246,6 +248,38 @@ intercepted and logged.
 to force a client action. Cross-reference with surrounding `SVCMD` entries to
 identify which server command triggered the QVM call.
 
+#### 2h. Server stopped processing our usercmds before kicking (confirmed in captured sessions)
+
+**Confirmed sequence from both netdebug logs:**
+
+1. `ps.commandTime` (`cmdTime` in SNAP line) freezes — server stops stamping
+   our usercmds into the snapshot.
+2. As we send new outgoing packets their `p_serverTime` advances past the
+   frozen `ps.commandTime`. Once all 32 `outPackets` slots are newer, the
+   ping calculation finds no match → `ping=999` in the log.
+3. One snap later (~50 ms), the first OOB disconnect packet arrives
+   (`silenceMs=56–64 ms`). The OOB flood runs at ~125 packets/second.
+4. Game data stops. `cl_timeout` would eventually fire but the server accepts
+   a new connection first.
+
+The jump from normal ping (31 ms) to `ping=999` in a **single snap** is the
+observable fingerprint: it cannot be jitter or a cap artefact — only a frozen
+or reset `ps.commandTime` can exhaust all 32 history slots in one frame.
+
+**What we do not yet know:** what server-side condition causes it to stop
+processing our commands at that moment. Candidates — pending QVM source
+review:
+- `sv_maxPing` kick triggered by a transient period where `usercmd.serverTime`
+  ran ahead of `sv.time` (the earlier `ping=263→247→0` blip in log 2 is a
+  candidate precursor)
+- Per-client auth or reliable-overflow check firing mid-session
+- Something specific to the URT4 game QVM's `ClientThink`
+
+**What to look for:**  
+In a level-2 log: two or more consecutive SNAP lines with the same `cmdTime`
+value, immediately followed by the first `OOB:DISCONNECT`. The `cmdTime` freeze
+precedes `ping=999` by definition; find the freeze to find the trigger moment.
+
 ---
 
 ## Priority reading order for the first log
@@ -254,11 +288,15 @@ identify which server command triggered the QVM call.
 2. Read `reason` — if it contains any server-supplied text, that is the primary clue.
 3. Check `oobIgnored` — if > 0, look for preceding `OOB:DISCONNECT` entries.
 4. Check `silenceMs` — if > 500 ms, there was a network gap before the disconnect.
-5. Check `ping` — note that 999 or 0 can be a calculation artefact, not necessarily a server ping-kick.
-6. Scroll back ~5 seconds to find the last `DROP`, `SNAP:DELTA_*`, or `OOB:PACKET` burst.
-7. Look for any `QVM:SET_INTERCEPTED`, `QVM:SET_BLOCKED`, or `QVM:CONSOLECMD_BLOCKED` events.
-8. Look for `FAST`, `RESET`, or `SVCMD:DISCONNECT` events in the window before disconnect.
-9. At level 2: check `USERINFO:SEND` to see if a mid-session userinfo update preceded the disconnect.
+5. At level 2: scan SNAP lines backwards for a **frozen `cmdTime`** — two or more
+   consecutive snaps with the same value. That is the server-side kick moment.
+   `ping=999` appears in the same snap or the one immediately after.
+6. Check `ping` — `ping=999` confirms `ps.commandTime` froze (§2h); `ping=0` on an
+   isolated snap can be a calculation artefact, ignore it.
+7. Scroll back ~5 seconds to find the last `DROP`, `SNAP:DELTA_*`, or `OOB:PACKET` burst.
+8. Look for any `QVM:SET_INTERCEPTED`, `QVM:SET_BLOCKED`, or `QVM:CONSOLECMD_BLOCKED` events.
+9. Look for `FAST`, `RESET`, or `SVCMD:DISCONNECT` events in the window before disconnect.
+10. At level 2: check `USERINFO:SEND` to see if a mid-session userinfo update preceded the disconnect.
 
 ---
 
@@ -266,9 +304,9 @@ identify which server command triggered the QVM call.
 
 | File | What was added |
 |------|---------------|
-| `code/client/cl_scrn.c` | `SCR_LogConnectInfo`, `SCR_LogServerCmd`, `SCR_LogSnapState`, `SCR_LogTimeout`, `SCR_LogNote`, `SCR_LogPacketDrop`, `SCR_LogCapRelease`, `SCR_LogOOBPacket`, `SCR_LogOOBDisconnect`, `SCR_LogUserinfoSend`, `SCR_OOBIgnoredIncrement`, `SCR_LogDisconnect`; `netMonCapHitsSession`+`netMonOOBIgnoredSession` per-connection counters |
-| `code/client/client.h` | Declarations for all new log functions; `cl_noOOBDisconnect` extern |
-| `code/client/cl_parse.c` | Call sites: `SCR_LogConnectInfo`, `SCR_LogServerCmd`, `SCR_LogDisconnect` (early disconnect), `SCR_LogSnapState`, `SCR_LogPacketDrop`, `SCR_LogNote` × 4 (delta failures + reloverflow); fixed stale "cap will be disabled" comment |
+| `code/client/cl_scrn.c` | `SCR_LogConnectInfo`, `SCR_LogServerCmd`, `SCR_LogSnapState`, `SCR_LogTimeout`, `SCR_LogNote`, `SCR_LogPacketDrop`, `SCR_LogCapRelease`, `SCR_LogOOBPacket`, `SCR_LogOOBDisconnect`, `SCR_LogUserinfoSend`, `SCR_OOBIgnoredIncrement`, `SCR_LogDisconnect`; `netMonCapHitsSession`+`netMonOOBIgnoredSession` per-connection counters; `cmdTime` (`ps.commandTime`) added to `SCR_LogSnapState` output |
+| `code/client/client.h` | Declarations for all new log functions; `cl_noOOBDisconnect` extern; `SCR_LogSnapState` signature updated |
+| `code/client/cl_parse.c` | Call sites: `SCR_LogConnectInfo`, `SCR_LogServerCmd`, `SCR_LogDisconnect` (early disconnect), `SCR_LogSnapState` (now passes `ps.commandTime`), `SCR_LogPacketDrop`, `SCR_LogNote` × 4 (delta failures + reloverflow); fixed stale "cap will be disabled" comment |
 | `code/client/cl_cgame.c` | `SVCMD:DISCONNECT` note for in-band disconnect; `CG_SENDCONSOLECOMMAND` guard (log all, block dangerous); `CG_CVAR_SET` expanded intercept list (`net_qport`, `rate=0`, `net_dropsim`, `cl_packetdelay`, `cl_packetdup`, `cl_timeout`, `in_mouse`, `cl_noOOBDisconnect`) |
 | `code/client/cl_main.c` | `cl_noOOBDisconnect` cvar (`CVAR_ARCHIVE\|CVAR_PROTECTED`); `SCR_LogOOBPacket` at top of `CL_ConnectionlessPacket`; `SCR_LogOOBDisconnect` in OOB disconnect handler; `SCR_LogUserinfoSend` + `WARN:RELWND` in `CL_CheckUserinfo` |
 

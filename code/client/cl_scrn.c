@@ -844,10 +844,10 @@ Called from CL_ParseSnapshot after each accepted snapshot.
 Logs reliable-command sequence state to detect command-buffer flooding.  Level 2.
 ========================
 */
-void SCR_LogSnapState( int snapTime, int ping, int msgSeq,
+void SCR_LogSnapState( int snapTime, int ping, int cmdTime, int msgSeq,
                         int cmdSeq, int relSeq, int relAck ) {
 	qtime_t t;
-	char line[192];
+	char line[224];
 
 	if ( !cl_netlog || cl_netlog->integer < 2 )
 		return;
@@ -855,10 +855,10 @@ void SCR_LogSnapState( int snapTime, int ping, int msgSeq,
 	SCR_OpenNetLog();
 	Com_RealTime( &t );
 	Com_sprintf( line, sizeof(line),
-		"[%02d:%02d:%02d] SNAP  t=%d  ping=%d  msg=%d"
+		"[%02d:%02d:%02d] SNAP  t=%d  ping=%d  cmdTime=%d  msg=%d"
 		"  cmdSeq=%d  relSeq=%d  relAck=%d\n",
 		t.tm_hour, t.tm_min, t.tm_sec,
-		snapTime, ping, msgSeq, cmdSeq, relSeq, relAck );
+		snapTime, ping, cmdTime, msgSeq, cmdSeq, relSeq, relAck );
 	SCR_WriteLog( line );
 }
 

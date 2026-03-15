@@ -352,8 +352,9 @@ static void CL_ParseSnapshot( msg_t *msg ) {
 	cl.snapshots[cl.snap.messageNum & PACKET_MASK] = cl.snap;
 
 	// Log per-snapshot reliable-command state for flood/drift diagnosis (level 2).
-	SCR_LogSnapState( cl.snap.serverTime, cl.snap.ping, cl.snap.messageNum,
-		clc.serverCommandSequence, clc.reliableSequence, clc.reliableAcknowledge );
+	SCR_LogSnapState( cl.snap.serverTime, cl.snap.ping, cl.snap.ps.commandTime,
+		cl.snap.messageNum, clc.serverCommandSequence,
+		clc.reliableSequence, clc.reliableAcknowledge );
 
 	SCR_NetMonitorAddPing( cl.snap.ping );
 
