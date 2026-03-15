@@ -181,12 +181,11 @@ have log evidence that hitches are the cause**.
 
 #### 2c. QVM cvar intercept side-effects  
 Our engine silently ignores `trap_Cvar_Set("snaps", …)` calls from the cgame
-QVM. The URT4 vanilla cgame.qvm almost certainly sets `snaps` once on map load
-to match `sv_fps`. With our fork, `snaps` stays at 60 when the QVM reads it
-back. This is harmless for a 20 Hz server (server clamps delivery to `sv_fps`
-anyway), but if the QVM makes any decision based on the current value of
-`snaps` — for example computing expected snapshot intervals for a timeout check
-— the wrong value could matter.
+QVM. Review of qsource.zip confirms the URT4 cgame only **registers** `snaps`
+— it never calls `trap_Cvar_Set("snaps", …)` directly. Neither captured log
+shows any `QVM:SET_INTERCEPTED` event, confirming this path is not triggered
+in practice against the single populated vanilla server.
+**This scenario is ruled out.**
 
 **What to look for:**  
 `QVM:SET_INTERCEPTED` lines in the log. Note how many times and with what
@@ -250,6 +249,20 @@ identify which server command triggered the QVM call.
 
 #### 2h. Server stopped processing our usercmds before kicking (confirmed in captured sessions)
 
+**Runtime parameters (vanilla server, both sessions):**
+`sv_fps 20` · `snaps 20` · `cl_maxpackets 125` · `cl_packetdup 1–3`
+
+At 125 pps the client sends one outgoing packet every ~8 ms. The 32-slot
+`outPackets` ring therefore covers **32 × 8 ms = 256 ms** of history. With
+`cl_packetdup ≥ 1` every usercmd is delivered in multiple packets, so ordinary
+packet loss cannot exhaust all 32 slots in one server tick — only the server
+*deliberately stopping* `ClientThink` can do that. The ring also constrains
+the `ClientThink` clamping window: at sv_fps 20 each tick is 50 ms, and
+the server QVM clamps incoming usercmd times to a fixed window around
+`level.time` (review of qsource.zip). The allowed client-lead headroom means
+the early-return guard inside `ClientThink` cannot be reached through normal
+play at these rates.
+
 **Confirmed sequence from both netdebug logs:**
 
 1. `ps.commandTime` (`cmdTime` in SNAP line) freezes — server stops stamping
@@ -263,17 +276,42 @@ identify which server command triggered the QVM call.
    a new connection first.
 
 The jump from normal ping (31 ms) to `ping=999` in a **single snap** is the
-observable fingerprint: it cannot be jitter or a cap artefact — only a frozen
-or reset `ps.commandTime` can exhaust all 32 history slots in one frame.
+observable fingerprint. With `cl_packetdup ≥ 1` in effect, jitter or loss
+cannot account for it — it requires the entire 256 ms ring to be exhausted in
+one 50 ms server tick, which is only possible if `ClientThink` was not called
+at all that tick.
 
-**What we do not yet know:** what server-side condition causes it to stop
-processing our commands at that moment. Candidates — pending QVM source
-review:
-- `sv_maxPing` kick triggered by a transient period where `usercmd.serverTime`
-  ran ahead of `sv.time` (the earlier `ping=263→247→0` blip in log 2 is a
-  candidate precursor)
-- Per-client auth or reliable-overflow check firing mid-session
-- Something specific to the URT4 game QVM's `ClientThink`
+**Findings from qsource.zip review:**
+
+- **`sv_maxPing` kick is engine-only.** Review of qsource.zip confirms there
+  is no QVM-level ping-kick logic — `sv_maxPing` is read by the game module
+  solely for stats reporting. Kick enforcement is entirely inside the vanilla
+  server engine (`SV_CalcPings` + engine frame loop), which we do not have
+  source for. Log 1 shows a precursor ping blip of `263 → 247 → 0 → 0 → 0 → 16 ms`
+  approximately 2.7 s before the fatal `ping=999`. Log 2 shows no such blip
+  (pings were a steady 32–40 ms up to the fatal snap), indicating at least
+  two different trigger paths exist across sessions.
+
+- **`ClientThink` early-return guard is a consequence, not the cause.**
+  qsource.zip confirms the server game module stops advancing `commandTime`
+  when no new usercmd time has arrived (early-return guard). At sv_fps 20 /
+  cl_maxpackets 125 this guard is not reachable during normal play. Once the
+  server engine stops routing usercmds to the game module (client is being
+  dropped), `ClientThink` is never called again and `commandTime` stays
+  frozen — the guard is a consequence, not the cause.
+
+- **Auth mid-session drop is a real candidate.** qsource.zip shows the
+  server game module has a dedicated auth-kick path that fires when the auth
+  server sends a rejection or revocation response mid-session. Neither
+  captured log received an `SVCMD:DISCONNECT` before the OOB flood, which is
+  consistent with the server using the OOB path (not the reliable in-band
+  path) for auth kicks. Auth mode appears to be active on the target server.
+
+- **`QVM:CONSOLECMD` button13/14 spam is harmless.** qsource.zip confirms
+  these are zoom-state signals the cgame injects every frame. Buttons 0–15
+  are registered in our engine (`CL_InitInput` in cl_input.c) and correctly mapped to
+  usercmd bits via `CL_CmdButtons`. They should be harmless and are not a
+  disconnect vector. The high volume in level-2 logs is expected and noise.
 
 **What to look for:**  
 In a level-2 log: two or more consecutive SNAP lines with the same `cmdTime`
