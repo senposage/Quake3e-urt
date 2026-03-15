@@ -1599,14 +1599,22 @@ Gated behind the cl_urt43cgPatches bitmask cvar (default 7 = all three enabled):
              (case 1) currently falls through to TR_STATIONARY (VectorCopy only).
              Redirect it to the TR_LINEAR case so entities use velocity-based
              forward extrapolation when the next snapshot is unavailable.
-             Safe because sv_snapshot.c now anchors es->pos.trTime = sv.time for
-             every TR_INTERPOLATE entity: the TR_LINEAR formula returns trBase
-             unchanged during normal snapshot interpolation (dt ≈ 0 at
-             snap.serverTime) and provides correct forward extrapolation when
-             cg.time advances past the last snapshot.  Previously disabled due to
-             stale trTime (BG_PlayerStateToEntityState never writes trTime for
-             TR_INTERPOLATE), which caused (evalTime - 0)/1000 → a huge dt and
-             instant teleportation of all bots and players every frame.
+             Safe because sv_snapshot.c unconditionally anchors pos.trTime to
+             sv.time for every TR_INTERPOLATE client entity (the anchor runs
+             even when sv_smoothClients and sv_extrapolate are both disabled):
+             the TR_LINEAR formula returns trBase unchanged during normal
+             snapshot interpolation (dt ≈ 0 at snap.serverTime) and provides
+             correct forward extrapolation when cg.time advances past the last
+             snapshot.  Previously disabled due to stale trTime
+             (BG_PlayerStateToEntityState never writes trTime for
+             TR_INTERPOLATE), which caused (evalTime - 0)/1000 → a huge dt
+             and instant teleportation of all bots and players every frame.
+             NOTE: the anchor was previously gated behind sv_smoothClients /
+             sv_extrapolate; servers with neither cvar enabled saw weapon and
+             entity sounds play at wrong 3D coordinates (muted / skipped)
+             because player entities were teleported to wrong positions.  The
+             else-branch in sv_snapshot.c (SV_WriteSnapshotToClient) now
+             covers that case.
 
 Target QVM: UrbanTerror 4.3 official binary
   CRC32:            0x1289DB6B
