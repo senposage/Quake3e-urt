@@ -295,7 +295,7 @@ The engine detects server type in `CL_ParseServerInfo()` (the same detection use
 | Situation | Cvar used | Default value |
 |---|---|---|
 | Custom server (`sv_snapshotFps` present in serverinfo) | `cl_urt43cgPatches` | `7` (all three patches) |
-| Vanilla server (`sv_snapshotFps` absent) | `cl_qvmPatchVanilla` | `0` (no patches — safe baseline for A/B testing) |
+| Vanilla server (`sv_snapshotFps` absent) | `cl_qvmPatchVanilla` | `3` (Patches 2+3 — safe on any server; Patch 1/bit2 excluded as it requires server-side trTime anchor) |
 
 The bridge is a `CVAR_TEMP` cvar **`cl_urt43serverIsVanilla`** set to `1` or `0` by `CL_ParseServerInfo()` immediately after `cl.vanillaServer` is determined.  `VM_URT43_CgamePatches()` reads it at VM load time to choose which user cvar to apply.  The TEMP flag ensures it never persists to the config file.
 
@@ -303,15 +303,16 @@ The bridge is a `CVAR_TEMP` cvar **`cl_urt43serverIsVanilla`** set to `1` or `0`
 
 | Bit | Name | What it fixes | Custom server | Vanilla server |
 |---|---|---|---|---|
-| 0 (1) | **Patch 2 — frameInterpolation clamp** | The existing QVM clamp is wrong: lower threshold is `0.1f` (should be `0.0f`) and upper clamped value is `~0.99f` (should be `1.0f`). Fixes two constants at instruction indices `0xa688` and `0xa692`. Safe on any server — no server-side dependency. | ✅ enabled | ⬜ off by default (`cl_qvmPatchVanilla 0`) |
-| 1 (2) | **Patch 3 — nextSnap NULL crash fix** | `CG_InterpolateEntityPosition` calls `CG_Error()` (fatal crash) when `cg.nextSnap == NULL` during lag spikes. Replaces the 5-instruction error path with a `CONST`+`JUMP` early return to the function's `PUSH`+`LEAVE` (instr `0x1594d`). Safe on any server — no server-side dependency. | ✅ enabled | ⬜ off by default (`cl_qvmPatchVanilla 0`) |
+| 0 (1) | **Patch 2 — frameInterpolation clamp** | The existing QVM clamp is wrong: lower threshold is `0.1f` (should be `0.0f`) and upper clamped value is `~0.99f` (should be `1.0f`). Fixes two constants at instruction indices `0xa688` and `0xa692`. Safe on any server — no server-side dependency. | ✅ enabled | ✅ enabled (`cl_qvmPatchVanilla 3`) |
+| 1 (2) | **Patch 3 — nextSnap NULL crash fix** | `CG_InterpolateEntityPosition` calls `CG_Error()` (fatal crash) when `cg.nextSnap == NULL` during lag spikes or on the first rendered frame before a second snapshot arrives. Replaces the 5-instruction error path with a `CONST`+`JUMP` early return to the function's `PUSH`+`LEAVE` (instr `0x1594d`). Safe on any server — no server-side dependency. **Required**: without this patch the game crashes every time a map loads. | ✅ enabled | ✅ enabled (`cl_qvmPatchVanilla 3`) |
 | 2 (4) | **Patch 1 — TR_INTERPOLATE velocity extrapolation** | The `BG_EvaluateTrajectory` switch-table entry for `trType == TR_INTERPOLATE` (case 1, data addr `0xdbb4`) points to the `TR_STATIONARY` handler (VectorCopy only). Redirects it to the `TR_LINEAR` handler (`instr 0x3ab15`) so velocity-based forward extrapolation is used when the next snapshot is unavailable. **Requires server-side `trTime` anchor** — vanilla servers leave `trTime = 0`, causing `(evalTime − 0) / 1000` → enormous `dt` → entity teleportation every frame. Auto-suppressed on vanilla servers via `cl_qvmPatchVanilla`. | ✅ enabled | ❌ unsafe — leave unset |
 
 The function `VM_URT43_CgamePatches()` in `vm.c` prints verbose diagnostic output for every patch attempt (instruction opcodes and values before patching, applied/skipped result) to aid debugging if a future QVM version changes the binary layout.
 
 **Debug output example** — custom server (all patches, `cl_urt43cgPatches 7`):
 ```
-UrT43 cgame patch: CRC=1289DB6B ic=258563 dl=38055548 flags=0x7 (custom server → cl_urt43cgPatches)
+VM_URT43_CgamePatches: entered (CRC=1289DB6B)
+UrT43 cgame patch: CRC=1289DB6B ic=258563 dl=38055548 flags=0x7 (custom server -> cl_urt43cgPatches)
   [Patch2] frameInterpolation clamp:
     [0xa688] op=0x08 val=0x3dcccccd (expect op=0x08 val=0x3dcccccd)
     [0xa692] op=0x08 val=0x3f7d70a4 (expect op=0x08 val=0x3f7d70a4)
@@ -325,16 +326,27 @@ UrT43 cgame patch: CRC=1289DB6B ic=258563 dl=38055548 flags=0x7 (custom server �
 UrT43 cgame patch: applied=0x7 skipped=0x0
 ```
 
-**Debug output example** — vanilla server (no patches by default, `cl_qvmPatchVanilla 0`):
+**Debug output example** — vanilla server (Patches 2+3 by default, `cl_qvmPatchVanilla 3`):
 ```
-UrT43 cgame patch: CRC=1289DB6B ic=258563 dl=38055548 flags=0x0 (vanilla server → cl_qvmPatchVanilla)
-  [Patch2] DISABLED by cvar (bit 0 not set)
-  [Patch3] DISABLED by cvar (bit 1 not set)
+VM_URT43_CgamePatches: entered (CRC=1289DB6B)
+UrT43 cgame patch: CRC=1289DB6B ic=258563 dl=38055548 flags=0x3 (vanilla server -> cl_qvmPatchVanilla)
+  [Patch2] frameInterpolation clamp:
+    ...
+    [Patch2] APPLIED: lower=0.0f upper=1.0f
+  [Patch3] CG_InterpolateEntityPosition null crash:
+    ...
+    [Patch3] APPLIED: CG_Error->early return at instr 0x1594d
   [Patch1] DISABLED by cvar (bit 2 not set)
-UrT43 cgame patch: applied=0x0 skipped=0x0
+UrT43 cgame patch: applied=0x3 skipped=0x0
 ```
 
-To enable Patches 2+3 on vanilla servers for testing: `cl_qvmPatchVanilla 3`
+> **Note:** `cl_urt43serverIsVanilla` is a `CVAR_TEMP` set by `CL_ParseServerInfo` each gamestate.
+> It can be stale (value `1` from a prior vanilla connection) when `CL_InitCGame` is called via
+> `vid_restart` or reconnect paths that skip `CL_ParseGamestate`.  `cl_qvmPatchVanilla 3` ensures
+> Patches 2+3 are applied even in that case, since both are safe on any server.
+
+To disable Patch 2 on vanilla servers: `cl_qvmPatchVanilla 2` (keep Patch3 only).
+To disable all patches on vanilla servers (testing only — will crash): `cl_qvmPatchVanilla 0`.
 
 If the loaded QVM does not match the expected CRC/size, a `DPrintf` warning identifies the actual fingerprint so a new patch entry can be written.
 
