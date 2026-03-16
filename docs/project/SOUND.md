@@ -184,6 +184,46 @@ direction change — the player hears the sound arriving *around the corner* rat
 than straight through the wall.  The old hard-coded radius of 80 u has been
 replaced with the tunable `s_alOccSearchRadius` (default 120 u).
 
+**Multi-hop corridor probing** — when the 8 near-source probes all fail (thick
+wall, or source is deep inside a corridor far from the doorway), the engine casts
+a second pass of two-leg paths:
+
+```
+listener → corridor direction (leg 1) → source (leg 2)
+```
+
+Eight world-space horizontal directions are tested.  Each direction is skipped if
+it points within ~30° of the direct listener→source line (already covered by the
+near-source probes).  The score is the product of both legs' fractions, penalised
+by the ratio `srcDist / pathLen` so that longer detour paths attenuate more than
+short doorway paths.  Only active when `bestFrac < 0.50` and `srcDist > 200 u`.
+
+> **Per-frame budget (`S_AL_MULTIHOP_BUDGET = 8`):** Each multi-hop run casts up to
+> 16 `CM_BoxTrace` calls (8 directions × 2 legs).  To prevent a burst of concurrent
+> sound events (e.g. 32 players firing simultaneously) from stacking hundreds of
+> traces in a single audio tick and starving the OpenAL mixing thread, only the
+> first 8 occluded sources per `s_al_loopFrame` run the full two-hop loop.
+> Subsequent sources in the same frame fall back to the near-source-probe result.
+
+**BSP area connectivity floor** (`s_alOccAreaFloor`) — even when all trace legs
+hit solid geometry, BSP areas that are connected through portal chains (corridors,
+tunnels, doorways) still let sound through at a minimum level.  The floor fades
+linearly with distance:
+
+| Area relationship | Floor gain |
+|---|---|
+| Same area | `0.50 × distScale` |
+| Connected (via portals) | `s_alOccAreaFloor × distScale` (default 0.30) |
+| Disconnected / sealed | none — fully blocked |
+
+where `distScale = 1 − (dist − refDist) / (maxDist − refDist)` clamped to [0, 1].
+
+> **Important:** when the BSP floor wins (raises `bestFrac`), `acousticPos` is reset
+> to `srcOrigin`.  The floor represents connectivity through the BSP graph, not a
+> specific gap position, so leaving a stale multi-hop waypoint in `acousticPos`
+> would project it to `srcLen` distance in an arbitrary corridor direction — causing
+> the apparent source to jump to a bogus direction each trace tick.
+
 ### EFX Environmental Effects (`ALC_EXT_EFX`)
 
 All EFX entry points are loaded via `alcGetProcAddress(device, ...)` at runtime — no link-time EFX dependency.
@@ -281,6 +321,7 @@ Background music is streamed via a dedicated AL source and `S_AL_MUSIC_BUFFERS` 
 | `s_alOccHFFloor` | `0.50` | Floor of `AL_LOWPASS_GAINHF` (high-frequency content) for fully-blocked sources [0–1]. `1.0` = no HF filtering (only volume changes). `0.0` = bass-only thud through walls. Default 0.50 preserves enough weapon crack to remain recognisable. Old formula `occ²` reached near-zero HF even at moderate occlusion — this was the main cause of the "tinny pop" corner transition. |
 | `s_alOccPosBlend` | `0.40` | How far to redirect the HRTF apparent-source position towards the nearest acoustic gap when a source is occluded [0–1]. The gap position is **projected to the source's actual distance** so the value directly controls an angular shift: at 0.40 a doorway 45° off the direct line gives ~16° apparent HRTF direction change. `0.0` = always true source position (no gap hint). `1.0` = full redirect to gap direction. Default 0.40 (raised from 0.25 — the projection makes larger values perceptually meaningful). |
 | `s_alOccSearchRadius` | `120` | Tangent-plane probe radius (game units) used to find the nearest acoustic gap when a source is occluded. Default 120 ≈ URT door half-width. Increase to 160–200 for wide doorways or thick pillars; decrease for tighter gap sensitivity. |
+| `s_alOccAreaFloor` | `0.30` | Minimum occlusion gain for BSP-connected areas when all trace legs are blocked [0–1]. Applied as `floor × distScale` so it fades naturally with distance. Set to `0` to disable the BSP connectivity floor entirely. |
 | `s_alDebugOcc` | `0` | Print per-source occlusion state each frame. Each occluded source shows entity, distance, trace target, smoothed gain, GAIN and GAINHF values. Use to identify which sounds are being filtered and by how much. Not archived. |
 | `s_alDebugPlayback` | `0` | Playback diagnostics for isolating audio quality issues. **`1`** = log every **PREEMPT** (sound cut short by a new sound on the same channel) and every **rate-mismatch** at load time (file Hz ≠ device Hz, which forces the internal resampler). **`2`** = also log every natural completion. Each line shows sound name, samples played / total, % consumed, file rate, and device rate. Use `1` to determine whether the DE-50 boom is being **truncated** (preempt line, low %) or **degraded** by the resampler (rate-mismatch lines at registration). Not archived — set before loading a map to catch registration warnings. |
 
@@ -561,9 +602,11 @@ transitions without per-frame CM_BoxTrace overhead:
 
 | Phase | Runs | What it does |
 |---|---|---|
-| **1 — Trace** | On interval (see table) | Runs `CM_BoxTrace`, updates `occlusionTarget` + `acousticOffset` |
+| **1 — Trace** | On interval (see table) | Runs `CM_BoxTrace`, updates `occlusionTarget`; IIR-blends `acousticOffset` toward new gap (step 0.35) |
 | **2 — Smooth** | Every frame | IIR-blends `occlusionGain` toward target. Opening: step 0.30 (fast snap on LOS). Closing: step 0.18 (gradual muffle, no pop) |
 | **3 — Apply** | Every frame | Writes position + filter using smoothed values. Detaches filter entirely (`AL_FILTER_NULL`) when `occ > 0.98` to eliminate biquad phase-shift coloration on clear sources |
+
+> **Note:** `acousticOffset` is IIR-blended (not hard-assigned) because direct assignment caused the apparent HRTF source direction to jump abruptly at every trace tick (4–8 frames apart for medium/far sources).  These sudden direction discontinuities were audible as directional crackling.  Blending at step 0.35 — matching the gain-opening speed — ensures position and loudness fade together.
 
 | Source distance | Trace interval | Rationale |
 |---|---|---|
@@ -631,6 +674,91 @@ DMA-matching mechanisms prevent degradation:
    `numSrc / 8` = 12 sources, matching DMA's `WORLD_ENTITY_MAX_CHANNELS`.
 3. **Per-entity dedup**: same sfx on the same entity within 20 ms (100 ms for world
    impacts) is suppressed, matching DMA's dedup window.
+
+#### Occlusion bugs fixed (multi-hop / BSP floor)
+
+Three bugs were introduced by the multi-hop corridor probing and BSP area
+connectivity floor features.  All three produced distorted crackling audio that
+scaled with concurrent sound events and was directionally sensitive:
+
+---
+
+**Bug 1 — Stale multi-hop waypoint projected after BSP floor win**
+
+*Symptom:* Apparent source direction changed randomly each trace tick (4–8 frames
+apart for medium/far sources) even though the source had not moved.  Directionally
+sensitive because the stale direction corresponded to one of the 8 fixed
+`hopDirs[]` world-space corridor axes.
+
+*Root cause:* When the BSP connectivity floor raised `bestFrac`, `acousticPos` was
+left pointing at the last multi-hop waypoint.  Multi-hop waypoints are near the
+*listener* (at `leg1Dist × 0.95` along a corridor axis).  The projection step
+then scaled that listener-proximal position to `srcLen` distance, placing the
+apparent source in a completely wrong direction.
+
+*Fix:* When the floor wins (`bestFrac < floor → bestFrac = floor`), reset
+`acousticPos = srcOrigin`.  The BSP graph confirms connectivity but provides no
+specific gap geometry to redirect toward.
+
+---
+
+**Bug 2 — `acousticOffset` hard-assigned at trace interval, causing HRTF direction jumps**
+
+*Symptom:* Crackling specifically at medium and far range (interval 4 or 8 frames).
+Direction of crackling rotated with the listener's yaw — confirming HRTF artefact.
+Setting `s_alOccAreaFloor 0` had limited effect (the floor reset helped, but
+abrupt snaps remained when the best multi-hop axis changed between ticks).
+
+*Root cause:* `occlusionGain` was already IIR-blended, but `acousticOffset` was
+written directly (`offset = pBlend × (newPos − origin)`).  When the highest-scoring
+`hopDirs[]` direction changed between trace ticks — e.g. switching from the
+`+X` corridor to the `+Y` corridor — the offset snapped to an entirely different
+vector.  OpenAL's HRTF processes this as a sudden spatial discontinuity and
+produces an audible click/crackle in the convolution output.
+
+*Fix:* IIR-blend `acousticOffset` toward its new target at step 0.35 (matching the
+gain-opening step) so that position and loudness transitions happen together
+without discontinuities:
+
+```c
+s_al_src[i].acousticOffset[k] +=
+    (newOffset[k] - s_al_src[i].acousticOffset[k]) * 0.35f;
+```
+
+---
+
+**Bug 3 — Unbounded multi-hop trace burst (32-player servers)**
+
+*Symptom:* Crackling that scaled with the number of concurrent sound events — most
+noticeable on full 32-player servers during heavy firefights.  Not purely
+directional but correlated with volley events (all 32 players firing
+simultaneously).
+
+*Root cause:* Every new sound source starts with `occlusionTick = 0`, so all
+sources created in the same frame trace together on the same tick.  Each
+multi-hop run casts up to **16 `CM_BoxTrace` calls** (8 directions × 2 legs).
+With 30+ new weapon sounds arriving in one game tick this produces 400–500 traces
+in a single audio frame, starving the OpenAL mixing thread's buffer fill deadline.
+
+*Fix:* Per-frame multi-hop budget (`S_AL_MULTIHOP_BUDGET = 8`, reset each
+`s_al_loopFrame`).  The first 8 occluded sources per frame run the full two-hop
+loop.  Additional sources in the same frame skip multi-hop and use the
+near-source-probe result only, capping worst-case traces at
+`8 × 16 + N × 9 = 128 + 9N` (near-source still runs for all N sources):
+
+```c
+if (s_al_multihop_frame != s_al_loopFrame) {
+    s_al_multihop_frame = s_al_loopFrame;
+    s_al_multihop_used  = 0;
+}
+if (bestFrac < 0.5f && srcDist > 200.f
+        && s_al_multihop_used < S_AL_MULTIHOP_BUDGET) {
+    s_al_multihop_used++;
+    /* ... two-hop loop ... */
+}
+```
+
+---
 
 #### Own-player audio (DMA comparison)
 
@@ -815,6 +943,7 @@ When a source is occluded, the engine searches for the nearest acoustic gap usin
 |---|---|---|---|
 | `s_alOccPosBlend` | 0.40 | 0–1 | Fraction of HRTF redirect toward nearest acoustic gap |
 | `s_alOccSearchRadius` | 120 | 20–400 | Probe radius (u) for gap search — increase for wide doorways/pillars |
+| `s_alOccAreaFloor` | 0.30 | 0–1 | BSP-connectivity minimum gain for connected areas (fades with distance). Set `0` to disable |
 
 #### Debug workflow (`s_alDebugReverb`)
 
