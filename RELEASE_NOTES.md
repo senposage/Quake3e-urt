@@ -73,3 +73,38 @@
 - New **`release.yml`** GitHub Actions workflow creates versioned release assets automatically on tag push.
 - CI streamlined to **Windows x64 + Linux x86/x64** for release builds; ARM moved to a manual workflow.
 - Both **client and dedicated-server binaries** are published as separate artifacts.
+
+---
+
+## Bug Fixes
+
+### 🔊 Audio: Directionally sensitive crackling on busy servers
+
+Three bugs in the multi-hop corridor probing and BSP area connectivity floor
+features introduced distorted crackling audio.  The corruption was directionally
+sensitive, scaled with the number of concurrent sound events, and was most
+prominent on 32-player vanilla servers during heavy firefights.
+
+- **BSP floor left stale multi-hop waypoint in `acousticPos`** — when the
+  connectivity floor raised the occlusion fraction, `acousticPos` still held the
+  last multi-hop waypoint (which is near the *listener*, not the source).  The
+  projection step then placed the apparent source in a completely wrong direction
+  that changed every trace tick.  Fixed: reset `acousticPos` to `srcOrigin` when
+  the BSP floor wins so no gap-redirect is applied.
+
+- **`acousticOffset` hard-assigned, causing abrupt HRTF direction jumps** —
+  `occlusionGain` was already IIR-smoothed but `acousticOffset` (the HRTF
+  redirect) was written directly at each trace tick (every 4–8 frames for
+  medium/far sources).  When the best multi-hop corridor axis changed between
+  ticks the offset snapped to a new direction, producing a spatial discontinuity
+  that the HRTF convolution rendered as a directional click/crackle.  Fixed:
+  IIR-blend `acousticOffset` toward the new target at step 0.35, matching the
+  gain-opening rate.
+
+- **Unbounded multi-hop trace burst with many concurrent sounds** — every new
+  source starts with `occlusionTick = 0` so all sources born in the same frame
+  trace together.  Each multi-hop run casts up to 16 `CM_BoxTrace` calls; with
+  30+ weapon sounds in one tick this stacked 400–500 traces in a single audio
+  frame, starving the OpenAL buffer fill thread.  Fixed: per-frame budget of 8
+  multi-hop runs (`S_AL_MULTIHOP_BUDGET`), reset each `s_al_loopFrame`.  Sources
+  beyond the budget skip the two-hop loop and use the near-source-probe result.
