@@ -11,3 +11,6 @@ UrbanTerror42_Source/
 build/
 *.o
 qvmrnd/
+
+# Debug log files
+netdebug_*.log

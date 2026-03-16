@@ -1,7 +1,8 @@
 # Sporadic Vanilla-Server Disconnect — Debug Guide
 
-> **Status:** OOB-disconnect guard added; bad-faith server protections in place; awaiting further real session logs.
-> **Relates to:** PR #68 (serverTime safety cap), ongoing sporadics on the single populated vanilla URT4 server.
+> **Status:** OOB-disconnect guard added; bad-faith server protections in place; two real sessions captured and analysed.
+> **Confirmed:** The vanilla URT4 server stops processing client usercmds mid-game and then floods ~125 OOB disconnect packets/second for 15–23 seconds while continuing to send snapshots. Root server-side trigger is still unknown.
+> **Relates to:** PR #68 (serverTime safety cap), PR #109/110 (OOB guard fix + cmdTime logging), ongoing sporadics on the single populated vanilla URT4 server.
 
 ---
 
@@ -311,4 +312,133 @@ precedes `ping=999` by definition; find the freeze to find the trigger moment.
 | `code/client/cl_parse.c` | Call sites: `SCR_LogConnectInfo`, `SCR_LogServerCmd`, `SCR_LogDisconnect` (early disconnect), `SCR_LogSnapState` (now passes `ps.commandTime`), `SCR_LogPacketDrop`, `SCR_LogNote` × 4 (delta failures + reloverflow); fixed stale "cap will be disabled" comment |
 | `code/client/cl_cgame.c` | `SVCMD:DISCONNECT` note for in-band disconnect; `CG_SENDCONSOLECOMMAND` guard (log all, block dangerous); `CG_CVAR_SET` expanded intercept list (`net_qport`, `rate=0`, `net_dropsim`, `cl_packetdelay`, `cl_packetdup`, `cl_timeout`, `in_mouse`, `cl_noOOBDisconnect`) |
 | `code/client/cl_main.c` | `cl_noOOBDisconnect` cvar (`CVAR_ARCHIVE\|CVAR_PROTECTED`); `SCR_LogOOBPacket` at top of `CL_ConnectionlessPacket`; `SCR_LogOOBDisconnect` in OOB disconnect handler; `SCR_LogUserinfoSend` + `WARN:RELWND` in `CL_CheckUserinfo` |
+
+---
+
+## Research history
+
+Chronological record of every PR and investigation step related to the sporadics.
+
+| PR / commit | Date | What was done |
+|-------------|------|---------------|
+| **PR #68** `fix-vanilla-server-connection-issues` | 2026-03-12 | First attack: added a universal `cl.serverTime` safety cap (clamps `cl.serverTime` to not exceed the last received `snap.serverTime + cap_margin`) for vanilla-server connections. Also added the first version of the OOB disconnect handler in `cl_main.c`: when an OOB `disconnect` arrives, immediately call `Com_Error(ERR_SERVERDISCONNECT)`. This stopped the immediate-disconnect symptom but the sporadics continued. |
+| **PR #71** `increase-servertime-cap` | 2026-03-13 | Cap margin raised from 1 ms to 2 ms, then to a proportional `snapshotMsec / 4` margin (2–8 ms depending on `sv_fps`). Added a 2-second backstop: if silence exceeds 2 s, release the cap entirely. Documented in `CLIENT.md`. |
+| **PR #107** `standby-before-next-steps` | 2026-03-14 | Added full `cl_netlog 1/2` infrastructure (`SCR_Log*` family of functions), the per-connection counters, `DISCONNECT` trace block logged to both console and file, and the initial version of this NETDEBUG.md. Goal: capture real session data. |
+| **PR #108** `analyze-svcmd-logs` | 2026-03-14 | Analysed SVCMD logs from earlier test sessions. Ruled out in-band `SVCMD:DISCONNECT` as the cause — the server never sent a reliable-command disconnect. Confirmed pattern is always OOB. |
+| **PR #109** `fix-oob-guard-issue` | 2026-03-15 | **Critical bug fix**: the OOB disconnect handler was returning `qfalse` after ignoring the packet. `CL_PacketEvent` only calls `clc.lastPacketTime = cls.realtime` when the handler returns `qtrue`. With `qfalse` the `cl_timeout` clock started from the last *in-band* snapshot, so the client would timeout ~30 s after the OOB flood began regardless of `cl_noOOBDisconnect`. Fixed to return `qtrue` so OOB packets count as liveness evidence. |
+| **PR #110** `debug-random-disconnect-issue` | 2026-03-15 | Added `cmdTime` (`ps.commandTime`) to the `SNAP` log line. Corrected the documentation: `ping=999` is a **symptom** of `ps.commandTime` freezing, not a calculation artefact. Added the §2h section (server stops processing usercmds) as a confirmed scenario. Analysed the two captured `netdebug_20260314_*.log` files — see §Captured session analysis below. |
+
+---
+
+## Captured session analysis (2026-03-14)
+
+Two back-to-back sessions were captured with `cl_netlog 2` on the same vanilla URT4 server
+(`|RFA| RisenFromAshes.us`) on 2026-03-14. Both ended in spontaneous disconnects.
+Log files: `netdebug_20260314_202819.log` (session 1) and `netdebug_20260314_203024.log` (session 2).
+
+### Session metrics
+
+| Metric | Session 1 | Session 2 |
+|--------|-----------|-----------|
+| Log file | `netdebug_20260314_202819.log` | `netdebug_20260314_203024.log` |
+| Wall-clock start | 20:28:19 | 20:30:24 |
+| Server snapshot Hz | 20 Hz (snapshotMsec=50) | 20 Hz (snapshotMsec=50) |
+| Server type | vanilla=1 forbidsAdaptive=1 | vanilla=1 forbidsAdaptive=1 |
+| Auth response | `no account` | `no account` |
+| Last good ping | 31 ms (t=102850, msg=1972) | 32 ms (t=227750, msg=1985) |
+| Ping jump to 999 | msg=1972→1973 (single snap) | msg=1985→1986 (single snap) |
+| cmdSeq frozen at | 406 (relSeq=relAck=17) | 352 (relSeq=relAck=9) |
+| Server time at kick | svrT≈104842 ms into server uptime | svrT≈229742 ms into server uptime |
+| Gap last-snap → first OOB silenceMs | 56 ms | 64 ms |
+| OOB flood rate | ~120 pkt/s | ~124 pkt/s |
+| Total OOB packets until reconnect | 2743 | 1974 |
+| OOB flood duration | ~22.8 s | ~15.9 s |
+| Session duration before kick | ~98.6 s | ~99.3 s |
+| Notable precursor | Ping blip 263→247→0 ms at t≈100100 ms (~2.75 s before kick) | None observed |
+
+### Confirmed sequence in both sessions
+
+```
+1.  Normal gameplay: ping 31–40 ms, snapshots at 20 Hz, no drops, no delta errors.
+
+2.  [cmdTime freeze]  ps.commandTime stops advancing.  The client continues sending
+    usercmds but the server stamps none of them into the snapshot.
+
+3.  [ping → 999]  Over the next ~50 ms the 32 outPacket history slots all advance
+    past the frozen ps.commandTime.  On the first snap where no slot matches,
+    ping reads as 999.  Transition is instantaneous — one snap goes from 31 ms
+    to 999 ms with no intermediate values.
+
+4.  [OOB flood begins ~56–64 ms after the last snapshot]  The server sends OOB
+    `disconnect` packets at ~120–124 pkt/s while simultaneously continuing to
+    send game snapshots (snapshots carry on arriving for a few more frames).
+
+5.  [Snapshots stop]  In-band game data ceases entirely.  The OOB flood keeps
+    arriving; `cl_noOOBDisconnect 1` keeps it ignored.  The client keeps sending
+    outgoing packets at normal rate (~125 pkt/s, ~3100 B/s).
+
+6.  [Reconnect]  The server's previous session slot is freed (presumably when the
+    server accepts the client's reconnect attempt), the CONNECT event fires, and
+    a new session begins on the same server without any user action.
+```
+
+### Key observations
+
+**1. Single-snap ping transition is the fingerprint.**  
+In both sessions, ping goes from 31–32 ms to 999 in exactly one snapshot interval
+(50 ms).  The only mechanism that exhausts all 32 `outPackets` history slots that
+fast is a frozen `ps.commandTime`.  Jitter, cap artefacts, or packet loss cannot
+do this — they produce intermediate values.
+
+**2. Server kicked while game data was still flowing.**  
+`silenceMs=56–64 ms` at `sessionCount=1` (the *first* OOB packet of the flood)
+means the last in-band packet from the server was only ~60 ms before the OOB
+arrived at the client.  The last snapshot's server time (`snapT=104850` / `snapT=229750`)
+matches the server's clock at kick time (`svrT=104842` / `svrT=229742`) to within
+8 ms.  The server decided to kick while it was still actively sending snapshots —
+this is a deliberate server-side kick, not a network timeout or server crash.
+
+**3. `cl_noOOBDisconnect 1` worked as intended.**  
+Without the guard the client would have disconnected immediately at `sessionCount=1`.
+Instead it stayed connected, the OOB flood was absorbed, and the server eventually
+freed the slot.  The client reconnected automatically.  No user action was needed.
+
+**4. Reliable window was clean at kick time.**  
+`relSeq=relAck` in both sessions (window=0) rules out a reliable-command overflow
+on the *client→server* path as the trigger.
+
+**5. No in-band `SVCMD:DISCONNECT` in either session.**  
+The server never sent a reliable `disconnect` command.  The kick mechanism is
+entirely OOB.  There is no server-supplied reason string.
+
+**6. No DROP, no SNAP:DELTA_OLD, no TIMEOUT, no FAST/RESET in either session.**  
+The connection was clean from the network perspective.  The kick was not caused by
+packet loss or a timing artefact.
+
+**7. Ping blip precursor in session 1 (unconfirmed link).**  
+Two snapshots at t=100100 and t=100150 showed ping=263→247 ms, then immediately
+dropped to ping=0 (a calculation artefact after the safety cap absorbed the jump),
+2.75 seconds before the fatal ping=999 at t=102900.  This transient could indicate
+the server briefly stopped or delayed stamping a usercmd, then resumed — possibly
+the same condition that then triggered the full freeze 2.75 s later.  Session 2
+had no such precursor.
+
+### What the server-side trigger could be (still unknown)
+
+The server stops processing our usercmds precisely at the kick moment.  Candidates
+for what causes it in the URT4 game QVM `ClientThink`:
+
+| Candidate | Evidence for | Evidence against |
+|-----------|-------------|-----------------|
+| `sv_maxPing` kick on transient high ping | Ping blip precursor in session 1 (263→247 ms is within sv_maxPing range on many servers) | Session 2 had no precursor; sv_maxPing is usually 150–200 ms |
+| Per-client auth gate (no account = kick after N seconds) | Both sessions lasted ~99 s, a suspiciously consistent duration; auth reports `no account` on both connects | No `SVCMD:DISCONNECT` reason string; other `no account` clients remain connected longer on the same server |
+| Reliable-overflow on server→client path | Not visible on our side — we only see client→server reliable window | Would normally produce `reason="reliable overflow"` in SVCMD:DISCONNECT |
+| URT4 QVM per-session inactivity or anti-cheat timer | Could fire at ~99 s regardless of activity | No evidence; client was actively sending inputs throughout |
+| Server-side usercmd `serverTime` ahead of `sv.time` | Safety cap prevents our `cl.serverTime` from running ahead, but the gap is small | The cap margin is only 2–8 ms; unlikely to cause a kick |
+
+**Next step:** Obtain or decompile the vanilla URT4 `qagame.qvm` to audit
+`ClientThink` / `ClientEndFrame` for any ~99-second or auth-triggered kick logic.
+Cross-reference with the `[auth] no account` handling path.
+
+---
 
