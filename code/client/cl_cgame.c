@@ -377,6 +377,39 @@ rescan:
 	}
 #endif
 
+	// Intercept the UrT QVM "cv <cvarname>" probe.
+	//
+	// The QVM sends this reliable server command to request the value of a
+	// named cvar from every connected client.  We block the command (return
+	// qfalse so it never reaches the cgame) when the requested cvar:
+	//
+	//   1. Does not exist — prevents the server from detecting our custom
+	//      features by probing for their cvar names.
+	//   2. Is CVAR_PRIVATE — these are internal-only cvars that the QVM
+	//      cannot read anyway, but we also suppress the command itself so
+	//      the server cannot even infer existence from a missing reply.
+	//   3. Is CVAR_PROTECTED — we don't want the server reading cvars that
+	//      are protected from VM modification (e.g. cl_guid, cl_timeNudge).
+	//
+	// All blocked probes are logged for audit.
+	if ( !strcmp( cmd, "cv" ) ) {
+		if ( argc >= 2 ) {
+			const char *cvarName = Cmd_Argv( 1 );
+			unsigned flags = Cvar_Flags( cvarName );
+
+			if ( flags == CVAR_NONEXISTENT
+				|| ( flags & ( CVAR_PROTECTED | CVAR_PRIVATE ) ) ) {
+				SCR_LogNote( "SVCMD:CV_BLOCKED",
+					va( "cv probe blocked: \"%s\" (flags=0x%x)", cvarName, flags ) );
+				return qfalse;
+			}
+		} else {
+			// malformed — no cvar name supplied
+			SCR_LogNote( "SVCMD:CV_BLOCKED", "cv probe blocked: no cvar name" );
+			return qfalse;
+		}
+	}
+
 	// we may want to put a "connect to other server" command here
 
 	// cgame can now act on the command
@@ -988,7 +1021,7 @@ void CL_InitCGame( void ) {
 	//
 	// cl_urt43cgPatches  — used when connected to our custom server (default 7)
 	// cl_qvmPatchVanilla — used when connected to a vanilla server   (default 3)
-	Cvar_Get( "cl_urt43cgPatches", "7", CVAR_ARCHIVE | CVAR_PROTECTED );
+	Cvar_Get( "cl_urt43cgPatches", "7", CVAR_ARCHIVE | CVAR_PROTECTED | CVAR_PRIVATE );
 	Cvar_SetDescription2( "cl_urt43cgPatches",
 		"QVM patch bitmask applied when connected to a custom (Quake3e-urt) server. "
 		"Bit 0 = Patch2 (frameInterpolation clamp), "
@@ -996,7 +1029,7 @@ void CL_InitCGame( void ) {
 		"bit 2 = Patch1 (TR_LINEAR velocity extrapolation — requires server-side trTime anchor). "
 		"Default 7 (all patches). "
 		"On vanilla servers cl_qvmPatchVanilla is used instead." );
-	Cvar_Get( "cl_qvmPatchVanilla", "3", CVAR_ARCHIVE );
+	Cvar_Get( "cl_qvmPatchVanilla", "3", CVAR_ARCHIVE | CVAR_PRIVATE );
 	Cvar_SetDescription2( "cl_qvmPatchVanilla",
 		"QVM patch bitmask applied when connected to a vanilla UrT server "
 		"(server lacks sv_snapshotFps — no server-side trTime anchor for TR_LINEAR). "
