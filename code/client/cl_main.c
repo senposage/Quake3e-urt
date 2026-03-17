@@ -3113,6 +3113,20 @@ static qboolean CL_ConnectionlessPacket( const netadr_t *from, msg_t *msg ) {
 
 #ifdef USE_AUTH
 	if ( strstr(c, "AUTH:CL") ) {
+		// Only process AUTH:CL packets from the resolved authorizeServer address.
+		// Any other sender — including a malicious game server — is silently
+		// dropped and logged.  This prevents a rogue server from triggering
+		// the UI QVM's UI_AUTHSERVER_PACKET handler (which has UI_CVAR_SET
+		// access) on behalf of an untrusted source.
+		if ( cls.authorizeServer.type == NA_BAD
+			|| !NET_CompareBaseAdr( from, &cls.authorizeServer ) ) {
+			SCR_LogNote( "AUTH:CL_REJECTED",
+				va( "AUTH:CL from unexpected source %s — ignored",
+					NET_AdrToStringwPort( from ) ) );
+			return qfalse;
+		}
+		SCR_LogNote( "AUTH:CL_ACCEPTED",
+			va( "AUTH:CL from %s", NET_AdrToStringwPort( from ) ) );
 		Com_Printf( "AUTH:CL packet received from %s\n", NET_AdrToStringwPort( from ) );
 		VM_Call( uivm, 1, UI_AUTHSERVER_PACKET, from );
 		return qfalse;
