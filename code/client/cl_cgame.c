@@ -27,6 +27,10 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 
 extern	botlib_export_t	*botlib_export;
 
+// Cvars whose values are spoofed when the server QVM reads them via
+// CG_CVAR_VARIABLESTRINGBUFFER, to avoid leaking the custom engine identity.
+#define SPOOF_CVAR_VERSION "version"
+
 //extern qboolean loadCamera(const char *name);
 //extern void startCamera(int time);
 //extern qboolean getCameraInfo(int time, vec3_t *origin, vec3_t *angles);
@@ -565,6 +569,15 @@ static intptr_t CL_CgameSystemCalls( intptr_t *args ) {
 		return 0;
 	case CG_CVAR_VARIABLESTRINGBUFFER:
 		VM_CHECKBOUNDS( cgvm, args[2], args[3] );
+		// Intercept "version" queries so the server QVM cannot fingerprint our
+		// custom engine build name.  Return the same vanilla URT identifier that
+		// the "client" userinfo key also presents.
+		if ( Q_stricmp( (const char *)VMA(1), SPOOF_CVAR_VERSION ) == 0 ) {
+			Q_strncpyz( VMA(2), URT_VANILLA_BUILD, args[3] );
+			SCR_LogNote( "QVM:CVAR_SPOOF",
+				"\"version\" read by QVM — returned vanilla URT build name" );
+			return 0;
+		}
 		Cvar_VariableStringBufferSafe( VMA(1), VMA(2), args[3], CVAR_PRIVATE );
 		return 0;
 	case CG_ARGC:

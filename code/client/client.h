@@ -39,6 +39,12 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 #define QKEY_FILE "qkey"
 #define QKEY_SIZE 2048
 
+// Vanilla URT (ioquake3) build name sent in the "client" userinfo key and
+// returned to the server QVM when it queries the "version" cvar.  Using the
+// standard "ioq3-urt" prefix ensures servers that check the build name accept
+// us as a legitimate client rather than flagging us as a custom engine.
+#define URT_VANILLA_BUILD "ioq3-urt 1.1 " PLATFORM_STRING " " __DATE__
+
 #define	RETRANSMIT_TIMEOUT	3000	// time between connection packet retransmits
 
 // snapshots are a view of the server at a given time

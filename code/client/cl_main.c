@@ -2558,8 +2558,11 @@ static void CL_CheckForResend( void ) {
 		notOverflowed &= Info_SetValueForKey_s( info, MAX_USERINFO_LENGTH, "challenge",
 			va( "%i", clc.challenge ) );
 
-		// Do NOT send the "client" key: broadcasting our custom engine version
-		// allows servers to detect that we are using a non-standard client.
+		// Send the "client" key with the vanilla URT build name so that servers
+		// performing build-name checks accept us as a standard client.  Using the
+		// real Q3_VERSION ("FTWGL") here would fingerprint our custom engine.
+		// This is an optional key so it will not trigger an oversize warning.
+		Info_SetValueForKey_s( info, MAX_USERINFO_LENGTH, "client", URT_VANILLA_BUILD );
 
 		if ( !notOverflowed ) {
 			Com_Printf( S_COLOR_YELLOW "WARNING: oversize userinfo, you might be not able to join remote server!\n" );
