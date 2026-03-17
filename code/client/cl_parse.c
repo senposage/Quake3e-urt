@@ -599,7 +599,7 @@ static void CL_ParseServerInfo( void )
 	// (vanilla server) as the effective QVM patch bitmask.  Set it here, after
 	// cl.vanillaServer is determined, so it is always current before the cgame
 	// VM is created.  The cvar is CVAR_TEMP so it never persists to config.
-	Cvar_Get( "cl_urt43serverIsVanilla", "0", CVAR_TEMP );
+	Cvar_Get( "cl_urt43serverIsVanilla", "0", CVAR_TEMP | CVAR_PRIVATE );
 	Cvar_SetValue( "cl_urt43serverIsVanilla", cl.vanillaServer ? 1 : 0 );
 	Com_DPrintf( "CL_ParseServerInfo: vanillaServer=%d (sv_snapshotFps='%s') "
 		"-> cl_urt43serverIsVanilla=%d, QVM patches will use %s\n",

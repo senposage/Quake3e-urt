@@ -1566,22 +1566,22 @@ void SCR_Init( void ) {
 	cl_graphscale = Cvar_Get ("graphscale", "1", CVAR_CHEAT);
 	cl_graphshift = Cvar_Get ("graphshift", "0", CVAR_CHEAT);
 
-	cl_netgraph = Cvar_Get( "cl_netgraph", "0", 0 );
+	cl_netgraph = Cvar_Get( "cl_netgraph", "0", CVAR_PRIVATE );
 	Cvar_SetDescription( cl_netgraph,
 		"Show the net monitor overlay.\n"
 		"0 = off, 1 = on\n"
 		"Default: 0" );
 
-	cl_netgraph_x = Cvar_Get( "cl_netgraph_x", "460", 0 );
+	cl_netgraph_x = Cvar_Get( "cl_netgraph_x", "460", CVAR_PRIVATE );
 	Cvar_SetDescription( cl_netgraph_x, "Net monitor X position in virtual 640x480 coords.\nDefault: 460" );
 
-	cl_netgraph_y = Cvar_Get( "cl_netgraph_y", "4", 0 );
+	cl_netgraph_y = Cvar_Get( "cl_netgraph_y", "4", CVAR_PRIVATE );
 	Cvar_SetDescription( cl_netgraph_y, "Net monitor Y position in virtual 640x480 coords.\nDefault: 4" );
 
-	cl_netgraph_scale = Cvar_Get( "cl_netgraph_scale", "1.0", 0 );
+	cl_netgraph_scale = Cvar_Get( "cl_netgraph_scale", "1.0", CVAR_PRIVATE );
 	Cvar_SetDescription( cl_netgraph_scale, "Net monitor text/box scale multiplier.\nDefault: 1.0" );
 
-	cl_netlog = Cvar_Get( "cl_netlog", "0", 0 );
+	cl_netlog = Cvar_Get( "cl_netlog", "0", CVAR_PRIVATE );
 	Cvar_SetDescription( cl_netlog,
 		"Net debug session logging to netdebug_YYYYMMDD_HHMMSS.log.\n"
 		"0 = off\n"
@@ -1591,7 +1591,7 @@ void SCR_Init( void ) {
 		"Note: DISCONNECT context is always printed to console regardless of this setting.\n"
 		"Default: 0" );
 
-	cl_laggotannounce = Cvar_Get( "cl_laggotannounce", "1", 0 );
+	cl_laggotannounce = Cvar_Get( "cl_laggotannounce", "1", CVAR_PRIVATE );
 	Cvar_SetDescription( cl_laggotannounce,
 		"Auto-announce network issues to the server via say.\n"
 		"0 = off, 1 = on\n"

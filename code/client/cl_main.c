@@ -68,6 +68,7 @@ cvar_t	*cl_serverStatusResendTime;
 cvar_t	*cl_lanForcePackets;
 
 cvar_t	*cl_guidServerUniq;
+static cvar_t *cl_guidOverride;
 
 #ifdef USE_AUTH
 cvar_t	*cl_auth_engine;
@@ -1325,11 +1326,20 @@ void CL_ClearState( void ) {
 ====================
 CL_UpdateGUID
 
-update cl_guid using QKEY_FILE and optional prefix
+update cl_guid using QKEY_FILE and optional prefix.
+If the user has run "guid_regen", cl_guidOverride holds a random GUID
+that overrides the QKEY-derived one for the duration of the config.
 ====================
 */
 static void CL_UpdateGUID( const char *prefix, int prefix_len )
 {
+	// User-chosen random override takes priority over the QKEY-derived value.
+	// cl_guidOverride is CVAR_PRIVATE so the QVM cannot read it.
+	if ( cl_guidOverride && cl_guidOverride->string[0] != '\0' ) {
+		Cvar_Set( "cl_guid", cl_guidOverride->string );
+		return;
+	}
+
 #ifdef USE_Q3KEY
 	fileHandle_t f;
 	int len;
@@ -1345,6 +1355,39 @@ static void CL_UpdateGUID( const char *prefix, int prefix_len )
 #else
 	Cvar_Set( "cl_guid", Com_MD5Buf( &cl_cdkey[0], sizeof(cl_cdkey), prefix, prefix_len));
 #endif
+}
+
+
+/*
+====================
+CL_GuidRegen_f
+
+Generate a fresh random GUID and store it as the active cl_guid.
+The result is saved in cl_guidOverride (CVAR_ARCHIVE|CVAR_PRIVATE) so it
+survives map changes and server reconnects within the same config; clear
+cl_guidOverride (or delete the config) to revert to the QKEY-derived GUID.
+====================
+*/
+static void CL_GuidRegen_f( void ) {
+	static const char hexdigits[] = "0123456789abcdef";
+	byte raw[16];
+	char hex[33];
+	int i;
+
+	Com_RandomBytes( raw, sizeof( raw ) );
+	for ( i = 0; i < 16; i++ ) {
+		hex[i * 2]     = hexdigits[(raw[i] >> 4) & 0xf];
+		hex[i * 2 + 1] = hexdigits[ raw[i]       & 0xf];
+	}
+	hex[32] = '\0';
+
+	Cvar_Set( "cl_guidOverride", hex );
+	CL_UpdateGUID( NULL, 0 );
+
+	Com_Printf( "GUID randomized. New cl_guid: %s\n"
+		"Run 'guid_regen' again to rotate. "
+		"Clear cl_guidOverride or delete your config to revert to QKEY-derived GUID.\n",
+		Cvar_VariableString( "cl_guid" ) );
 }
 
 
@@ -4106,23 +4149,23 @@ static void CL_InitGLimp_Cvars( void )
 	Cvar_CheckRange( r_noborder, "0", "1", CV_INTEGER );
 	Cvar_SetDescription( r_noborder, "Setting to 1 will remove window borders and title bar in windowed mode, hold ALT to drag & drop it with opened console." );
 
-	r_mode = Cvar_Get( "r_mode", "-2", CVAR_ARCHIVE | CVAR_LATCH );
+	r_mode = Cvar_Get( "r_mode", "-2", CVAR_ARCHIVE | CVAR_LATCH | CVAR_PRIVATE );
 	Cvar_CheckRange( r_mode, "-2", va( "%i", s_numVidModes-1 ), CV_INTEGER );
 	Cvar_SetDescription( r_mode, "Set video mode:\n -2 - use current desktop resolution\n -1 - use \\r_customWidth and \\r_customHeight\n  0..N - enter \\modelist for details" );
 #ifdef _DEBUG
-	r_modeFullscreen = Cvar_Get( "r_modeFullscreen", "", CVAR_ARCHIVE | CVAR_LATCH );
+	r_modeFullscreen = Cvar_Get( "r_modeFullscreen", "", CVAR_ARCHIVE | CVAR_LATCH | CVAR_PRIVATE );
 #else
-	r_modeFullscreen = Cvar_Get( "r_modeFullscreen", "-2", CVAR_ARCHIVE | CVAR_LATCH );
+	r_modeFullscreen = Cvar_Get( "r_modeFullscreen", "-2", CVAR_ARCHIVE | CVAR_LATCH | CVAR_PRIVATE );
 #endif
 	Cvar_SetDescription( r_modeFullscreen, "Dedicated fullscreen mode, set to \"\" to use \\r_mode in all cases." );
-	r_fullscreen = Cvar_Get( "r_fullscreen", "1", CVAR_ARCHIVE | CVAR_LATCH );
+	r_fullscreen = Cvar_Get( "r_fullscreen", "1", CVAR_ARCHIVE | CVAR_LATCH | CVAR_PRIVATE );
 	Cvar_SetDescription( r_fullscreen, "Fullscreen mode. Set to 0 for windowed mode." );
 	r_customPixelAspect = Cvar_Get( "r_customPixelAspect", "1", CVAR_ARCHIVE_ND | CVAR_LATCH );
 	Cvar_SetDescription( r_customPixelAspect, "Enables custom aspect of the screen, with \\r_mode -1." );
-	r_customwidth = Cvar_Get( "r_customWidth", "1600", CVAR_ARCHIVE | CVAR_LATCH );
+	r_customwidth = Cvar_Get( "r_customWidth", "1600", CVAR_ARCHIVE | CVAR_LATCH | CVAR_PRIVATE );
 	Cvar_CheckRange( r_customwidth, "4", NULL, CV_INTEGER );
 	Cvar_SetDescription( r_customwidth, "Custom width to use with \\r_mode -1." );
-	r_customheight = Cvar_Get( "r_customHeight", "1024", CVAR_ARCHIVE | CVAR_LATCH );
+	r_customheight = Cvar_Get( "r_customHeight", "1024", CVAR_ARCHIVE | CVAR_LATCH | CVAR_PRIVATE );
 	Cvar_CheckRange( r_customheight, "4", NULL, CV_INTEGER );
 	Cvar_SetDescription( r_customheight, "Custom height to use with \\r_mode -1." );
 
@@ -4247,7 +4290,7 @@ void CL_Init( void ) {
 	Cvar_CheckRange( cl_timeout, "5", NULL, CV_INTEGER );
 	Cvar_SetDescription( cl_timeout, "Duration of receiving nothing from server for client to decide it must be disconnected (in seconds)." );
 
-	cl_noOOBDisconnect = Cvar_Get( "cl_noOOBDisconnect", "1", CVAR_ARCHIVE | CVAR_PROTECTED );
+	cl_noOOBDisconnect = Cvar_Get( "cl_noOOBDisconnect", "1", CVAR_ARCHIVE | CVAR_PROTECTED | CVAR_PRIVATE );
 	Cvar_CheckRange( cl_noOOBDisconnect, "0", "1", CV_INTEGER );
 	Cvar_SetDescription( cl_noOOBDisconnect,
 		"Ignore connectionless 'disconnect' packets sent out-of-band by the server.\n"
@@ -4260,7 +4303,7 @@ void CL_Init( void ) {
 	cl_autoNudge = Cvar_Get( "cl_autoNudge", "0", CVAR_TEMP );
 	Cvar_CheckRange( cl_autoNudge, "0", "1", CV_FLOAT );
 	Cvar_SetDescription( cl_autoNudge, "Automatic time nudge that uses your average ping as the time nudge, values:\n  0 - use fixed \\cl_timeNudge\n (0..1] - factor of median average ping to use as timenudge\n" );
-	cl_timeNudge = Cvar_Get( "cl_timeNudge", "0", CVAR_PROTECTED );
+	cl_timeNudge = Cvar_Get( "cl_timeNudge", "0", CVAR_PROTECTED | CVAR_PRIVATE );
 	Cvar_CheckRange( cl_timeNudge, "-30", "30", CV_INTEGER );
 	Cvar_SetDescription( cl_timeNudge, "Allows more or less latency to be added in the interest of better smoothness or better responsiveness." );
 
@@ -4268,7 +4311,7 @@ void CL_Init( void ) {
 	Cvar_SetDescription( cl_shownet, "Toggle the display of current network status." );
 	cl_showTimeDelta = Cvar_Get ("cl_showTimeDelta", "0", CVAR_TEMP );
 	Cvar_SetDescription( cl_showTimeDelta, "Prints the time delta of each packet to the console (the time delta between server updates)." );
-	cl_adaptiveTiming = Cvar_Get ("cl_adaptiveTiming", "1", CVAR_ARCHIVE );
+	cl_adaptiveTiming = Cvar_Get ("cl_adaptiveTiming", "1", CVAR_ARCHIVE | CVAR_PRIVATE );
 	Cvar_SetDescription( cl_adaptiveTiming, "Scale time sync thresholds with snapshotMsec. 0=vanilla, 1=scaled (default). Automatically disabled on vanilla servers. Can also be overridden by the server via sv_allowClientAdaptiveTiming." );
 	rcon_client_password = Cvar_Get ("rconPassword", "", CVAR_TEMP );
 	Cvar_SetDescription( rcon_client_password, "Sets a remote console password so clients may change server settings without direct access to the server console." );
@@ -4338,7 +4381,7 @@ void CL_Init( void ) {
 	cl_lanForcePackets = Cvar_Get( "cl_lanForcePackets", "1", CVAR_ARCHIVE_ND );
 	Cvar_SetDescription( cl_lanForcePackets, "Bypass \\cl_maxpackets for LAN games, send packets every frame." );
 
-	cl_guidServerUniq = Cvar_Get( "cl_guidServerUniq", "1", CVAR_ARCHIVE_ND );
+	cl_guidServerUniq = Cvar_Get( "cl_guidServerUniq", "1", CVAR_ARCHIVE_ND | CVAR_PRIVATE );
 	Cvar_SetDescription( cl_guidServerUniq, "Makes cl_guid unique for each server." );
 
 	cl_dlURL = Cvar_Get( "cl_dlURL", "http://urt.li/q3ut4", CVAR_ARCHIVE_ND );
@@ -4440,6 +4483,18 @@ void CL_Init( void ) {
 	CL_GenerateQKey();
 #endif
 	Cvar_Get( "cl_guid", "", CVAR_USERINFO | CVAR_ROM | CVAR_PROTECTED );
+
+	// cl_guidOverride: when non-empty holds a user-generated random GUID that
+	// supersedes the QKEY-derived value.  CVAR_ARCHIVE so it survives restarts;
+	// CVAR_PRIVATE so the QVM cannot probe for it.
+	cl_guidOverride = Cvar_Get( "cl_guidOverride", "", CVAR_ARCHIVE | CVAR_PRIVATE );
+	Cvar_SetDescription( cl_guidOverride,
+		"Stores a user-generated random GUID set by 'guid_regen'.\n"
+		"While non-empty this value is used instead of the QKEY-derived cl_guid.\n"
+		"Clear this cvar (or delete your config) to revert to the QKEY-derived GUID." );
+
+	Cmd_AddCommand( "guid_regen", CL_GuidRegen_f );
+
 	CL_UpdateGUID( NULL, 0 );
 
 	Com_Printf( "----- Client Initialization Complete -----\n" );
