@@ -76,6 +76,10 @@ cvar_t	*cl_auth;
 cvar_t	*authc;
 cvar_t	*authl;
 cvar_t	*cl_authSecure;
+// Lazily-resolved address of the URT auth server (authserver.urbanterror.info).
+// NOTE: this is NOT cls.authorizeServer — that is the old Q3 cdkey-authorize
+// server (authorize.urbanterror.info) and is completely unrelated to URT auth.
+static netadr_t cl_urtAuthServer;
 #endif
 
 cvar_t	*cl_dlURL;
@@ -3116,14 +3120,35 @@ static qboolean CL_ConnectionlessPacket( const netadr_t *from, msg_t *msg ) {
 #ifdef USE_AUTH
 	if ( strstr(c, "AUTH:CL") ) {
 		// When cl_authSecure is enabled, only process AUTH:CL packets from
-		// the resolved authorizeServer address.  Any other sender —
-		// including a malicious game server — is dropped and logged.
-		// This prevents a rogue server from triggering the UI QVM's
-		// UI_AUTHSERVER_PACKET handler (which has UI_CVAR_SET access)
-		// on behalf of an untrusted source.
+		// authserver.urbanterror.info.  Any other sender — including a
+		// malicious game server — is dropped and logged.  This prevents a
+		// rogue server from triggering the UI QVM's UI_AUTHSERVER_PACKET
+		// handler (which has UI_CVAR_SET access) on behalf of an untrusted
+		// source.
+		// NOTE: cls.authorizeServer is the Q3 cdkey-authorize server
+		// (authorize.urbanterror.info) — that is NOT the URT auth server and
+		// must not be used here.
 		if ( cl_authSecure && cl_authSecure->integer ) {
-			if ( cls.authorizeServer.type == NA_BAD
-				|| !NET_CompareBaseAdr( from, &cls.authorizeServer ) ) {
+			if ( cl_urtAuthServer.type == NA_BAD ) {
+				// Resolution failed at init time; attempt once more in case
+				// DNS was temporarily unavailable, but do not retry on every
+				// packet — use a static flag to try at most once here.
+				static qboolean retried = qfalse;
+				if ( retried ) {
+					Com_DPrintf( "AUTH:CL — auth server address still unresolved, dropping\n" );
+					return qfalse;
+				}
+				retried = qtrue;
+				if ( !NET_StringToAdr( AUTH_SERVER_NAME, &cl_urtAuthServer, NA_IP ) ) {
+					Com_Printf( "AUTH:CL — could not resolve %s, dropping packet\n",
+						AUTH_SERVER_NAME );
+					cl_urtAuthServer.type = NA_BAD;
+					return qfalse;
+				}
+				Com_DPrintf( "AUTH:CL — resolved %s to %s (deferred)\n",
+					AUTH_SERVER_NAME, NET_AdrToString( &cl_urtAuthServer ) );
+			}
+			if ( !NET_CompareBaseAdr( from, &cl_urtAuthServer ) ) {
 				SCR_LogNote( "AUTH:CL_REJECTED",
 					va( "AUTH:CL from unexpected source %s — ignored",
 						NET_AdrToStringwPort( from ) ) );
@@ -4428,11 +4453,24 @@ void CL_Init( void ) {
 	Cvar_CheckRange( cl_authSecure, "0", "1", CV_INTEGER );
 	Cvar_SetDescription( cl_authSecure,
 		"Harden against the closed-binary UrT auth/UI QVM:\n"
-		"  1 (default) — validate AUTH:CL packet source; block the auth QVM\n"
+		"  1 (default) — validate AUTH:CL packet source against\n"
+		"                authserver.urbanterror.info; block the auth QVM\n"
 		"                from forcing or reading protected/private CVars and\n"
 		"                from running dangerous console commands.\n"
 		"  0           — vanilla behaviour (disable all hardening).\n"
 		"Set to 0 only if you fully trust the server's auth module." );
+
+	// Pre-resolve the URT auth server address so the packet handler does not
+	// need to do a blocking DNS lookup on the hot path.
+	// NOTE: authserver.urbanterror.info is NOT the Q3 cdkey-authorize server
+	// (authorize.urbanterror.info / cls.authorizeServer) — they are unrelated.
+	if ( NET_StringToAdr( AUTH_SERVER_NAME, &cl_urtAuthServer, NA_IP ) ) {
+		Com_DPrintf( "AUTH: resolved %s to %s\n",
+			AUTH_SERVER_NAME, NET_AdrToString( &cl_urtAuthServer ) );
+	} else {
+		Com_Printf( S_COLOR_YELLOW "WARNING: could not resolve %s — AUTH:CL source "
+			"validation will be retried on first packet\n", AUTH_SERVER_NAME );
+	}
 #endif
 
 	// userinfo

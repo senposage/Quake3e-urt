@@ -364,6 +364,10 @@ extern const int demo_protocols[];
 #ifndef PORT_AUTHORIZE
 #define	PORT_AUTHORIZE		27952
 #endif
+#ifdef USE_AUTH
+// The URT player-auth server is distinct from the Q3 authorize server above.
+#define AUTH_SERVER_NAME	"authserver.urbanterror.info"
+#endif
 #else
 #define	UPDATE_SERVER_NAME	"update.quake3arena.com"
 #ifndef MASTER_SERVER_NAME
