@@ -971,11 +971,22 @@ static alSfxRec_t *S_AL_AllocSfx( void )
  *   the click artefacts common in URT's abruptly-starting 22 kHz assets.
  * · The output is divided by wsum (sum of applied weights) so that DC gain is
  *   exactly 1.0 everywhere, including near the buffer edges.
+ *
+ * Polyphase fast-path
+ * -------------------
+ * The original per-sample sin() call caused 15-20 second map-load stalls.
+ * S_AL_ResamplePCM now builds a polyphase filter table (S_AL_RESAMPLE_PHASES
+ * rows × nTaps columns) once at the start of the call using sin().  The main
+ * resampling loop then does only float multiply-adds against the pre-computed
+ * table — no transcendental functions — giving ~180× less sin() work for a
+ * typical 2-second sound and reducing map-load resampling time from seconds
+ * to milliseconds.
  * =========================================================================
  */
-#define S_AL_SINC_HALF_TAPS  24     /* kernel half-width (input samples); 24 → ~74 dB */
-#define S_AL_KAISER_BETA     6.0    /* Kaiser β for ~74 dB stopband attenuation       */
-#define S_AL_KAISER_LUT_N    512    /* Kaiser window LUT resolution                   */
+#define S_AL_SINC_HALF_TAPS   24    /* kernel half-width (input samples); 24 → ~74 dB */
+#define S_AL_KAISER_BETA      6.0   /* Kaiser β for ~74 dB stopband attenuation       */
+#define S_AL_KAISER_LUT_N     512   /* Kaiser window LUT resolution                   */
+#define S_AL_RESAMPLE_PHASES  512   /* polyphase table phase count; 512 → <0.001-sample phase error */
 
 /* Pre-computed Kaiser window lookup table.  Index 0 = centre (gain=1), index
  * S_AL_KAISER_LUT_N-1 = edge (gain≈0).  Populated once by S_AL_InitKaiserLUT. */
@@ -1031,13 +1042,29 @@ static float S_AL_KaiserWindow( double norm )
  * Returns a Z_Malloc'd array of (*outSamplesOut × inChannels) shorts.
  * The caller must Z_Free the returned pointer.
  * Returns NULL on invalid arguments or allocation failure.
+ *
+ * Performance
+ * -----------
+ * The original naive implementation called sin() for every tap of every
+ * output sample, causing 15-20 second map-load stalls on modern hardware.
+ *
+ * This implementation pre-computes a polyphase filter table of
+ * S_AL_RESAMPLE_PHASES × nTaps float coefficients at the start of the call.
+ * The table is built with sin() (one call per cell), but that cost is
+ * negligible compared to the saved per-sample-per-tap sin() calls.  The
+ * main resampling loop then does only float multiply-adds — no transcendental
+ * functions.  For a 2-second 22 050 Hz → 48 000 Hz sound this reduces the
+ * per-file work from ~4.6 M sin() calls to ~25 K (a 180× reduction), cutting
+ * total map-load resampling time from seconds to milliseconds.
  */
 static short *S_AL_ResamplePCM( const short *in, int inSamples, int inChannels,
                                  int inRate,  int outRate,  int *outSamplesOut )
 {
     double  step, fc, winHalf;
-    int     outN, i, k, ch;
+    int     outN, nTaps, tapMin, i, j, ch;
     short  *out;
+    float  *phaseCoeffs; /* [S_AL_RESAMPLE_PHASES * nTaps] pre-computed kernel  */
+    float  *phaseWsum;   /* [S_AL_RESAMPLE_PHASES]          sum of each phase    */
 
     if (!in || inSamples <= 0 || inChannels <= 0 ||
             inRate <= 0 || outRate <= 0 || !outSamplesOut)
@@ -1046,14 +1073,11 @@ static short *S_AL_ResamplePCM( const short *in, int inSamples, int inChannels,
     outN = (int)((double)inSamples * outRate / inRate + 0.5);
     if (outN <= 0) return NULL;
 
-    out = (short *)Z_Malloc(outN * inChannels * (int)sizeof(short));
-    if (!out) return NULL;
-
-    /* Advance in the input per output sample. */
+    /* Advance in the input domain per output sample. */
     step = (double)inRate / outRate;
 
     /* Anti-aliasing cutoff in normalised-input-rate units.
-     * Upsampling: fc = 0.5 (full source bandwidth).
+     * Upsampling: fc = 0.5 (full source bandwidth preserved).
      * Downsampling: fc = outRate/(2·inRate) (cut at output Nyquist). */
     fc = (step > 1.0) ? 0.5 / step : 0.5;
 
@@ -1063,46 +1087,103 @@ static short *S_AL_ResamplePCM( const short *in, int inSamples, int inChannels,
         ? (double)S_AL_SINC_HALF_TAPS * step
         : (double)S_AL_SINC_HALF_TAPS;
 
-    for (i = 0; i < outN; i++) {
-        double t   = i * step;                        /* position in input sample space */
-        int    kLo = (int)floor(t - winHalf) + 1;
-        int    kHi = (int)floor(t + winHalf);
+    /* Polyphase table layout
+     * ----------------------
+     * For each output sample at input position t = i*step, let
+     *   iFloor = (int)t,  frac = t - iFloor.
+     * Tap j (0 … nTaps-1) reads input sample iFloor + tapMin + j, where
+     *   tapMin = -ceil(winHalf).
+     * The phase index p = round(frac * S_AL_RESAMPLE_PHASES) selects the
+     * pre-computed row phaseCoeffs[p * nTaps … +nTaps-1].
+     * phaseWsum[p] = sum of that row (used for DC-gain normalisation).       */
+    tapMin = -(int)ceil(winHalf);
+    nTaps  = 2 * (int)ceil(winHalf) + 1;
 
-        for (ch = 0; ch < inChannels; ch++) {
-            double sum = 0.0, wsum = 0.0;
-            for (k = kLo; k <= kHi; k++) {
-                double dt, norm, sinc_arg, sinc_v, w, coeff;
-                if (k < 0 || k >= inSamples) continue;   /* zero-pad at edges */
+    phaseCoeffs = (float *)Z_Malloc(S_AL_RESAMPLE_PHASES * nTaps * sizeof(float));
+    phaseWsum   = (float *)Z_Malloc(S_AL_RESAMPLE_PHASES * sizeof(float));
+    if (!phaseCoeffs || !phaseWsum) {
+        if (phaseCoeffs) Z_Free(phaseCoeffs);
+        if (phaseWsum)   Z_Free(phaseWsum);
+        return NULL;
+    }
 
-                dt   = t - k;
-                norm = (dt < 0.0 ? -dt : dt) / winHalf;  /* normalised [0, 1) */
-                if (norm >= 1.0) continue;
-
-                /* Kaiser window */
-                w = (double)S_AL_KaiserWindow(norm);
-
-                /* Windowed sinc: h(dt) = 2·fc · sinc(2·fc·dt) · w */
-                sinc_arg = dt * (2.0 * fc);
-                sinc_v   = (fabs(sinc_arg) < 1e-10)
+    /* Build the polyphase table — sin() calls happen only here, once. */
+    for (i = 0; i < S_AL_RESAMPLE_PHASES; i++) {
+        double frac = (double)i / S_AL_RESAMPLE_PHASES;
+        float  wsum = 0.0f;
+        for (j = 0; j < nTaps; j++) {
+            /* dt: distance from the fractional input position to tap j's sample */
+            double dt      = frac - (double)(tapMin + j);
+            double normAbs = (dt < 0.0 ? -dt : dt) / winHalf;
+            float  coeff   = 0.0f;
+            if (normAbs < 1.0) {
+                double w        = (double)S_AL_KaiserWindow(normAbs);
+                double sinc_arg = dt * (2.0 * fc);
+                double sinc_v   = (fabs(sinc_arg) < 1e-10)
                     ? 1.0
                     : sin(M_PI * sinc_arg) / (M_PI * sinc_arg);
-
-                coeff  = sinc_v * w * (2.0 * fc);
-                sum   += in[k * inChannels + ch] * coeff;
-                wsum  += coeff;
+                coeff = (float)(sinc_v * w * (2.0 * fc));
             }
+            phaseCoeffs[i * nTaps + j] = coeff;
+            wsum += coeff;
+        }
+        phaseWsum[i] = wsum;
+    }
 
-            /* Divide by wsum so DC gain = 1.0 even near buffer edges. */
-            if (wsum > 1e-10) sum /= wsum;
+    out = (short *)Z_Malloc(outN * inChannels * (int)sizeof(short));
+    if (!out) {
+        Z_Free(phaseCoeffs);
+        Z_Free(phaseWsum);
+        return NULL;
+    }
 
-            {
-                int clampedSample = (int)(sum + (sum < 0.0 ? -0.5 : 0.5));
-                out[i * inChannels + ch] =
-                    (short)(clampedSample < -32768 ? -32768 : clampedSample > 32767 ? 32767 : clampedSample);
-            }
+    /* Fast resampling loop — float multiply-add only, no sin() calls. */
+    for (i = 0; i < outN; i++) {
+        double        t      = (double)i * step;
+        int           iFloor = (int)t;        /* floor(t); t is always >= 0 */
+        double        frac   = t - (double)iFloor;
+        int           pIdx   = (int)(frac * (double)S_AL_RESAMPLE_PHASES + 0.5);
+        int           kBase  = iFloor + tapMin;
+        int           jLo, jHi;
+        const float  *coeffs;
+        float         wsumNorm;
+
+        if (pIdx >= S_AL_RESAMPLE_PHASES) pIdx = S_AL_RESAMPLE_PHASES - 1;
+        coeffs = phaseCoeffs + pIdx * nTaps;
+
+        /* Clamp tap range to valid input indices (zero-padding outside). */
+        jLo = (kBase < 0)          ? -kBase              : 0;
+        jHi = (kBase + nTaps > inSamples) ? inSamples - kBase : nTaps;
+        if (jHi < jLo) jHi = jLo;   /* entirely outside buffer → silence */
+
+        /* DC-gain normalisation weight for this output sample.
+         * Interior samples reuse the pre-summed value; edge samples
+         * recompute the partial sum for only the in-bounds taps. */
+        if (jLo == 0 && jHi == nTaps) {
+            wsumNorm = phaseWsum[pIdx];   /* fast path: all taps in bounds */
+        } else {
+            wsumNorm = 0.0f;
+            for (j = jLo; j < jHi; j++)
+                wsumNorm += coeffs[j];
+        }
+
+        for (ch = 0; ch < inChannels; ch++) {
+            float sum = 0.0f;
+            int   s;
+
+            for (j = jLo; j < jHi; j++)
+                sum += (float)in[(kBase + j) * inChannels + ch] * coeffs[j];
+
+            if (wsumNorm > 1e-10f) sum /= wsumNorm;
+
+            s = (int)(sum + (sum < 0.0f ? -0.5f : 0.5f));
+            out[i * inChannels + ch] =
+                (short)(s < -32768 ? -32768 : s > 32767 ? 32767 : s);
         }
     }
 
+    Z_Free(phaseCoeffs);
+    Z_Free(phaseWsum);
     *outSamplesOut = outN;
     return out;
 }
