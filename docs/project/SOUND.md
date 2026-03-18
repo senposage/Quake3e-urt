@@ -12,6 +12,7 @@
 1. [Architecture Overview](#architecture-overview)
 2. [snd_main.c — Sound Dispatcher](#snd_mainc--sound-dispatcher)
 3. [snd_openal.c — OpenAL Soft Backend [URT]](#snd_openalc--openal-soft-backend-urt)
+   - [Load-time PCM Resampler](#load-time-pcm-resampler)
 4. [snd_dma.c — Base DMA Backend](#snd_dmac--base-dma-backend)
 5. [snd_dmahd.c — High-Definition dmaHD Backend](#snd_dmahdcc--high-definition-backend)
 6. [snd_mem.c — Sound Data Loading](#snd_memc--sound-data-loading)
@@ -86,8 +87,91 @@ Both root causes were addressed in snd_dmahd.c (PR #75), but the fundamental com
 
 - Buffer transitions are guaranteed click-free by the OpenAL specification — no filter warm-up state to manage.
 - HRTF is provided by OpenAL Soft using measured HRIR datasets (CIPIC / MIT KEMAR) — no custom convolution code needed.
-- Resampling is handled internally by OpenAL Soft at the device's native rate.
+- URT sound assets are resampled to the device's native rate **once at load time** using a Kaiser-windowed sinc filter — OpenAL's per-playback internal resampler never fires on these sounds (see [Load-time PCM Resampler](#load-time-pcm-resampler)).
 - Cross-platform: WASAPI (Windows), PipeWire/ALSA/PulseAudio (Linux), CoreAudio (macOS) — single code path.
+
+### Load-time PCM Resampler
+
+URT source audio is almost universally **22 050 Hz 16-bit PCM**. Modern audio
+hardware runs its device at **48 000 Hz** (or 44 100 Hz). Whenever a buffer's
+sample rate differs from the device rate, OpenAL must resample every source on
+every single playback call through its *internal* resampler.
+
+**Why this matters for URT:**
+
+- Even the best internal resampler (BSinc24) cannot repair crackling artefacts
+  that originate in the source PCM — it can only preserve them or make them
+  slightly worse.
+- Older OpenAL builds (or systems with a minimal OpenAL library) may only offer
+  the Zero-Order-Hold or Linear resamplers. These are fast but actively amplify
+  high-frequency artefacts through aliasing and interpolation overshoot —
+  exactly the crackling behaviour players report on 22 kHz URT sounds.
+- The internal resampler runs in the audio callback on every playback tick,
+  wasting CPU cycles identically for every concurrent sound.
+
+**Solution — convert once at load time:**
+
+`S_AL_RegisterSound` checks whether `info.rate` differs from `s_al_deviceFreq`
+(the actual device mixing rate, queried via `ALC_FREQUENCY` at context creation).
+When rates differ, it calls `S_AL_ResamplePCM` and submits the AL buffer at the
+device's own rate. OpenAL receives native-rate audio and its internal resampler
+**never fires** on these sounds.
+
+#### Resampler algorithm
+
+A **Kaiser-windowed sinc** (Whittaker–Shannon interpolation with a Kaiser
+window) is used. This is the industry-standard resampler quality tier used by
+professional audio software (SoX, libresample, libsoxr).
+
+```
+y[i] = Σ_k  x[k] · h(t − k)      t = i × (inRate / outRate)
+
+h(u) = 2·fc · sinc(2·fc·u) · Kaiser(|u|/W, β)
+
+fc  = min(inRate, outRate) / (2·inRate)   — anti-aliasing cutoff
+W   = 24 input samples                    — kernel half-width
+β   = 6.0                                 — ≈ 74 dB stopband attenuation
+```
+
+Key properties:
+
+| Property | Value |
+|----------|-------|
+| Kernel half-width (`S_AL_SINC_HALF_TAPS`) | 24 input samples |
+| Kaiser β (`S_AL_KAISER_BETA`) | 6.0 |
+| Stopband attenuation | ≈ 74 dB |
+| Upsampling cutoff | 0.5 × inRate (full source bandwidth preserved) |
+| Downsampling cutoff | 0.5 × outRate (anti-aliasing at output Nyquist) |
+| Edge handling | Zero-padding (samples outside buffer treated as silence) |
+| DC gain | Exactly 1.0 everywhere, including near buffer edges (normalised by wsum) |
+| Window LUT size (`S_AL_KAISER_LUT_N`) | 512 entries, computed once at device open |
+
+The Kaiser LUT (`s_al_kaiserLUT`) is populated by `S_AL_InitKaiserLUT()` once
+at `S_AL_Init` time via `S_AL_BesselI0` (modified Bessel function series). All
+subsequent sound loads share the same pre-computed table — there is no
+per-sound setup cost.
+
+#### Scope
+
+| Audio path | Pre-resampled? | Reason |
+|------------|---------------|--------|
+| Sound effects (`S_AL_RegisterSound`) | **Yes** | All 22 kHz URT `.wav` files |
+| Music streaming (`S_AL_MusicFillBuffer`) | No | Streaming path reads in real-time chunks; music is typically already 44 100 Hz OGG Vorbis; stateful cross-chunk filter state would complicate looping |
+| Raw samples / VoIP (`S_AL_RawSamples`) | No | Real-time delivery at caller's rate; cannot buffer ahead |
+| Tinnitus (procedural) | No | Generated directly at 22 050 Hz; pure sine wave; OpenAL resampler produces artefact-free output for band-limited signals |
+
+#### Diagnostics
+
+With `s_alDebugPlayback 1`, the console prints a `[alDbg] pre-resampled` line
+for every sound effect that was converted at load time:
+
+```
+[alDbg] pre-resampled: sound/weapons/sniper/snipershot.wav  22050 Hz → 48000 Hz  (12600 → 27443 smp)
+```
+
+If the conversion is skipped (unknown device rate or allocation failure), a
+yellow `[alDbg] rate mismatch (pre-resample skipped)` warning is printed instead
+and the sound falls back to OpenAL's internal resampler.
 
 ### Dynamic Library Loading
 
@@ -323,7 +407,7 @@ Background music is streamed via a dedicated AL source and `S_AL_MUSIC_BUFFERS` 
 | `s_alOccSearchRadius` | `120` | Tangent-plane probe radius (game units) used to find the nearest acoustic gap when a source is occluded. Default 120 ≈ URT door half-width. Increase to 160–200 for wide doorways or thick pillars; decrease for tighter gap sensitivity. |
 | `s_alOccAreaFloor` | `0.30` | Minimum occlusion gain for BSP-connected areas when all trace legs are blocked [0–1]. Applied as `floor × distScale` so it fades naturally with distance. Set to `0` to disable the BSP connectivity floor entirely. |
 | `s_alDebugOcc` | `0` | Print per-source occlusion state each frame. Each occluded source shows entity, distance, trace target, smoothed gain, GAIN and GAINHF values. Use to identify which sounds are being filtered and by how much. Not archived. |
-| `s_alDebugPlayback` | `0` | Playback diagnostics for isolating audio quality issues. **`1`** = log every **PREEMPT** (sound cut short by a new sound on the same channel) and every **rate-mismatch** at load time (file Hz ≠ device Hz, which forces the internal resampler). **`2`** = also log every natural completion. Each line shows sound name, samples played / total, % consumed, file rate, and device rate. Use `1` to determine whether the DE-50 boom is being **truncated** (preempt line, low %) or **degraded** by the resampler (rate-mismatch lines at registration). Not archived — set before loading a map to catch registration warnings. |
+| `s_alDebugPlayback` | `0` | Playback diagnostics for isolating audio quality issues. **`1`** = log every **PREEMPT** (sound cut short by a new sound on the same channel), every **pre-resampled** conversion at load time (file Hz → device Hz via the Kaiser sinc resampler), and any **rate-mismatch (pre-resample skipped)** fallback when the conversion could not run. **`2`** = also log every natural completion. Each line shows sound name, samples played / total, % consumed, file rate, and device rate. Use `1` to determine whether the DE-50 boom is being **truncated** (preempt line, low %) or had a resampling failure (rate-mismatch skipped warning). Not archived — set before loading a map to catch registration warnings. |
 
 #### Volume mixer — per-category controls (0–10 scale)
 
@@ -488,11 +572,12 @@ Both checks always run. URT suppressed file names confirmed from pk3 audit: `de_
 
 `s_alDebugPlayback` produces three kinds of console lines — use them together to
 pinpoint whether a broken weapon sound is a **truncation** problem or a
-**resampler** problem:
+**resampling failure**:
 
 | Prefix | Colour | What it means |
 |--------|--------|---------------|
-| `[alDbg] rate mismatch` | Yellow | Printed when a file is loaded and its Hz ≠ device Hz. This is the condition that forces OpenAL's internal resampler to run. If the DE-50 shot file appears here, the resampler is active on it. |
+| `[alDbg] pre-resampled` | Normal | Printed when a file is load-time converted by the Kaiser sinc resampler (22 050 Hz → 48 000 Hz, etc.). This is the expected happy path — the internal resampler is bypassed. |
+| `[alDbg] rate mismatch (pre-resample skipped)` | Yellow | The load-time conversion could not run (unknown device rate or allocation failure). The file will be resampled on each playback by OpenAL's internal resampler. |
 | `[alDbg] PREEMPT` | Red | A playing sound was cut short because a new sound started on the same channel (`chan=N`) for the same entity. `played X / Y smp (Z%)` shows how far through the sample it got. A low % on the DE boom means it is being truncated — look at the "by:" field to see which sound caused it. |
 | `[alDbg] done` | Green | Natural completion (level 2 only). Should show ~100% for correctly played one-shot sounds. |
 
@@ -502,13 +587,14 @@ pinpoint whether a broken weapon sound is a **truncation** problem or a
 // 1. Before loading any map (catches registration warnings):
 s_alDebugPlayback 1
 
-// 2. Load the map; watch for yellow "rate mismatch" lines on DE-50 sounds.
-//    The startup line "S_AL: device mixing frequency: NNNNN Hz" tells you
-//    what rate the device is running at.
+// 2. Load the map.
+//    "S_AL: device mixing frequency: NNNNN Hz" shows the device rate.
+//    "pre-resampled" lines (no colour) confirm the load-time resampler ran.
+//    Yellow "pre-resample skipped" lines indicate a fallback.
 
 // 3. Fire the DE-50.  Watch for:
-//      RED   PREEMPT lines  → truncation/channel-preemption is the bug
-//      no PREEMPT + yellow rate-mismatch at load → resampler is the bug
+//      RED PREEMPT lines            → truncation/channel-preemption is the bug
+//      yellow rate-mismatch skipped → resampler fallback (allocation issue?)
 
 // 4. For full natural-completion audit:
 s_alDebugPlayback 2

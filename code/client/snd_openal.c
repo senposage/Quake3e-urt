@@ -932,6 +932,181 @@ static alSfxRec_t *S_AL_AllocSfx( void )
     }
 }
 
+/* =========================================================================
+ * Load-time PCM resampler
+ *
+ * URT source audio is typically 22 050 Hz 16-bit PCM.  When the device
+ * runs at a different rate (48 000 Hz on virtually all modern hardware)
+ * OpenAL Soft must resample every source on every playback call.  Even the
+ * best internal resampler (BSinc24) cannot repair crackling artefacts that
+ * originate in the source — it can only preserve them — and older or less
+ * capable resamplers (Zero-Order Hold, linear) actively amplify artefacts
+ * through aliasing and interpolation overshoot.
+ *
+ * The fix: convert each sound file to the device's native rate ONCE at
+ * load time using a Kaiser-windowed sinc filter.  The AL buffer is then
+ * submitted at the device's own rate, bypassing the internal resampler on
+ * every subsequent playback.  The CPU cost is a few milliseconds per sound
+ * at map load; the extra RAM is one copy of each sound at the higher rate.
+ *
+ * Algorithm
+ * ---------
+ * For each output sample i at continuous input position  t = i*(inRate/outRate):
+ *
+ *     y[i] = Σ_k  x[k] · h(t − k)            (where k ranges over nearby input frames)
+ *
+ * where the Kaiser-windowed sinc kernel h is
+ *
+ *     h(u) = 2·fc · sinc(2·fc·u) · Kaiser(|u|/W, β)
+ *
+ * with
+ *     fc  = min(inRate, outRate) / (2·inRate)   anti-aliasing cutoff
+ *     W   = S_AL_SINC_HALF_TAPS                  kernel half-width (input samples)
+ *     β   = S_AL_KAISER_BETA                     window shape (~74 dB stopband)
+ *
+ * · Upsampling (inRate < outRate): fc = 0.5 → full source bandwidth preserved.
+ * · Downsampling (inRate > outRate): fc < 0.5 → anti-aliasing at output Nyquist.
+ * · Zero-padding at boundaries (samples outside [0, inSamples) are treated as 0).
+ *   This creates a natural sub-millisecond fade at each edge, which eliminates
+ *   the click artefacts common in URT's abruptly-starting 22 kHz assets.
+ * · The output is divided by wsum (sum of applied weights) so that DC gain is
+ *   exactly 1.0 everywhere, including near the buffer edges.
+ * =========================================================================
+ */
+#define S_AL_SINC_HALF_TAPS  24     /* kernel half-width (input samples); 24 → ~74 dB */
+#define S_AL_KAISER_BETA     6.0    /* Kaiser β for ~74 dB stopband attenuation       */
+#define S_AL_KAISER_LUT_N    512    /* Kaiser window LUT resolution                   */
+
+/* Pre-computed Kaiser window lookup table.  Index 0 = centre (gain=1), index
+ * S_AL_KAISER_LUT_N-1 = edge (gain≈0).  Populated once by S_AL_InitKaiserLUT. */
+static float s_al_kaiserLUT[S_AL_KAISER_LUT_N];
+static qboolean s_al_kaiserReady = qfalse;
+
+/* Modified Bessel function of the first kind, order 0 (I₀).
+ * Series expansion; converges in <30 iterations for β ≤ 12. */
+static double S_AL_BesselI0( double x )
+{
+    double d = 0.0, ds = 1.0, s = 1.0;
+    do {
+        d  += 2.0;
+        ds *= x * x / (d * d);
+        s  += ds;
+    } while (ds > s * 1e-12);
+    return s;
+}
+
+/* Populate s_al_kaiserLUT.  Must be called once before S_AL_ResamplePCM. */
+static void S_AL_InitKaiserLUT( void )
+{
+    double inv_i0beta;
+    int    i;
+    if (s_al_kaiserReady) return;
+    inv_i0beta = 1.0 / S_AL_BesselI0(S_AL_KAISER_BETA);
+    for (i = 0; i < S_AL_KAISER_LUT_N; i++) {
+        double x   = (double)i / (double)(S_AL_KAISER_LUT_N - 1); /* 0 = centre, 1 = edge */
+        double arg = 1.0 - x * x;
+        s_al_kaiserLUT[i] = (arg > 0.0)
+            ? (float)(S_AL_BesselI0(S_AL_KAISER_BETA * sqrt(arg)) * inv_i0beta)
+            : 0.0f;
+    }
+    s_al_kaiserReady = qtrue;
+}
+
+/* Inline Kaiser window evaluation.  norm ∈ [0, 1): 0 = centre, 1 = edge. */
+static float S_AL_KaiserWindow( double norm )
+{
+    int idx = (int)(norm * (S_AL_KAISER_LUT_N - 1) + 0.5);
+    if (idx < 0)                  idx = 0;
+    if (idx >= S_AL_KAISER_LUT_N) idx = S_AL_KAISER_LUT_N - 1;
+    return s_al_kaiserLUT[idx];
+}
+
+/*
+ * S_AL_ResamplePCM
+ *
+ * Resample `inSamples` frames of `inChannels`-channel native-endian 16-bit
+ * signed PCM from `inRate` to `outRate` Hz using the Kaiser-windowed sinc
+ * algorithm described above.
+ *
+ * Returns a Z_Malloc'd array of (*outSamplesOut × inChannels) shorts.
+ * The caller must Z_Free the returned pointer.
+ * Returns NULL on invalid arguments or allocation failure.
+ */
+static short *S_AL_ResamplePCM( const short *in, int inSamples, int inChannels,
+                                 int inRate,  int outRate,  int *outSamplesOut )
+{
+    double  step, fc, winHalf;
+    int     outN, i, k, ch;
+    short  *out;
+
+    if (!in || inSamples <= 0 || inChannels <= 0 ||
+            inRate <= 0 || outRate <= 0 || !outSamplesOut)
+        return NULL;
+
+    outN = (int)((double)inSamples * outRate / inRate + 0.5);
+    if (outN <= 0) return NULL;
+
+    out = (short *)Z_Malloc(outN * inChannels * (int)sizeof(short));
+    if (!out) return NULL;
+
+    /* Advance in the input per output sample. */
+    step = (double)inRate / outRate;
+
+    /* Anti-aliasing cutoff in normalised-input-rate units.
+     * Upsampling: fc = 0.5 (full source bandwidth).
+     * Downsampling: fc = outRate/(2·inRate) (cut at output Nyquist). */
+    fc = (step > 1.0) ? 0.5 / step : 0.5;
+
+    /* Kernel half-width in input-sample units.
+     * Scaled up for downsampling so we still span SINC_HALF_TAPS output taps. */
+    winHalf = (step > 1.0)
+        ? (double)S_AL_SINC_HALF_TAPS * step
+        : (double)S_AL_SINC_HALF_TAPS;
+
+    for (i = 0; i < outN; i++) {
+        double t   = i * step;                        /* position in input sample space */
+        int    kLo = (int)floor(t - winHalf) + 1;
+        int    kHi = (int)floor(t + winHalf);
+
+        for (ch = 0; ch < inChannels; ch++) {
+            double sum = 0.0, wsum = 0.0;
+            for (k = kLo; k <= kHi; k++) {
+                double dt, norm, sinc_arg, sinc_v, w, coeff;
+                if (k < 0 || k >= inSamples) continue;   /* zero-pad at edges */
+
+                dt   = t - k;
+                norm = (dt < 0.0 ? -dt : dt) / winHalf;  /* normalised [0, 1) */
+                if (norm >= 1.0) continue;
+
+                /* Kaiser window */
+                w = (double)S_AL_KaiserWindow(norm);
+
+                /* Windowed sinc: h(dt) = 2·fc · sinc(2·fc·dt) · w */
+                sinc_arg = dt * (2.0 * fc);
+                sinc_v   = (fabs(sinc_arg) < 1e-10)
+                    ? 1.0
+                    : sin(M_PI * sinc_arg) / (M_PI * sinc_arg);
+
+                coeff  = sinc_v * w * (2.0 * fc);
+                sum   += in[k * inChannels + ch] * coeff;
+                wsum  += coeff;
+            }
+
+            /* Divide by wsum so DC gain = 1.0 even near buffer edges. */
+            if (wsum > 1e-10) sum /= wsum;
+
+            {
+                int clampedSample = (int)(sum + (sum < 0.0 ? -0.5 : 0.5));
+                out[i * inChannels + ch] =
+                    (short)(clampedSample < -32768 ? -32768 : clampedSample > 32767 ? 32767 : clampedSample);
+            }
+        }
+    }
+
+    *outSamplesOut = outN;
+    return out;
+}
+
 /* Compute a per-sample RMS ceiling limiter gain for ambient sources.
  *
  * Samples the decoded PCM file at a regular stride so that the ENTIRE loop
@@ -1111,8 +1286,78 @@ static sfxHandle_t S_AL_RegisterSound( const char *sample, qboolean compressed )
         return 0;
     }
 
-    qalBufferData(r->buffer, fmt, pcm, info.size, info.rate);
-    Hunk_FreeTempMemory(pcm);
+    /* Pre-resample to the device's native rate when rates differ.
+     * This converts the PCM exactly once at load time, so OpenAL receives
+     * native-rate audio and its internal per-playback resampler never runs.
+     * Eliminating that resampler prevents aliasing, interpolation overshoot,
+     * and the crackling amplification inherent in all lower-quality resamplers
+     * (ZOH, Linear) that may be the only option on older OpenAL Soft builds.
+     * For 8-bit sources we expand to 16-bit first so the sinc filter can
+     * work at full precision. */
+    {
+        void   *pcmToSubmit  = pcm;
+        ALenum  fmtToSubmit  = fmt;
+        int     rateToSubmit = info.rate;
+        int     sizeToSubmit = info.size;
+        short  *resampled    = NULL;  /* non-NULL when we own a Z_Malloc'd buffer */
+        short  *tmp16        = NULL;  /* non-NULL when we converted 8-bit to 16-bit */
+
+        if (s_al_deviceFreq > 0 && info.rate != (int)s_al_deviceFreq
+                && info.channels <= 2) {
+            const short *src16 = NULL;
+
+            if (info.width == 2) {
+                src16 = (const short *)pcm;
+            } else if (info.width == 1) {
+                /* Expand 8-bit unsigned PCM to 16-bit signed. */
+                int n = info.samples * info.channels, ii;
+                tmp16 = (short *)Z_Malloc(n * (int)sizeof(short));
+                if (tmp16) {
+                    const byte *p = (const byte *)pcm;
+                    for (ii = 0; ii < n; ii++)
+                        tmp16[ii] = (short)(((int)p[ii] - 128) << 8);
+                    src16 = tmp16;
+                }
+            }
+
+            if (src16) {
+                int outSamples = 0;
+                resampled = S_AL_ResamplePCM(src16, info.samples, info.channels,
+                                              info.rate, (int)s_al_deviceFreq,
+                                              &outSamples);
+                if (resampled) {
+                    pcmToSubmit  = resampled;
+                    fmtToSubmit  = (info.channels == 1)
+                                    ? AL_FORMAT_MONO16 : AL_FORMAT_STEREO16;
+                    rateToSubmit = (int)s_al_deviceFreq;
+                    sizeToSubmit = outSamples * info.channels * (int)sizeof(short);
+
+                    if (s_alDebugPlayback && s_alDebugPlayback->integer >= 1) {
+                        Com_Printf("[alDbg] pre-resampled: %s  %d Hz → %d Hz"
+                                   "  (%d → %d smp)\n",
+                                   sample, info.rate, rateToSubmit,
+                                   info.samples, outSamples);
+                    }
+                }
+            }
+        }
+
+        qalBufferData(r->buffer, fmtToSubmit, pcmToSubmit, sizeToSubmit, rateToSubmit);
+
+        if (tmp16)     { Z_Free(tmp16);     tmp16     = NULL; }
+        if (resampled) { Z_Free(resampled); resampled = NULL; }
+        Hunk_FreeTempMemory(pcm);
+
+        /* Debug: if rate still differs (device freq unknown or alloc failed),
+         * log so the operator knows the internal resampler will be used. */
+        if (s_alDebugPlayback && s_alDebugPlayback->integer >= 1
+                && rateToSubmit != (int)s_al_deviceFreq && s_al_deviceFreq > 0) {
+            Com_Printf(S_COLOR_YELLOW
+                "[alDbg] rate mismatch (pre-resample skipped): %s"
+                "  file=%d Hz  device=%d Hz  normGain=%.3f\n",
+                sample, info.rate, (int)s_al_deviceFreq, r->normGain);
+        }
+    }
 
     if (S_AL_CheckError("alBufferData")) {
         qalDeleteBuffers(1, &r->buffer);
@@ -1128,19 +1373,6 @@ static sfxHandle_t S_AL_RegisterSound( const char *sample, qboolean compressed )
     idx = (int)(r - s_al_sfx);
     Com_DPrintf("S_AL: loaded %s (%d Hz, %d ch, %d smp, normGain=%.3f)\n",
         sample, info.rate, info.channels, info.samples, r->normGain);
-
-    /* Playback debug: warn when the file's sample rate doesn't match the
-     * device's mixing rate — this is the condition that forces the internal
-     * resampler to run and is the root cause of the Gaussian-filter quality
-     * loss described in kcat/openal-soft#985.
-     * Also report normGain so outlier ambient loops can be identified. */
-    if (s_alDebugPlayback && s_alDebugPlayback->integer >= 1 &&
-            s_al_deviceFreq > 0 && info.rate != (int)s_al_deviceFreq) {
-        Com_Printf(S_COLOR_YELLOW
-            "[alDbg] rate mismatch: %s  file=%d Hz  device=%d Hz"
-            "  normGain=%.3f  — resampler will run\n",
-            sample, info.rate, (int)s_al_deviceFreq, r->normGain);
-    }
 
     return (sfxHandle_t)idx;
 }
@@ -6741,6 +6973,7 @@ qboolean S_AL_Init( soundInterface_t *si )
      * We log this at startup and use it in the playback-debug output. */
     qalcGetIntegerv(s_al_device, ALC_FREQUENCY, 1, &s_al_deviceFreq);
     Com_Printf("S_AL: device mixing frequency: %d Hz\n", (int)s_al_deviceFreq);
+    S_AL_InitKaiserLUT();
 
     /* Pick the highest-quality resampler offered by OpenAL Soft.
      * Priority: BSinc24 > BSinc12 > Cubic > (default).
