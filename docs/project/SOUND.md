@@ -674,8 +674,11 @@ DMA-matching mechanisms prevent degradation:
    3D source rather than the oldest — nearby (high-impact) sounds survive.
 2. **World-entity cap**: `ENTITYNUM_WORLD` (bullet impacts, casings) is capped at
    `numSrc / 8` = 12 sources, matching DMA's `WORLD_ENTITY_MAX_CHANNELS`.
-3. **Per-entity dedup**: same sfx on the same entity within 20 ms (100 ms for world
-   impacts) is suppressed, matching DMA's dedup window.
+3. **Per-entity dedup** (`s_alDedupMs`, default 20 ms): same sfx on the same
+   entity is suppressed within this window, matching DMA's 20 ms per-entity /
+   100 ms world-entity floors.  Non-weapon channels additionally extend the
+   window to the full sound duration to prevent trigger re-trips while the
+   previous instance is still playing.
 
 #### Occlusion bugs fixed (multi-hop / BSP floor)
 
@@ -1563,7 +1566,7 @@ When the OpenAL backend is active (`USE_OPENAL=1` and `libopenal.so.1` present):
 | `s_alOccSearchRadius` | `120` | Tangent-plane probe radius (units) for gap search. Default 120 ≈ URT door half-width. |
 | `s_alMaxDist` | `1330` | Override max attenuation distance (floor: 1330 Q3 units) |
 | `s_alMaxSrc` | `512` | Maximum OpenAL source pool size. Grows dynamically on demand up to this cap. (LATCH) |
-| `s_alDedupMs` | `0` | Same-frame dedup window in ms (0 = disabled). Light guard against double-start artefacts. |
+| `s_alDedupMs` | `20` | One-shot dedup window in ms (default 20, matching DMA). `CHAN_WEAPON`: fixed window only — rapid fire never suppressed. Other channels: window extends to full sound duration, blocking trigger re-trips while the previous instance plays. `ENTITYNUM_WORLD` always uses max(value, 100). |
 
 #### Volume mixer — per-category controls
 
@@ -1671,7 +1674,7 @@ Three mechanisms keep DMA from drowning in its own events:
 
 | Mechanism | Value | Purpose |
 |-----------|-------|---------|
-| Per-entity dedup window | 20 ms (100 ms for world) | Same sfx from same entity can't fire again within the window — prevents double-start in a single frame |
+| Per-entity dedup window | 20 ms (100 ms for world) | Same sfx from same entity can't fire again within the window — prevents double-start in a single frame. OpenAL matches this via `s_alDedupMs` (default 20 ms) and additionally extends the window to the sound duration for non-weapon channels. |
 | Per-entity concurrency cap | 16 (listener), 8 (other), 2 (world) | Limits how many concurrent copies of the same sound any one entity can hold |
 | `ENTITYNUM_WORLD` hard cap | `MAX_CHANNELS / 8` | Brass, impacts, and ricochets all share the world entity — without this cap they exhaust the pool under heavy fire |
 
@@ -1735,8 +1738,8 @@ Loop (ambient) sources are never stolen — they have their own lifecycle.
 **Culling philosophy**: sounds are dropped by **distance** (rejection at start)
 and by **age/distance** (eviction when stealing) — never by hitting an arbitrary
 slot count.  If a surplus of sources ever causes issues, reduce `s_alMaxSrc`
-(default 512) or lower `s_alDedupMs` from its default of 0 (disabled) to add
-a light same-entity dedup window.
+(default 512).  Use `s_alDedupMs` (default 20 ms) to tune the same-entity
+dedup window.
 
 ### Behaviour by scenario
 

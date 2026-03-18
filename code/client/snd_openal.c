@@ -230,11 +230,26 @@ static LPALGETAUXILIARYEFFECTSLOTF    qalGetAuxiliaryEffectSlotf;
  * the player's own weapon fire even when the sound was emitted as a world sound. */
 #define S_AL_WEAPON_NOOCC_DIST  160.0f
 
-/* Dedup window removed — vanilla URT has the same double-start behaviour
- * and nobody notices.  Culling is handled by distance rejection and by the
- * priority-ordered eviction in S_AL_GetFreeSource.
- * s_alDedupMs is registered as a cvar for potential future use; no code
- * currently reads it (value is ignored at runtime). */
+/* One-shot dedup window (s_alDedupMs).
+ *
+ * Two-tier dedup applied in S_AL_StartSound:
+ *
+ *   CHAN_WEAPON:       minimum window only (default 20 ms ≈ 1 frame).
+ *                     Blocks same-frame double-starts (e.g. cgame submitting
+ *                     the same fire event twice) but lets every intentional
+ *                     shot through at any fire rate.
+ *
+ *   All other channels: extend the window to the FULL SOUND DURATION when a
+ *                     source with the same (entnum, sfx) is still playing.
+ *                     Prevents trigger sounds (birds, ambient music,
+ *                     environment cues) from re-stacking when the player
+ *                     stands on overlapping trigger bounds or moves in/out
+ *                     of a trigger area before the previous instance ends.
+ *
+ *   ENTITYNUM_WORLD:  hard 100 ms floor regardless of the cvar, matching
+ *                     DMA's hardcoded world-entity throttle
+ *                     (dma.speed * 100 / 1000) that limits impact/casing
+ *                     accumulation at sv_fps rate. */
 
 /* Per-sound-file data */
 typedef struct alSfxRec_s {
@@ -2796,6 +2811,48 @@ static void S_AL_StartSound( const vec3_t origin, int entnum,
             return;   /* beyond audible range — no slot needed */
     }
 
+    /* One-shot dedup — see comment block above S_AL_StartSound definition. */
+    if (s_alDedupMs && s_alDedupMs->integer > 0) {
+        int dedupMs = s_alDedupMs->integer;
+        int nowMs   = Com_Milliseconds();
+        int i;
+
+        /* ENTITYNUM_WORLD hard floor: match DMA's 100 ms world-entity throttle. */
+        if (entnum == ENTITYNUM_WORLD && dedupMs < 100)
+            dedupMs = 100;
+
+        for (i = 0; i < s_al_numSrc; i++) {
+            alSrc_t *src = &s_al_src[i];
+            int      elapsed, window;
+
+            if (!src->isPlaying || src->loopSound) continue;
+            if (src->entnum != entnum || src->sfx != sfx) continue;
+
+            elapsed = nowMs - src->allocTime;
+            window  = dedupMs;
+
+            /* Non-weapon channels: extend the window to the full sound
+             * duration so trigger-bound sounds cannot re-stack while the
+             * previous instance is still playing — regardless of how
+             * s_alDedupMs is configured.  Weapon channels keep the minimum
+             * window so rapid fire is never suppressed. */
+            if (entchannel != CHAN_WEAPON && sfx >= 0 && sfx < s_al_numSfx) {
+                alSfxRec_t *sr = &s_al_sfx[sfx];
+                if (sr->fileRate > 0 && sr->soundLength > 0) {
+                    int durMs = (int)((sr->soundLength * 1000) / sr->fileRate);
+                    if (durMs > window) window = durMs;
+                }
+            }
+
+            if (elapsed < window) {
+                S_AL_TRACE(2, "StartSound: dedup blocked sfx=%d ent=%d ch=%d "
+                              "(%d ms elapsed < %d ms window)\n",
+                           sfx, entnum, entchannel, elapsed, window);
+                return;
+            }
+        }
+    }
+
     srcIdx = S_AL_GetFreeSource();
     if (srcIdx < 0) return;
 
@@ -3628,9 +3685,9 @@ static void S_AL_UpdateLoops( void )
             if (foMs < 1) foMs = 1;
             if (fiMs < 1) fiMs = 1;
             {
-                int   elapsed_out = now - lp->fadeOutStartMs;
-                float curGain = (elapsed_out >= foMs) ? 0.0f
-                    : lp->fadeOutStartGain * (1.0f - (float)elapsed_out / (float)foMs);
+                int   elapsedOut = now - lp->fadeOutStartMs;
+                float curGain = (elapsedOut >= foMs) ? 0.0f
+                    : lp->fadeOutStartGain * (1.0f - (float)elapsedOut / (float)foMs);
                 if (curGain < 0.0f) curGain = 0.0f;
                 if (curGain > 1.0f) curGain = 1.0f;
                 lp->fadeStartMs = now - (int)(curGain * (float)fiMs);
@@ -6436,16 +6493,22 @@ qboolean S_AL_Init( soundInterface_t *si )
         "hardware; reduce only if the audio driver reports resource errors.  "
         "Requires vid_restart (LATCH).");
 
-    /* Dedup window — disabled by default (0).  Set to e.g. 20 to suppress
-     * identical (entity, sfx) re-submissions within that many milliseconds.
-     * Vanilla URT doesn't bother and nobody notices; kept as a cvar in case
-     * it is ever needed for unusual sound designs. */
-    s_alDedupMs = Cvar_Get("s_alDedupMs", "0", CVAR_ARCHIVE_ND);
-    Cvar_CheckRange(s_alDedupMs, "0", "200", CV_INTEGER);
+    /* Dedup window — default 20 ms to match DMA's hardcoded per-entity window.
+     * ENTITYNUM_WORLD always uses max(this, 100 ms) to match DMA's world throttle.
+     * Non-weapon channels additionally extend the window to the sound duration
+     * so trigger sounds cannot re-stack while the previous instance plays. */
+    s_alDedupMs = Cvar_Get("s_alDedupMs", "20", CVAR_ARCHIVE_ND);
+    Cvar_CheckRange(s_alDedupMs, "0", "10000", CV_INTEGER);
     Cvar_SetDescription(s_alDedupMs,
-        "Same-entity same-sfx dedup window in milliseconds.  0 = disabled (default).  "
-        "When > 0, suppresses a second start of the exact same sound from the same "
-        "entity within this window — prevents audible doubling on rapid re-triggers.");
+        "Same-entity same-sfx dedup window in milliseconds (default 20, matching the DMA backend). "
+        "0 = disabled. "
+        "Blocks a second S_StartSound for the same (entity, sfx) pair within this window. "
+        "CHAN_WEAPON uses only this fixed window — rapid fire is never suppressed. "
+        "All other channels additionally extend the window to the full sound duration so "
+        "trigger-bound sounds (birds, ambient cues, map music) cannot re-stack while the "
+        "previous instance is still playing, regardless of how quickly the trigger is re-tripped. "
+        "ENTITYNUM_WORLD always uses max(s_alDedupMs, 100) to throttle impact/casing "
+        "accumulation at sv_fps rate.");
 
     s_alTrace = Cvar_Get("s_alTrace", "0", CVAR_TEMP);
     Cvar_CheckRange(s_alTrace, "0", "2", CV_INTEGER);
