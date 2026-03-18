@@ -1083,7 +1083,7 @@ static short *S_AL_ResamplePCM( const short *in, int inSamples, int inChannels,
 
                 /* Windowed sinc: h(dt) = 2·fc · sinc(2·fc·dt) · w */
                 sinc_arg = dt * (2.0 * fc);
-                sinc_v   = (sinc_arg < 1e-10 && sinc_arg > -1e-10)
+                sinc_v   = (fabs(sinc_arg) < 1e-10)
                     ? 1.0
                     : sin(M_PI * sinc_arg) / (M_PI * sinc_arg);
 
@@ -1096,9 +1096,9 @@ static short *S_AL_ResamplePCM( const short *in, int inSamples, int inChannels,
             if (wsum > 1e-10) sum /= wsum;
 
             {
-                int v = (int)(sum + (sum < 0.0 ? -0.5 : 0.5));
+                int clampedSample = (int)(sum + (sum < 0.0 ? -0.5 : 0.5));
                 out[i * inChannels + ch] =
-                    (short)(v < -32768 ? -32768 : v > 32767 ? 32767 : v);
+                    (short)(clampedSample < -32768 ? -32768 : clampedSample > 32767 ? 32767 : clampedSample);
             }
         }
     }
