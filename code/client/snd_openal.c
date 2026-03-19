@@ -667,6 +667,7 @@ static cvar_t *s_alDebugNorm;      /* 0=off 1=print normGain for all active ambi
 static cvar_t *s_alMaxSrc;         /* max source pool size (LATCH) */
 static cvar_t *s_alDedupMs;        /* same-frame dedup window in ms (live) */
 static cvar_t *s_alTrace;          /* 0=off 1=key lifecycle events 2=verbose */
+static cvar_t *s_alLoadThreads;   /* async load worker count [1-8], default 4, LATCH */
 
 /* Set to qtrue by the s_alReset command; cleared on the next probe cycle. */
 static qboolean s_al_reverbReset = qfalse;
@@ -1189,6 +1190,9 @@ static short *S_AL_ResamplePCM( const short *in, int inSamples, int inChannels,
     return out;
 }
 
+/* Forward declaration — used by S_AL_LoadWorker before the full definition. */
+static float S_AL_CalcNormGain( const void *pcm, const snd_info_t *info );
+
 /* =========================================================================
  * Async sound-loader thread pool
  * =========================================================================
@@ -1545,6 +1549,7 @@ static int  s_al_numWorkers = 0;
 #endif  /* _WIN32 */
 
 
+/* Compute a per-sample RMS ceiling limiter gain for ambient sources.
  *
  * Samples the decoded PCM file at a regular stride so that the ENTIRE loop
  * body is represented, not just the opening seconds.  The old approach (scan
@@ -3275,7 +3280,9 @@ static void S_AL_Shutdown( void )
         s_al_tinnitusLastBuiltMs = 0;
     }
 
-    /* Sfx */
+    /* Sfx — drain the async loader pool first so no workers are accessing
+     * sfx records when we wipe them. */
+    S_AL_StopThreadPool();
     S_AL_FreeSfx();
 
     /* Context / device */
@@ -7727,6 +7734,21 @@ qboolean S_AL_Init( soundInterface_t *si )
 
     s_al_started = qtrue;
     s_al_muted   = qfalse;
+
+    /* Async loader thread pool.
+     * Start workers now, before cgame registers any sounds, so the pool is
+     * ready from the very first S_AL_RegisterSound call.
+     * Default 4 threads — enough to parallelize all weapons+radio calls on a
+     * quad-core.  Clamped to [1, 8] internally by S_AL_StartThreadPool. */
+    s_alLoadThreads = Cvar_Get("s_alLoadThreads", "4", CVAR_ARCHIVE_ND | CVAR_LATCH);
+    Cvar_CheckRange(s_alLoadThreads, "1", "8", CV_INTEGER);
+    Cvar_SetDescription(s_alLoadThreads,
+        "Number of background worker threads for async sound loading. "
+        "Each worker runs CalcNormGain + ResamplePCM in parallel so the game "
+        "thread is only stalled for the ~0.5 ms file-decode step per sound. "
+        "Default 4. Range 1–8. Requires vid_restart (LATCH). "
+        "Not supported on Windows (sync loading used instead).");
+    S_AL_StartThreadPool(s_alLoadThreads->integer);
 
     Cmd_AddCommand("s_devices",              S_AL_ListDevicesCmd);
     Cmd_AddCommand("s_alReset",              S_AL_ReverbReset_f);
