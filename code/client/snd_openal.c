@@ -53,13 +53,6 @@ Build flag: compile with USE_OPENAL=1 (set in Makefile).
  */
 
 #ifdef _WIN32
-/* CONDITION_VARIABLE APIs (SleepConditionVariableCS etc.) require Vista+ */
-# if defined(_WIN32_WINNT) && _WIN32_WINNT < 0x0600
-#  undef _WIN32_WINNT
-#  define _WIN32_WINNT 0x0600
-# elif !defined(_WIN32_WINNT)
-#  define _WIN32_WINNT 0x0600
-# endif
 # include <windows.h>
 typedef HMODULE al_lib_t;
 # define AL_LoadLib(n)    LoadLibraryA(n)
@@ -1354,25 +1347,29 @@ static void S_AL_ProcessJob( S_AL_LoadJob_t *job )
 }
 
 /* =========================================================================
- * Platform thread pool -- pthreads (Linux / macOS) or Win32 threads.
+ * Platform thread pool -- pthreads (Linux / macOS) or Win64 threads.
+ * 32-bit Windows uses synchronous loading only (no thread pool).
  * =========================================================================
  */
+
+/* Shared state -- always declared regardless of platform. */
+static S_AL_LoadJob_t   *s_al_jobHead    = NULL;
+static S_AL_LoadJob_t   *s_al_jobTail    = NULL;
+static int               s_al_jobsTotal  = 0;
+static int               s_al_poolRunning = 0;
+static int               s_al_numWorkers = 0;
+
+static S_AL_LoadJob_t   *s_al_doneHead   = NULL;
+static S_AL_LoadJob_t   *s_al_doneTail   = NULL;
 
 #ifndef _WIN32   /* pthreads */
 
 static pthread_mutex_t   s_al_jobMutex   = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t    s_al_jobCond    = PTHREAD_COND_INITIALIZER;
 static pthread_cond_t    s_al_allDone    = PTHREAD_COND_INITIALIZER;
-static S_AL_LoadJob_t   *s_al_jobHead    = NULL;
-static S_AL_LoadJob_t   *s_al_jobTail    = NULL;
-static int               s_al_jobsTotal  = 0;
-static int               s_al_poolRunning = 0;
 static pthread_t         s_al_workers[S_AL_POOL_MAX_THREADS];
-static int               s_al_numWorkers = 0;
 
 static pthread_mutex_t   s_al_doneMutex  = PTHREAD_MUTEX_INITIALIZER;
-static S_AL_LoadJob_t   *s_al_doneHead   = NULL;
-static S_AL_LoadJob_t   *s_al_doneTail   = NULL;
 
 static void *S_AL_LoadWorker( void *unused )
 {
@@ -1414,21 +1411,14 @@ static void *S_AL_LoadWorker( void *unused )
     /* unreachable */
 }
 
-#else  /* _WIN32 -- Win32 threads (CRITICAL_SECTION + CONDITION_VARIABLE) */
+#elif defined(_WIN64)   /* 64-bit Windows: CRITICAL_SECTION + CONDITION_VARIABLE (Vista+) */
 
 static CRITICAL_SECTION   s_al_jobCS;
 static CONDITION_VARIABLE s_al_jobCV;
 static CONDITION_VARIABLE s_al_allDoneCV;
-static S_AL_LoadJob_t    *s_al_jobHead    = NULL;
-static S_AL_LoadJob_t    *s_al_jobTail    = NULL;
-static int                s_al_jobsTotal  = 0;
-static int                s_al_poolRunning = 0;
 static HANDLE             s_al_workers[S_AL_POOL_MAX_THREADS];
-static int                s_al_numWorkers = 0;
 
 static CRITICAL_SECTION   s_al_doneCS;
-static S_AL_LoadJob_t    *s_al_doneHead   = NULL;
-static S_AL_LoadJob_t    *s_al_doneTail   = NULL;
 
 static DWORD WINAPI S_AL_LoadWorker( LPVOID unused )
 {
@@ -1470,7 +1460,7 @@ static DWORD WINAPI S_AL_LoadWorker( LPVOID unused )
     /* unreachable */
 }
 
-#endif  /* _WIN32 */
+#endif  /* !_WIN32 / _WIN64 */
 
 /* =========================================================================
  * Thread-pool management -- shared interface (platform abstracted above).
@@ -1480,9 +1470,9 @@ static DWORD WINAPI S_AL_LoadWorker( LPVOID unused )
 /* Submit a job to the pending queue.  Called on the game thread. */
 static void S_AL_SubmitLoadJob( S_AL_LoadJob_t *job )
 {
-#ifdef _WIN32
+#ifdef _WIN64
     EnterCriticalSection(&s_al_jobCS);
-#else
+#elif !defined(_WIN32)
     pthread_mutex_lock(&s_al_jobMutex);
 #endif
     job->next = NULL;
@@ -1492,10 +1482,10 @@ static void S_AL_SubmitLoadJob( S_AL_LoadJob_t *job )
         s_al_jobHead = job;
     s_al_jobTail = job;
     s_al_jobsTotal++;
-#ifdef _WIN32
+#ifdef _WIN64
     WakeConditionVariable(&s_al_jobCV);
     LeaveCriticalSection(&s_al_jobCS);
-#else
+#elif !defined(_WIN32)
     pthread_cond_signal(&s_al_jobCond);
     pthread_mutex_unlock(&s_al_jobMutex);
 #endif
@@ -1507,18 +1497,20 @@ static void S_AL_CommitCompletedJobs( void )
 {
     S_AL_LoadJob_t *list, *job;
 
+    if (!s_al_numWorkers) return;
+
     /* Atomically detach the entire done list. */
-#ifdef _WIN32
+#ifdef _WIN64
     EnterCriticalSection(&s_al_doneCS);
-#else
+#elif !defined(_WIN32)
     pthread_mutex_lock(&s_al_doneMutex);
 #endif
     list          = s_al_doneHead;
     s_al_doneHead = NULL;
     s_al_doneTail = NULL;
-#ifdef _WIN32
+#ifdef _WIN64
     LeaveCriticalSection(&s_al_doneCS);
-#else
+#elif !defined(_WIN32)
     pthread_mutex_unlock(&s_al_doneMutex);
 #endif
 
@@ -1587,12 +1579,12 @@ static void S_AL_FlushAllJobs( void )
 {
     if (!s_al_numWorkers) return;
 
-#ifdef _WIN32
+#ifdef _WIN64
     EnterCriticalSection(&s_al_jobCS);
     while (s_al_jobsTotal > 0)
         SleepConditionVariableCS(&s_al_allDoneCV, &s_al_jobCS, INFINITE);
     LeaveCriticalSection(&s_al_jobCS);
-#else
+#elif !defined(_WIN32)
     pthread_mutex_lock(&s_al_jobMutex);
     while (s_al_jobsTotal > 0)
         pthread_cond_wait(&s_al_allDone, &s_al_jobMutex);
@@ -1612,7 +1604,7 @@ static void S_AL_StartThreadPool( int n )
     s_al_poolRunning = 1;
     s_al_numWorkers  = 0;
 
-#ifdef _WIN32
+#ifdef _WIN64
     InitializeCriticalSection(&s_al_jobCS);
     InitializeConditionVariable(&s_al_jobCV);
     InitializeConditionVariable(&s_al_allDoneCV);
@@ -1627,7 +1619,7 @@ static void S_AL_StartThreadPool( int n )
         s_al_workers[i] = h;
         s_al_numWorkers++;
     }
-#else
+#elif !defined(_WIN32)
     for (i = 0; i < n; i++) {
         if (pthread_create(&s_al_workers[i], NULL, S_AL_LoadWorker, NULL) != 0) {
             Com_Printf(S_COLOR_YELLOW "S_AL: failed to create load worker %d\n", i);
@@ -1637,7 +1629,8 @@ static void S_AL_StartThreadPool( int n )
     }
 #endif
 
-    Com_Printf("S_AL: async load pool: %d worker thread(s)\n", s_al_numWorkers);
+    if (s_al_numWorkers > 0)
+        Com_Printf("S_AL: async load pool: %d worker thread(s)\n", s_al_numWorkers);
 }
 
 /* Drain queue, join all worker threads.  Called from S_AL_Shutdown. */
@@ -1647,7 +1640,7 @@ static void S_AL_StopThreadPool( void )
     if (!s_al_numWorkers) return;
 
     /* Signal workers to exit after draining remaining work. */
-#ifdef _WIN32
+#ifdef _WIN64
     EnterCriticalSection(&s_al_jobCS);
     s_al_poolRunning = 0;
     WakeAllConditionVariable(&s_al_jobCV);
@@ -1658,7 +1651,7 @@ static void S_AL_StopThreadPool( void )
         CloseHandle(s_al_workers[i]);
         s_al_workers[i] = NULL;
     }
-#else
+#elif !defined(_WIN32)
     pthread_mutex_lock(&s_al_jobMutex);
     s_al_poolRunning = 0;
     pthread_cond_broadcast(&s_al_jobCond);
@@ -1675,9 +1668,9 @@ static void S_AL_StopThreadPool( void )
 
     /* Discard any jobs still on the pending queue (shouldn't happen after
      * flush, but be defensive). */
-#ifdef _WIN32
+#ifdef _WIN64
     EnterCriticalSection(&s_al_jobCS);
-#else
+#elif !defined(_WIN32)
     pthread_mutex_lock(&s_al_jobMutex);
 #endif
     while (s_al_jobHead) {
@@ -1689,11 +1682,11 @@ static void S_AL_StopThreadPool( void )
     }
     s_al_jobTail   = NULL;
     s_al_jobsTotal = 0;
-#ifdef _WIN32
+#ifdef _WIN64
     LeaveCriticalSection(&s_al_jobCS);
     DeleteCriticalSection(&s_al_jobCS);
     DeleteCriticalSection(&s_al_doneCS);
-#else
+#elif !defined(_WIN32)
     pthread_mutex_unlock(&s_al_jobMutex);
 #endif
 }
