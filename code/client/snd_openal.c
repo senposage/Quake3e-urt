@@ -1460,7 +1460,7 @@ static DWORD WINAPI S_AL_LoadWorker( LPVOID unused )
     /* unreachable */
 }
 
-#endif  /* !_WIN32 / _WIN64 */
+#endif  /* !_WIN32 (pthreads) / _WIN64 (Win32 threads) */
 
 /* =========================================================================
  * Thread-pool management -- shared interface (platform abstracted above).
