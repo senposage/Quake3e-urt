@@ -60,6 +60,7 @@ typedef HMODULE al_lib_t;
 # define AL_GetProc(h,n)  GetProcAddress(h, n)
 #else
 # include <dlfcn.h>
+# include <pthread.h>
 typedef void *al_lib_t;
 # define AL_LoadLib(n)    dlopen(n, RTLD_NOW | RTLD_LOCAL)
 # define AL_UnloadLib(h)  dlclose(h)
@@ -1099,11 +1100,11 @@ static short *S_AL_ResamplePCM( const short *in, int inSamples, int inChannels,
     tapMin = -(int)ceil(winHalf);
     nTaps  = 2 * (int)ceil(winHalf) + 1;
 
-    phaseCoeffs = (float *)Z_Malloc(S_AL_RESAMPLE_PHASES * nTaps * sizeof(float));
-    phaseWsum   = (float *)Z_Malloc(S_AL_RESAMPLE_PHASES * sizeof(float));
+    phaseCoeffs = (float *)malloc(S_AL_RESAMPLE_PHASES * nTaps * sizeof(float));
+    phaseWsum   = (float *)malloc(S_AL_RESAMPLE_PHASES * sizeof(float));
     if (!phaseCoeffs || !phaseWsum) {
-        if (phaseCoeffs) Z_Free(phaseCoeffs);
-        if (phaseWsum)   Z_Free(phaseWsum);
+        if (phaseCoeffs) free(phaseCoeffs);
+        if (phaseWsum)   free(phaseWsum);
         return NULL;
     }
 
@@ -1130,10 +1131,10 @@ static short *S_AL_ResamplePCM( const short *in, int inSamples, int inChannels,
         phaseWsum[i] = wsum;
     }
 
-    out = (short *)Z_Malloc(outN * inChannels * (int)sizeof(short));
+    out = (short *)malloc(outN * inChannels * (int)sizeof(short));
     if (!out) {
-        Z_Free(phaseCoeffs);
-        Z_Free(phaseWsum);
+        free(phaseCoeffs);
+        free(phaseWsum);
         return NULL;
     }
 
@@ -1182,13 +1183,368 @@ static short *S_AL_ResamplePCM( const short *in, int inSamples, int inChannels,
         }
     }
 
-    Z_Free(phaseCoeffs);
-    Z_Free(phaseWsum);
+    free(phaseCoeffs);
+    free(phaseWsum);
     *outSamplesOut = outN;
     return out;
 }
 
-/* Compute a per-sample RMS ceiling limiter gain for ambient sources.
+/* =========================================================================
+ * Async sound-loader thread pool
+ * =========================================================================
+ *
+ * Problem: S_AL_RegisterSound blocked the game thread for every new sound
+ * (~4 ms each: 0.5 ms file I/O + 0.5 ms CalcNormGain + 3 ms ResamplePCM).
+ * With 300+ sounds at map load AND lazy registration of radio calls during
+ * gameplay, this caused both a long map-load stall AND mid-game stutters
+ * every time an unregistered sound (radio call, new weapon variant, etc.)
+ * was played for the first time.
+ *
+ * Solution: a persistent worker thread pool (created at S_AL_Init, destroyed
+ * at S_AL_Shutdown).  S_AL_RegisterSound now:
+ *   1. Calls S_CodecLoad on the game thread (~0.5 ms — keeps FS access serial).
+ *   2. Copies the decoded PCM to a malloc'd buffer, frees the Hunk block.
+ *   3. Submits a load job to the pool and returns the sfxHandle immediately.
+ *      (r->inMemory = qfalse, r->buffer = 0 until committed.)
+ *   4. Worker threads run CalcNormGain + ResamplePCM in parallel (~3.5 ms).
+ *   5. S_AL_CommitCompletedJobs() (called from S_AL_Update every frame) drains
+ *      the completed-jobs queue and calls qalGenBuffers + qalBufferData on the
+ *      game/OpenAL thread.  After this, r->inMemory = qtrue.
+ *
+ * Playback guard: S_AL_StartSound already has "if (!r->inMemory || !r->buffer)
+ * return;" so sounds that haven't committed yet are silently skipped for that
+ * frame and play correctly on the next frame (typically < 1 frame later).
+ *
+ * S_AL_FlushAllJobs() (blocking) is called before any operation that would
+ * invalidate sfx records (S_AL_FreeSfx, S_AL_BeginRegistration, S_AL_Shutdown).
+ *
+ * Number of threads: s_alLoadThreads cvar, default 4, clamped to [1, 8].
+ * =========================================================================
+ */
+
+#ifndef _WIN32   /* pthreads — Linux / macOS / MinGW */
+
+/* One async load job. */
+typedef struct S_AL_LoadJob_s {
+    struct S_AL_LoadJob_s *next;            /* intrusive queue link              */
+    alSfxRec_t            *r;               /* sfx record (in hash, !inMemory)   */
+    char                   path[MAX_QPATH]; /* for diagnostics                   */
+    /* Decode output — filled on the game thread by S_AL_RegisterSound. */
+    void                  *pcm;             /* malloc'd decoded PCM              */
+    snd_info_t             info;            /* sample width/channels/rate/size   */
+    ALenum                 fmt;             /* AL_FORMAT_* matching pcm          */
+    float                  normCacheGain;   /* ≥ 0 → override; < 0 → none       */
+    /* Worker output — filled by S_AL_LoadWorker. */
+    void                  *submitPcm;       /* pcm or resampled (to submit)      */
+    int                    submitSize;      /* byte count for qalBufferData      */
+    ALenum                 submitFmt;       /* AL format for submission          */
+    int                    submitRate;      /* rate for submission               */
+    float                  normGain;        /* CalcNormGain result               */
+    qboolean               decodeOk;        /* qfalse → defaultSound             */
+} S_AL_LoadJob_t;
+
+#define S_AL_POOL_MAX_THREADS  8
+
+/* Shared state — all protected by s_al_jobMutex except s_al_done{Head,Tail}
+ * which have their own mutex. */
+static pthread_mutex_t   s_al_jobMutex   = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t    s_al_jobCond    = PTHREAD_COND_INITIALIZER;
+static pthread_cond_t    s_al_allDone    = PTHREAD_COND_INITIALIZER;
+static S_AL_LoadJob_t   *s_al_jobHead    = NULL; /* pending queue head          */
+static S_AL_LoadJob_t   *s_al_jobTail    = NULL; /* pending queue tail          */
+static int               s_al_jobsTotal  = 0;    /* pending + in-progress count */
+static int               s_al_poolRunning = 0;   /* 1 while threads are alive   */
+static pthread_t         s_al_workers[S_AL_POOL_MAX_THREADS];
+static int               s_al_numWorkers = 0;
+
+static pthread_mutex_t   s_al_doneMutex  = PTHREAD_MUTEX_INITIALIZER;
+static S_AL_LoadJob_t   *s_al_doneHead   = NULL; /* completed queue head        */
+static S_AL_LoadJob_t   *s_al_doneTail   = NULL; /* completed queue tail        */
+
+/* Worker thread: dequeue → CalcNormGain → ResamplePCM → push to done queue. */
+static void *S_AL_LoadWorker( void *unused )
+{
+    (void)unused;
+
+    pthread_mutex_lock(&s_al_jobMutex);
+
+    for (;;) {
+        S_AL_LoadJob_t *job;
+        short          *src16;
+        short          *tmp16;
+
+        /* Wait until there is work or the pool is shutting down. */
+        while (s_al_poolRunning && !s_al_jobHead)
+            pthread_cond_wait(&s_al_jobCond, &s_al_jobMutex);
+
+        if (!s_al_jobHead) {
+            /* Pool stopping with no remaining jobs — exit. */
+            pthread_mutex_unlock(&s_al_jobMutex);
+            return NULL;
+        }
+
+        /* Dequeue one job. */
+        job          = s_al_jobHead;
+        s_al_jobHead = job->next;
+        if (!s_al_jobHead) s_al_jobTail = NULL;
+        job->next    = NULL;
+        pthread_mutex_unlock(&s_al_jobMutex);
+
+        /* ---- CPU work (no locks held) ------------------------------------ */
+        src16 = NULL;
+        tmp16 = NULL;
+
+        if (job->decodeOk) {
+            /* Normalisation gain scan. */
+            job->normGain = S_AL_CalcNormGain(job->pcm, &job->info);
+
+            /* Prepare 16-bit source pointer for the resampler. */
+            if (s_al_deviceFreq > 0
+                    && job->info.rate != (int)s_al_deviceFreq
+                    && job->info.channels <= 2) {
+
+                if (job->info.width == 2) {
+                    src16 = (short *)job->pcm;
+                } else if (job->info.width == 1) {
+                    /* Expand 8-bit unsigned → 16-bit signed (malloc; no Q3 zone). */
+                    int  n  = job->info.samples * job->info.channels;
+                    int  ii;
+                    tmp16 = (short *)malloc((size_t)n * sizeof(short));
+                    if (tmp16) {
+                        const byte *p = (const byte *)job->pcm;
+                        for (ii = 0; ii < n; ii++)
+                            tmp16[ii] = (short)(((int)p[ii] - 128) << 8);
+                        src16 = tmp16;
+                    }
+                }
+
+                if (src16) {
+                    int    outSamples = 0;
+                    short *resampled  = S_AL_ResamplePCM(
+                                            src16,
+                                            job->info.samples,
+                                            job->info.channels,
+                                            job->info.rate,
+                                            (int)s_al_deviceFreq,
+                                            &outSamples);
+                    if (tmp16) { free(tmp16); tmp16 = NULL; }
+
+                    if (resampled) {
+                        /* Resampled buffer becomes the submission target. */
+                        job->submitPcm  = resampled;
+                        job->submitFmt  = (job->info.channels == 1)
+                                          ? AL_FORMAT_MONO16
+                                          : AL_FORMAT_STEREO16;
+                        job->submitRate = (int)s_al_deviceFreq;
+                        job->submitSize = outSamples * job->info.channels
+                                          * (int)sizeof(short);
+                        /* Original PCM is no longer needed. */
+                        free(job->pcm);
+                        job->pcm = NULL;
+                    }
+                }
+            }
+
+            /* If no resampling was done, submit the original PCM as-is. */
+            if (!job->submitPcm) {
+                job->submitPcm  = job->pcm;
+                job->submitFmt  = job->fmt;
+                job->submitRate = job->info.rate;
+                job->submitSize = job->info.size;
+            }
+        }
+
+        /* ---- Push to done queue (done mutex) ----------------------------- */
+        pthread_mutex_lock(&s_al_doneMutex);
+        if (s_al_doneTail)
+            s_al_doneTail->next = job;
+        else
+            s_al_doneHead = job;
+        s_al_doneTail = job;
+        pthread_mutex_unlock(&s_al_doneMutex);
+
+        /* Decrement total counter under job mutex; signal "all done" if 0. */
+        pthread_mutex_lock(&s_al_jobMutex);
+        s_al_jobsTotal--;
+        if (s_al_jobsTotal == 0)
+            pthread_cond_broadcast(&s_al_allDone);
+    }
+    /* unreachable */
+}
+
+/* Submit a job to the pending queue.  Called on the game thread. */
+static void S_AL_SubmitLoadJob( S_AL_LoadJob_t *job )
+{
+    pthread_mutex_lock(&s_al_jobMutex);
+    job->next = NULL;
+    if (s_al_jobTail)
+        s_al_jobTail->next = job;
+    else
+        s_al_jobHead = job;
+    s_al_jobTail = job;
+    s_al_jobsTotal++;
+    pthread_cond_signal(&s_al_jobCond);
+    pthread_mutex_unlock(&s_al_jobMutex);
+}
+
+/* Drain the completed-jobs queue and call qalBufferData for each.
+ * Must be called on the game/OpenAL thread (typically from S_AL_Update). */
+static void S_AL_CommitCompletedJobs( void )
+{
+    S_AL_LoadJob_t *list, *job;
+
+    /* Atomically detach the entire done list. */
+    pthread_mutex_lock(&s_al_doneMutex);
+    list          = s_al_doneHead;
+    s_al_doneHead = NULL;
+    s_al_doneTail = NULL;
+    pthread_mutex_unlock(&s_al_doneMutex);
+
+    while (list) {
+        alSfxRec_t *r;
+        float       ng;
+
+        job  = list;
+        list = job->next;
+
+        r = job->r;
+
+        if (!job->decodeOk || !job->submitPcm) {
+            /* Decode failed — mark as default sound so playback skips it. */
+            r->defaultSound = qtrue;
+            r->inMemory     = qtrue;
+            r->normGain     = 1.0f;
+            r->lastTimeUsed = Com_Milliseconds();
+            if (job->pcm)       { free(job->pcm);       job->pcm       = NULL; }
+            if (job->submitPcm) { free(job->submitPcm); job->submitPcm = NULL; }
+            free(job);
+            continue;
+        }
+
+        /* Apply normcache override if one was stored at register-time. */
+        ng = (job->normCacheGain >= 0.0f) ? job->normCacheGain : job->normGain;
+        r->normGain = ng;
+
+        /* Upload to OpenAL on this (game) thread. */
+        S_AL_ClearError("CommitJob");
+        qalGenBuffers(1, &r->buffer);
+        if (!S_AL_CheckError("alGenBuffers(async)")) {
+            qalBufferData(r->buffer, job->submitFmt,
+                          job->submitPcm, job->submitSize, job->submitRate);
+            if (S_AL_CheckError("alBufferData(async)")) {
+                qalDeleteBuffers(1, &r->buffer);
+                r->buffer      = 0;
+                r->defaultSound = qtrue;
+            }
+        } else {
+            r->defaultSound = qtrue;
+        }
+
+        r->soundLength  = job->info.samples;
+        r->fileRate     = job->info.rate;
+        r->inMemory     = qtrue;
+        r->lastTimeUsed = Com_Milliseconds();
+
+        Com_DPrintf("S_AL: committed %s (%d Hz→%d Hz, %d ch, normGain=%.3f)\n",
+            job->path, job->info.rate, job->submitRate,
+            job->info.channels, ng);
+
+        /* Free buffers. submitPcm is either the resampled buffer (malloc'd)
+         * or points into pcm.  Only free each pointer once. */
+        if (job->submitPcm && job->submitPcm != job->pcm)
+            free(job->submitPcm);
+        if (job->pcm)
+            free(job->pcm);
+        free(job);
+    }
+}
+
+/* Block until all submitted jobs have been processed and committed.
+ * Must be called before invalidating sfx records (FreeSfx, BeginRegistration,
+ * Shutdown).  Also drains the done queue so OpenAL buffers are created. */
+static void S_AL_FlushAllJobs( void )
+{
+    if (!s_al_numWorkers) return;
+
+    /* Wait until every in-flight job has been processed by a worker. */
+    pthread_mutex_lock(&s_al_jobMutex);
+    while (s_al_jobsTotal > 0)
+        pthread_cond_wait(&s_al_allDone, &s_al_jobMutex);
+    pthread_mutex_unlock(&s_al_jobMutex);
+
+    /* Commit all completed jobs now (caller is on game thread). */
+    S_AL_CommitCompletedJobs();
+}
+
+/* Start N worker threads.  Called from S_AL_Init. */
+static void S_AL_StartThreadPool( int n )
+{
+    int i;
+    if (n < 1) n = 1;
+    if (n > S_AL_POOL_MAX_THREADS) n = S_AL_POOL_MAX_THREADS;
+
+    s_al_poolRunning = 1;
+    s_al_numWorkers  = 0;
+
+    for (i = 0; i < n; i++) {
+        if (pthread_create(&s_al_workers[i], NULL, S_AL_LoadWorker, NULL) != 0) {
+            Com_Printf(S_COLOR_YELLOW "S_AL: failed to create load worker %d\n", i);
+            break;
+        }
+        s_al_numWorkers++;
+    }
+
+    Com_Printf("S_AL: async load pool: %d worker thread(s)\n", s_al_numWorkers);
+}
+
+/* Drain queue, join all worker threads.  Called from S_AL_Shutdown. */
+static void S_AL_StopThreadPool( void )
+{
+    int i;
+    if (!s_al_numWorkers) return;
+
+    /* Signal workers to exit after draining remaining work. */
+    pthread_mutex_lock(&s_al_jobMutex);
+    s_al_poolRunning = 0;
+    pthread_cond_broadcast(&s_al_jobCond);
+    pthread_mutex_unlock(&s_al_jobMutex);
+
+    for (i = 0; i < s_al_numWorkers; i++)
+        pthread_join(s_al_workers[i], NULL);
+
+    s_al_numWorkers = 0;
+
+    /* Commit anything that was completed but not yet drained. */
+    S_AL_CommitCompletedJobs();
+
+    /* Discard any jobs still on the pending queue (shouldn't happen after
+     * flush, but be defensive). */
+    pthread_mutex_lock(&s_al_jobMutex);
+    while (s_al_jobHead) {
+        S_AL_LoadJob_t *j = s_al_jobHead;
+        s_al_jobHead = j->next;
+        if (j->submitPcm && j->submitPcm != j->pcm) free(j->submitPcm);
+        if (j->pcm) free(j->pcm);
+        free(j);
+    }
+    s_al_jobTail   = NULL;
+    s_al_jobsTotal = 0;
+    pthread_mutex_unlock(&s_al_jobMutex);
+}
+
+#else  /* _WIN32 — no pthreads; async loading disabled, sync fallback used */
+
+typedef struct S_AL_LoadJob_s { int unused; } S_AL_LoadJob_t;
+static void S_AL_SubmitLoadJob(S_AL_LoadJob_t *j)   { (void)j; }
+static void S_AL_CommitCompletedJobs( void )         {}
+static void S_AL_FlushAllJobs( void )                {}
+static void S_AL_StartThreadPool( int n )            { (void)n; }
+static void S_AL_StopThreadPool( void )              {}
+static int  s_al_numWorkers = 0;
+
+#endif  /* _WIN32 */
+
+
  *
  * Samples the decoded PCM file at a regular stride so that the ENTIRE loop
  * body is represented, not just the opening seconds.  The old approach (scan
@@ -1292,7 +1648,14 @@ static float S_AL_CalcNormGain( const void *pcm, const snd_info_t *info )
 }
 
 /* Load a sound file into an AL buffer.  Returns the sfxHandle_t index
- * (>= 0) on success, 0 (the default-sound slot) on failure. */
+ * (>= 0) on success, 0 (the default-sound slot) on failure.
+ *
+ * The async path (non-Windows, pool running) submits CPU-intensive work
+ * (CalcNormGain + ResamplePCM) to the thread pool and returns immediately
+ * with a valid handle.  r->inMemory = qfalse until S_AL_CommitCompletedJobs
+ * (called from S_AL_Update) uploads the buffer.  Playback guards already in
+ * S_AL_StartSound / S_AL_AddLoopingSound skip sounds that are not yet ready;
+ * they play correctly from the very next frame. */
 static sfxHandle_t S_AL_RegisterSound( const char *sample, qboolean compressed )
 {
     alSfxRec_t  *r;
@@ -1312,17 +1675,17 @@ static sfxHandle_t S_AL_RegisterSound( const char *sample, qboolean compressed )
         return (sfxHandle_t)(r - s_al_sfx);
     }
 
-    /* Allocate new record. */
+    /* Allocate new record and insert into hash. */
     r = S_AL_AllocSfx();
     if (!r)
         return 0;
 
     Q_strncpyz(r->name, sample, sizeof(r->name));
-    h          = S_AL_SfxHash(sample);
-    r->next    = s_al_sfxHash[h];
+    h               = S_AL_SfxHash(sample);
+    r->next         = s_al_sfxHash[h];
     s_al_sfxHash[h] = r;
 
-    /* Decode via codec. */
+    /* Decode via codec (always on the game thread — FS is not thread-safe). */
     pcm = S_CodecLoad(sample, &info);
     if (!pcm) {
         Com_Printf(S_COLOR_YELLOW "S_AL: couldn't load %s\n", sample);
@@ -1339,6 +1702,75 @@ static sfxHandle_t S_AL_RegisterSound( const char *sample, qboolean compressed )
     if (info.channels == 4) {
         fmt = (info.width == 2) ? AL_FORMAT_BFORMAT3D_16 : AL_FORMAT_BFORMAT3D_8;
     }
+
+#ifndef _WIN32
+    /* -----------------------------------------------------------------------
+     * Async path: hand CPU work off to the thread pool.
+     * The game thread is only blocked for the S_CodecLoad above (~0.5 ms).
+     * CalcNormGain + ResamplePCM (~3.5 ms combined) run in a worker thread.
+     * S_AL_CommitCompletedJobs (called from S_AL_Update every frame) uploads
+     * the result to OpenAL and sets r->inMemory = qtrue.
+     * ----------------------------------------------------------------------- */
+    if (s_al_numWorkers > 0) {
+        S_AL_LoadJob_t *job;
+        void           *pcmMalloc;
+        int             ci;
+
+        /* Copy PCM from the Hunk stack allocator to a free-standing malloc
+         * buffer so the worker thread can hold it after we return and the
+         * Hunk block can be recycled immediately. */
+        pcmMalloc = malloc((size_t)info.size);
+        if (!pcmMalloc) {
+            Hunk_FreeTempMemory(pcm);
+            r->defaultSound = qtrue;
+            r->inMemory     = qtrue;
+            r->normGain     = 1.0f;
+            r->lastTimeUsed = Com_Milliseconds();
+            return (sfxHandle_t)(r - s_al_sfx);
+        }
+        memcpy(pcmMalloc, pcm, (size_t)info.size);
+        Hunk_FreeTempMemory(pcm);
+        pcm = NULL;
+
+        job = (S_AL_LoadJob_t *)malloc(sizeof(S_AL_LoadJob_t));
+        if (!job) {
+            free(pcmMalloc);
+            r->defaultSound = qtrue;
+            r->inMemory     = qtrue;
+            r->normGain     = 1.0f;
+            r->lastTimeUsed = Com_Milliseconds();
+            return (sfxHandle_t)(r - s_al_sfx);
+        }
+        memset(job, 0, sizeof(*job));
+        job->r             = r;
+        Q_strncpyz(job->path, sample, sizeof(job->path));
+        job->pcm           = pcmMalloc;
+        job->info          = info;
+        job->fmt           = fmt;
+        job->normCacheGain = -1.0f;   /* -1 = no override */
+        job->decodeOk      = qtrue;
+
+        /* Capture any normcache override so the worker can apply it without
+         * touching the shared normcache table. */
+        for (ci = 0; ci < s_al_normCacheCount; ci++) {
+            if (!Q_stricmp(s_al_normCache[ci].path, sample)) {
+                job->normCacheGain = s_al_normCache[ci].normGain;
+                break;
+            }
+        }
+
+        S_AL_SubmitLoadJob(job);
+        r->lastTimeUsed = Com_Milliseconds();
+        /* r->inMemory = qfalse, r->buffer = 0 until CommitCompletedJobs. */
+        return (sfxHandle_t)(r - s_al_sfx);
+    }
+#endif /* !_WIN32 */
+
+    /* -----------------------------------------------------------------------
+     * Synchronous path (Windows, or pool not yet started).
+     * Identical to the pre-threading code: CalcNormGain → normcache override
+     * → qalGenBuffers → ResamplePCM → qalBufferData, all inline.
+     * ----------------------------------------------------------------------- */
 
     /* Analyse PCM while it is still in the temp allocation. */
     r->normGain = S_AL_CalcNormGain(pcm, &info);
@@ -1380,8 +1812,8 @@ static sfxHandle_t S_AL_RegisterSound( const char *sample, qboolean compressed )
         ALenum  fmtToSubmit  = fmt;
         int     rateToSubmit = info.rate;
         int     sizeToSubmit = info.size;
-        short  *resampled    = NULL;  /* non-NULL when we own a Z_Malloc'd buffer */
-        short  *tmp16        = NULL;  /* non-NULL when we converted 8-bit to 16-bit */
+        short  *resampled    = NULL;
+        short  *tmp16        = NULL;
 
         if (s_al_deviceFreq > 0 && info.rate != (int)s_al_deviceFreq
                 && info.channels <= 2) {
@@ -1392,7 +1824,7 @@ static sfxHandle_t S_AL_RegisterSound( const char *sample, qboolean compressed )
             } else if (info.width == 1) {
                 /* Expand 8-bit unsigned PCM to 16-bit signed. */
                 int n = info.samples * info.channels, ii;
-                tmp16 = (short *)Z_Malloc(n * (int)sizeof(short));
+                tmp16 = (short *)malloc((size_t)n * sizeof(short));
                 if (tmp16) {
                     const byte *p = (const byte *)pcm;
                     for (ii = 0; ii < n; ii++)
@@ -1425,8 +1857,8 @@ static sfxHandle_t S_AL_RegisterSound( const char *sample, qboolean compressed )
 
         qalBufferData(r->buffer, fmtToSubmit, pcmToSubmit, sizeToSubmit, rateToSubmit);
 
-        if (tmp16)     { Z_Free(tmp16);     tmp16     = NULL; }
-        if (resampled) { Z_Free(resampled); resampled = NULL; }
+        if (tmp16)     { free(tmp16);     tmp16     = NULL; }
+        if (resampled) { free(resampled); resampled = NULL; }
         Hunk_FreeTempMemory(pcm);
 
         /* Debug: if rate still differs (device freq unknown or alloc failed),
@@ -1462,6 +1894,12 @@ static sfxHandle_t S_AL_RegisterSound( const char *sample, qboolean compressed )
 static void S_AL_FreeSfx( void )
 {
     int i;
+
+    /* Drain all in-flight async jobs before touching the sfx table.
+     * Any jobs still running hold pointers into s_al_sfx[]; wiping the
+     * table while they are live would cause a use-after-free. */
+    S_AL_FlushAllJobs();
+
     for (i = 0; i < s_al_numSfx; i++) {
         if (s_al_sfx[i].buffer) {
             qalDeleteBuffers(1, &s_al_sfx[i].buffer);
@@ -5259,6 +5697,10 @@ static void S_AL_Update( int msec )
 
     if (!s_al_started) return;
 
+    /* Upload any buffers that were decoded + resampled by worker threads
+     * since the last frame.  This is cheap when the queue is empty. */
+    S_AL_CommitCompletedJobs();
+
     /* Handle mute */
     masterGain = s_al_muted ? 0.0f : (s_volume ? s_volume->value : 0.8f);
 
@@ -6070,6 +6512,12 @@ static void S_AL_BeginRegistration( void )
     char mapbase[MAX_QPATH];
 
     s_al_muted = qfalse;
+
+    /* Commit any in-flight loads from the previous map before resetting the
+     * normcache.  Without this, a job queued for the old map might commit
+     * after the new map's cache has been loaded and overwrite the normGain
+     * that was just applied. */
+    S_AL_FlushAllJobs();
 
     /* Slot 0 must be reserved as the default/failure placeholder on every
      * registration cycle — cold start, map→menu, map→map.  The QVM checks
