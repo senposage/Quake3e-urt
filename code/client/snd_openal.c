@@ -405,9 +405,11 @@ static qboolean s_al_hrtf     = qfalse; /* ALC_HRTF_SOFT active */
 static qboolean s_al_inwater  = qfalse;
 static ALint    s_al_bestResampler = -1; /* AL_SOFT_source_resampler index, -1 = use default */
 
-static vec3_t s_al_listener_origin;   /* updated in S_AL_Respatialize */
+static vec3_t s_al_listener_origin;      /* updated in S_AL_Respatialize */
 static int    s_al_listener_entnum = -1; /* entity number of the listener */
-static vec3_t s_al_listener_forward;  /* axis[0] — direction listener is facing; updated in S_AL_Respatialize */
+static vec3_t s_al_listener_forward;     /* axis[0] — direction listener is facing; updated in S_AL_Respatialize */
+static vec3_t s_al_listener_prevOrigin;  /* previous-frame position for listener velocity delta */
+static int    s_al_listener_prevMs = 0;  /* Com_Milliseconds() at previous S_AL_Respatialize call */
 
 /* Fire-direction impact reverb: set in S_AL_StartSound on CHAN_WEAPON from
  * the listener entity; consumed by S_AL_UpdateDynamicReverb. */
@@ -475,6 +477,12 @@ static int    s_al_tinnitusLastPlay    = 0;  /* timestamp — spam-guard        
  * entity-following sounds start at the right place instead of the world
  * origin.  Indexed by entity number. */
 static vec3_t s_al_entity_origins[MAX_GENTITIES];
+
+/* Per-entity velocity tracking for doppler on one-shot sources.
+ * Velocity is derived each frame from position delta in S_AL_UpdateEntityPosition. */
+static vec3_t s_al_entity_velocities[MAX_GENTITIES];
+static vec3_t s_al_entity_prevOrigins[MAX_GENTITIES];
+static int    s_al_entity_prevMs[MAX_GENTITIES];
 
 typedef struct {
     qboolean available;       /* ALC_EXT_EFX present and procs loaded */
@@ -2812,6 +2820,7 @@ static void S_AL_SrcSetup( int idx, sfxHandle_t sfx,
     if (isLocal) {
         qalSourcei(sid, AL_SOURCE_RELATIVE, AL_TRUE);
         qalSource3f(sid, AL_POSITION, 0.0f, 0.0f, 0.0f);
+        qalSource3f(sid, AL_VELOCITY, 0.0f, 0.0f, 0.0f);
         qalSourcef(sid, AL_ROLLOFF_FACTOR, 0.0f);
         /* Explicitly clear any direct filter left from a previous 3-D use of
          * this source slot.  A stale low-pass (e.g. from a fully-occluded
