@@ -574,6 +574,7 @@ static qboolean           s_al_normCacheWritten;
 /* Cvars */
 static cvar_t *s_alDevice;
 static cvar_t *s_alHRTF;
+static cvar_t *s_alHeadShadow;   /* rear-source gain reduction in HRTF/UHJ spatial modes */
 static cvar_t *s_alEFX;          /* 0 = skip EFX init entirely (test/debug) */
 static cvar_t *s_alDirectChannels; /* 0 = disable AL_SOFT_direct_channels; active only when s_alHRTF 1 */
 static cvar_t *s_alMaxDist;
@@ -6471,6 +6472,7 @@ static void S_AL_Update( int msec )
                  * and substantially reduce the wall-to-clear volume jump. */
                 float gain   = gainFloor + (1.0f - gainFloor) * occ;
                 float gainHF = hfFloor   + (1.0f - hfFloor)   * occ;
+                float headShadowFactor = 1.0f;
 
                 vec3_t pos;
 
@@ -6534,8 +6536,34 @@ static void S_AL_Update( int msec )
                     qalSource3f(s_al_src[i].source, AL_POSITION,
                                 pos[0], pos[1], pos[2]);
 
+                /* Head-shadow correction for HRTF (s_alHRTF 1) and UHJ (s_alHRTF 2)
+                 * spatial modes. In binaural and ambisonics-based rendering the
+                 * spatial decoder can produce higher energy for sources behind the
+                 * listener than for equally-distant front sources, making rear
+                 * sounds (e.g. close enemy footsteps) perceptually louder than
+                 * intended.  Apply a smooth directional gain reduction that peaks
+                 * at directly behind (dot = -1) and fades to zero at the sides
+                 * (dot = 0), leaving front sources untouched. */
+                if (s_alHRTF && s_alHRTF->integer >= 1
+                        && s_alHeadShadow && s_alHeadShadow->value > 0.001f /* effectively disabled */) {
+                    float dx  = pos[0] - s_al_listener_origin[0];
+                    float dy  = pos[1] - s_al_listener_origin[1];
+                    float dz  = pos[2] - s_al_listener_origin[2];
+                    float dSq = dx*dx + dy*dy + dz*dz;
+                    if (dSq > 1.0f) {
+                        float rcp = 1.0f / sqrtf(dSq);
+                        float dot = (dx * s_al_listener_forward[0]
+                                   + dy * s_al_listener_forward[1]
+                                   + dz * s_al_listener_forward[2]) * rcp;
+                        if (dot < 0.0f)
+                            headShadowFactor = 1.0f
+                                              - s_alHeadShadow->value * (-dot);
+                    }
+                }
+                gain *= headShadowFactor;
+
                 if (s_al_efx.available) {
-                    if (occ > 0.98f && gainHF > 0.97f) {
+                    if (occ > 0.98f && gainHF > 0.97f && headShadowFactor > 0.98f) {
                         /* Fully clear and no disruption: use the EQ normalization
                          * filter if EQ is active (to keep dry+wet at source level),
                          * otherwise bypass filter entirely to avoid phase-shift coloration.
@@ -6572,7 +6600,7 @@ static void S_AL_Update( int msec )
                     qalSourcef(s_al_src[i].source, AL_GAIN,
                         (s_al_src[i].master_vol / 255.0f) *
                         S_AL_GetCategoryVol(s_al_src[i].category) *
-                        occ);
+                        occ * headShadowFactor);
                 }
 
                 if (s_alDebugOcc && s_alDebugOcc->integer && occ < 0.99f) {
@@ -6962,6 +6990,16 @@ qboolean S_AL_Init( soundInterface_t *si )
         "On speakers it smears transients into a muffled pop.\n"
         " 2 = UHJ — Ambisonics-based stereo encoding. Provides spatial positioning without HRTF "
         "convolution, preserving full bass and body. Works well on both headphones and speakers.");
+    s_alHeadShadow = Cvar_Get("s_alHeadShadow", "0.30", CVAR_ARCHIVE_ND);
+    Cvar_CheckRange(s_alHeadShadow, "0", "1", CV_FLOAT);
+    Cvar_SetDescription(s_alHeadShadow,
+        "Rear-source gain reduction for HRTF (s_alHRTF 1) and UHJ (s_alHRTF 2) spatial modes. "
+        "Compensates for energy imbalance where the spatial decoder makes sources behind the "
+        "listener appear louder than equally-distant front sources. "
+        "At directly behind (180 deg), source gain is multiplied by (1 - value): "
+        "0.30 -> 0.70x gain (~-3 dB); 0.50 -> 0.50x gain (~-6 dB). "
+        "Sources at the sides (90 deg) are unaffected; front sources are never attenuated. "
+        "0 = disabled (no correction). Has no effect when s_alHRTF 0. Default 0.30.");
     s_alEFX = Cvar_Get("s_alEFX", "1", CVAR_ARCHIVE_ND | CVAR_LATCH);
     Cvar_CheckRange(s_alEFX, "0", "1", CV_INTEGER);
     Cvar_SetDescription(s_alEFX, "Enable ALC_EXT_EFX (occlusion filters, reverb slots). "
