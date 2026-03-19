@@ -261,8 +261,8 @@ static LPALGETAUXILIARYEFFECTSLOTF    qalGetAuxiliaryEffectSlotf;
 typedef struct alSfxRec_s {
     ALuint              buffer;                 /* AL buffer handle */
     char                name[MAX_QPATH];
-    int                 soundLength;            /* in samples (file-rate frames) */
-    int                 fileRate;               /* original sample rate from the file (Hz) */
+    int                 soundLength;            /* submitted frame count (device-rate when pre-resampled, file-rate otherwise) */
+    int                 fileRate;               /* submitted sample rate (Hz) — device rate when pre-resampled, file rate otherwise */
     qboolean            defaultSound;           /* buzz on load failure */
     qboolean            inMemory;
     int                 lastTimeUsed;           /* Com_Milliseconds() */
@@ -1669,6 +1669,9 @@ static sfxHandle_t S_AL_RegisterSound( const char *sample, qboolean compressed )
     ALenum       fmt;
     unsigned int h;
     int          idx;
+    /* submitted frame count and rate — updated if pre-resampling succeeds */
+    int          submittedFrames;
+    int          submittedRate;
 
     if (!sample || !*sample)
         return 0;
@@ -1804,6 +1807,14 @@ static sfxHandle_t S_AL_RegisterSound( const char *sample, qboolean compressed )
         return 0;
     }
 
+    /* Track the frame count and rate actually submitted to the AL buffer.
+     * These default to the file's own values; if pre-resampling succeeds they
+     * are updated to the device-rate equivalents so that soundLength stays
+     * consistent with AL_SAMPLE_OFFSET (which OpenAL returns in submitted
+     * frames, not file-rate frames). */
+    submittedFrames = info.samples;
+    submittedRate   = info.rate;
+
     /* Pre-resample to the device's native rate when rates differ.
      * This converts the PCM exactly once at load time, so OpenAL receives
      * native-rate audio and its internal per-playback resampler never runs.
@@ -1847,8 +1858,10 @@ static sfxHandle_t S_AL_RegisterSound( const char *sample, qboolean compressed )
                     pcmToSubmit  = resampled;
                     fmtToSubmit  = (info.channels == 1)
                                     ? AL_FORMAT_MONO16 : AL_FORMAT_STEREO16;
-                    rateToSubmit = (int)s_al_deviceFreq;
-                    sizeToSubmit = outSamples * info.channels * (int)sizeof(short);
+                    rateToSubmit    = (int)s_al_deviceFreq;
+                    sizeToSubmit    = outSamples * info.channels * (int)sizeof(short);
+                    submittedFrames = outSamples;
+                    submittedRate   = (int)s_al_deviceFreq;
 
                     if (s_alDebugPlayback && s_alDebugPlayback->integer >= 1) {
                         Com_Printf("[alDbg] pre-resampled: %s  %d Hz → %d Hz"
@@ -1883,8 +1896,8 @@ static sfxHandle_t S_AL_RegisterSound( const char *sample, qboolean compressed )
         r->defaultSound = qtrue;
     }
 
-    r->soundLength  = info.samples;
-    r->fileRate     = info.rate;
+    r->soundLength  = submittedFrames;
+    r->fileRate     = submittedRate;
     r->inMemory     = qtrue;
     r->lastTimeUsed = Com_Milliseconds();
 
