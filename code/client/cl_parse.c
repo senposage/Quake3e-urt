@@ -318,15 +318,21 @@ static void CL_ParseSnapshot( msg_t *msg ) {
 	// measure snapshot interval for adaptive time management (before overwriting cl.snap)
 	if ( cl.snap.valid && newSnap.serverTime > cl.snap.serverTime ) {
 		int measured = newSnap.serverTime - cl.snap.serverTime;
-		int maxMeasured = cl.snapshotMsec > 0 ? cl.snapshotMsec * 4 : 200;
-		if ( measured >= 1 && measured <= maxMeasured ) {
-			if ( cl.snapshotMsec == 0 ) {
-				cl.snapshotMsec = measured;
-			} else {
-				cl.snapshotMsec = ( cl.snapshotMsec * 3 + measured ) >> 2; // EMA 75/25
+		// Only update the EMA on non-vanilla servers where sv_snapshotFps is known.
+		// On vanilla servers snapshotMsec stays pinned to the sv_fps seed from
+		// CL_ParseServerInfo, so burst packets cannot corrupt the adaptive timing
+		// thresholds used by CL_AdjustTimeDelta and CL_SetCGameTime.
+		if ( !cl.vanillaServer ) {
+			int maxMeasured = cl.snapshotMsec > 0 ? cl.snapshotMsec * 4 : 200;
+			if ( measured >= 1 && measured <= maxMeasured ) {
+				if ( cl.snapshotMsec == 0 ) {
+					cl.snapshotMsec = measured;
+				} else {
+					cl.snapshotMsec = ( cl.snapshotMsec * 3 + measured ) >> 2; // EMA 75/25
+				}
+				if ( cl.snapshotMsec < 8 ) cl.snapshotMsec = 8;
+				if ( cl.snapshotMsec > 100 ) cl.snapshotMsec = 100;
 			}
-			if ( cl.snapshotMsec < 8 ) cl.snapshotMsec = 8;
-			if ( cl.snapshotMsec > 100 ) cl.snapshotMsec = 100;
 		}
 		if ( cl.snapshotMsec > 0 ) {
 			SCR_NetMonitorAddSnapInterval( measured, cl.snapshotMsec );
