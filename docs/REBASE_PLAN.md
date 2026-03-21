@@ -35,8 +35,6 @@ that ship no PBR assets) is the motivating feature and is covered in detail in P
 
 Our repo (`Quake3e-urt`) has URT-specific patches on top of Quake3e that must be preserved:
 - URT auth server (`USE_AUTH`)
-- Anti-warp / lag compensation (`sv_antilag.c`)
-- Variable game Hz (`sv_gamehz`)
 - Positional VoIP + EQ normalisation (`snd_openal.c`)
 - Rankings system, TLD filter, demo recording
 
@@ -146,39 +144,7 @@ The server sends player GUIDs to the auth server; the auth server responds with 
 tweaks but does NOT have URT auth. Add a new `sv_urt_auth.c` / `sv_urt_auth.h` pair
 that implements the AUTH handshake, registered in `SV_Init`.
 
-### 3.2 Anti-Warp / Lag Compensation (`sv_antilag`)
-
-**Files**: `code/server/sv_antilag.c`, `code/server/sv_antilag.h`,
-`code/server/sv_main.c`, `code/server/sv_client.c`
-
-**What it does**: Records entity bounding-box history per server frame. On a hitscan
-attack, rewinds entities to the client's perceived time, traces the shot, then restores.
-
-**Key identifiers**: `SV_TimeShiftAllClients`, `SV_UnTimeShiftAllClients`,
-`sv_antilag`, `g_delagHitscan`, `antilag`.
-
-**Re-implementation note**: Upstream `sv_enhanced.c` already has a compatible
-`SV_Unlagged_*` implementation. Compare our `sv_antilag.c` against upstream
-`sv_enhanced.c` and merge differences (our version may have URT-specific frame-rate
-handling via `sv_gamehz`). Keep as `sv_urt_antilag.c` or merge into upstream's
-`sv_enhanced.c`.
-
-### 3.3 Variable Server Game Hz (`sv_gamehz`)
-
-**Files**: `code/server/sv_main.c`, `code/server/sv_antilag.c`,
-`code/server/server.h`, docs at `docs/project/SV_GAMEHZ.md`
-
-**What it does**: Allows the server game simulation to run at a configurable Hz
-(e.g., 125 Hz) independent of the network send rate. The anti-lag system must be
-aware of the game Hz for accurate rewind calculations.
-
-**Key identifiers**: `sv_gamehz`, `SV_GameHzFrame`, `svs.gameHz`.
-
-**Re-implementation note**: Upstream's game loop in `src/client/cl_gameframe.c`
-is more modular. The URT game-Hz logic should be added to server tick scheduling
-in `sv_main.c` of the new base.
-
-### 3.4 Positional VoIP + EQ Normalisation
+### 3.2 Positional VoIP + EQ Normalisation
 
 **Files**: `code/client/snd_openal.c` (8106 lines), `code/client/snd_main.c`
 
@@ -196,7 +162,7 @@ Port the positional VoIP and EQ normalization logic into the new audio backend.
 The upstream backend already has `s_openalVoipSpatial` and `s_openalVoipGain` cvars
 (verified in `src/audio/snd_main.c`). Add the team-gating and EQ normalization.
 
-### 3.5 Rankings System
+### 3.3 Rankings System
 
 **Files**: `code/server/sv_rankings.c`
 
@@ -206,7 +172,7 @@ queryable interface (used by the URT stats/matchmaking infrastructure).
 **Re-implementation note**: Add as `src/server/sv_urt_rankings.c`. No equivalent
 in upstream.
 
-### 3.6 TLD Filter
+### 3.4 TLD Filter
 
 **Files**: `code/server/tlds.h`
 
@@ -216,7 +182,7 @@ or player filtering on the URT server.
 **Re-implementation note**: Copy `tlds.h` directly to `src/server/tlds.h`, no
 functional change needed.
 
-### 3.7 Demo Recording (`USE_SERVER_DEMO`, `USE_URT_DEMO`)
+### 3.5 Demo Recording (`USE_SERVER_DEMO`, `USE_URT_DEMO`)
 
 **Files**: `code/server/sv_main.c`, `code/server/sv_client.c`,
 `code/client/cl_main.c`
@@ -228,7 +194,7 @@ functional change needed.
 path interfaces with `sv_snapshot.c`; ensure compatibility with upstream's snapshot
 system.
 
-### 3.8 URT Build Flags
+### 3.6 URT Build Flags
 
 **Makefile flags to carry forward into CMake**:
 - `USE_AUTH=1`
@@ -347,7 +313,7 @@ Each phase below maps to one or more feature branches:
 urt/next-gen-5-rebase          <- integration branch (merge target)
   urt/phase1-build             <- CMake + CI setup
   urt/phase2-auth              <- URT auth server
-  urt/phase3-server            <- antilag, gamehz, rankings, demo
+  urt/phase3-server            <- rankings, demo
   urt/phase4-audio             <- positional VoIP, EQ norm
   urt/phase5-renderer-compat   <- shader parser, texture compat
   urt/phase6-pbr-from-bsp      <- BSP PBR data generation (main feature)
@@ -360,12 +326,11 @@ For each URT patch file, the migration approach is:
 
 | Our file | Action |
 |---|---|
-| `sv_antilag.c/h` | Compare to upstream `sv_enhanced.c`; merge URT-specific diffs |
 | `sv_rankings.c` | Add as `src/server/sv_urt_rankings.c` |
 | `tlds.h` | Copy to `src/server/tlds.h` |
 | `snd_openal.c` | Port URT changes into `src/audio/backends/snd_backend_openal.c` |
 | `cl_main.c` (auth patches) | Apply auth patches to upstream `src/client/cl_main.c` |
-| `sv_main.c` (auth + gamehz) | Apply to upstream `src/server/sv_main.c` |
+| `sv_main.c` (auth) | Apply to upstream `src/server/sv_main.c` |
 | `sv_client.c` (auth + demo) | Apply to upstream `src/server/sv_client.c` |
 | `qcommon.h` (USE_AUTH defs) | Apply to upstream `src/qcommon/qcommon.h` |
 | Makefile `USE_AUTH` flags | Port to `cmake/URT.cmake` |
@@ -651,27 +616,20 @@ For best visual quality, supply _n and _orm textures per PBR_TEXTURES.md.
 
 ---
 
-### Phase 3: Server -- Anti-Lag, Game Hz, Rankings, Demo, TLD
+### Phase 3: Server -- Rankings, Demo, TLD
 
 **Branch**: `urt/phase3-server`  
-**Agent(s)**: 1-2  
-**Files**: `src/server/sv_urt_antilag.c`, `src/server/sv_urt_antilag.h`,
-`src/server/sv_urt_rankings.c`, `src/server/sv_urt_demo.c`,
-`src/server/sv_main.c`, `src/server/sv_client.c`, `src/server/tlds.h`
+**Agent(s)**: 1  
+**Files**: `src/server/sv_urt_rankings.c`, `src/server/sv_urt_demo.c`,
+`src/server/sv_client.c`, `src/server/tlds.h`
 
 **Tasks**:
-- [ ] Compare our `sv_antilag.c` against upstream `sv_enhanced.c`:
-  - Upstream already has `SV_Unlagged_*` -- identify what differs (likely: game-Hz
-    frame calculation, URT-specific entity types)
-  - Port the diffs into a `src/server/sv_urt_antilag.c` shim or extend `sv_enhanced.c`
-- [ ] Port `sv_gamehz`: add `sv_gamehz` cvar to `sv_main.c`, wire into the server
-  tick scheduler so game code runs at configurable Hz
 - [ ] Add `src/server/sv_urt_rankings.c` (copy + update includes)
 - [ ] Add `src/server/sv_urt_demo.c` for `USE_SERVER_DEMO` / `USE_URT_DEMO`
 - [ ] Copy `tlds.h` to `src/server/tlds.h`
 - [ ] Gate URT-specific server code behind `#ifdef USE_URT`
 
-**Deliverable**: URT anti-lag, gamehz, rankings, and demo recording functional.
+**Deliverable**: URT rankings and demo recording functional.
 
 ---
 
@@ -785,7 +743,6 @@ for competitive play; no authored asset changes required.
 **Tasks**:
 - [ ] Load `ut4_abbey` (representative URT map) with `r_pbr 1` -- verify no shader errors
 - [ ] Verify positional VoIP: player A talks, player B hears audio localized to A's position
-- [ ] Verify anti-lag: high-ping player registers hits correctly
 - [ ] Verify auth: client connects, auth handshake completes (mock auth server OK)
 - [ ] Run full build on Linux (GCC 15+, Clang 18+), macOS, Windows
 - [ ] Run smoke tests (`scripts/smoke_test.sh` from upstream)
@@ -800,8 +757,7 @@ for competitive play; no authored asset changes required.
 |---|---|---|
 | 1 | Build system | CMake, CI/CD |
 | 2 | URT auth | Networking, C server code |
-| 3a | Anti-lag + gamehz | Server physics, timing |
-| 3b | Rankings + demo | Server I/O |
+| 3 | Rankings + demo | Server I/O |
 | 4 | Audio / VoIP | OpenAL, signal processing |
 | 5 | Renderer compat | Shader systems, Q3 formats |
 | 6a | Normal map gen | Image processing, GLSL |
@@ -860,7 +816,6 @@ endif()
 
 # URT server extensions
 target_sources(idtech3_engine PRIVATE
-    src/server/sv_urt_antilag.c
     src/server/sv_urt_rankings.c
     src/server/sv_urt_demo.c
 )
@@ -896,8 +851,6 @@ Our existing CI scripts that call `make` must be updated to call
 
 ### Server
 
-- [ ] `sv_antilag 1`: high-ping player hits register (test with simulated 200ms latency)
-- [ ] `sv_gamehz 125`: server runs at 125 Hz game sim
 - [ ] `USE_AUTH`: client is accepted after successful auth handshake
 - [ ] `USE_AUTH`: client is kicked on auth denial
 - [ ] `USE_SERVER_DEMO`: server demo file created, playable
@@ -944,14 +897,6 @@ Our existing CI scripts that call `make` must be updated to call
 | Auth packet handler (client) | `code/client/cl_main.c` | `CL_AuthPacket` |
 | Auth request (server) | `code/server/sv_main.c` | `SV_AuthPacket` |
 | Auth server cvar | `code/server/sv_main.c` | `sv_authserver` |
-
-### Anti-lag -- key source locations in this repo
-
-| What | File | Symbol |
-|---|---|---|
-| Entity history record | `code/server/sv_antilag.c` | `SV_SaveStates` |
-| Rewind | `code/server/sv_antilag.c` | `SV_TimeShiftAllClients` |
-| Restore | `code/server/sv_antilag.c` | `SV_UnTimeShiftAllClients` |
 
 ### PBR autogen -- new symbols (Phase 6)
 
