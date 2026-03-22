@@ -269,24 +269,14 @@ VM_Init
 ==============
 */
 void VM_Init( void ) {
-    cvar_t* cv;
-
 #ifndef DEDICATED
-	cv= Cvar_Get( "vm_ui", "2", CVAR_ARCHIVE | CVAR_PROTECTED );	// !@# SHIP WITH SET TO 2
-    Cvar_SetDescription(cv, "Attempt to load the UI QVM and compile it to native assembly code\n2 - compile VM\n1 - interpreted VM\n0 - native VM using dynamic linking\nDefault: 2");
-
-    cv =Cvar_Get( "vm_cgame", "2", CVAR_ARCHIVE | CVAR_PROTECTED );	// !@# SHIP WITH SET TO 2
-    Cvar_SetDescription(cv, "Attempt to load the CGame QVM and compile it to native assembly code\n2 - compile VM\n1 - interpreted VM\n0 - native VM using dynamic linking\nDefault: 2");
-
+	Cvar_Get( "vm_ui", "2", CVAR_ARCHIVE | CVAR_PROTECTED );	// !@# SHIP WITH SET TO 2
+	Cvar_Get( "vm_cgame", "2", CVAR_ARCHIVE | CVAR_PROTECTED );	// !@# SHIP WITH SET TO 2
 #endif
-	cv =Cvar_Get( "vm_game", "2", CVAR_ARCHIVE | CVAR_PROTECTED );	// !@# SHIP WITH SET TO 2
-    Cvar_SetDescription(cv, "Attempt to load the Game QVM and compile it to native assembly code\n2 - compile VM\n1 - interpreted VM\n0 - native VM using dynamic linking\nDefault: 2");
+	Cvar_Get( "vm_game", "2", CVAR_ARCHIVE | CVAR_PROTECTED );	// !@# SHIP WITH SET TO 2
 
-    Cmd_AddCommand( "vmprofile", VM_VmProfile_f );
-    Cmd_SetDescription( "vmprofile", "Show VM profiling information\nusage: vmprofile <game|cgame|ui>" );
-
-    Cmd_AddCommand( "vminfo", VM_VmInfo_f );
-    Cmd_SetDescription( "vminfo", "Show VM information\nusage: vminfo" );
+	Cmd_AddCommand( "vmprofile", VM_VmProfile_f );
+	Cmd_AddCommand( "vminfo", VM_VmInfo_f );
 
 	Com_Memset( vmTable, 0, sizeof( vmTable ) );
 }
@@ -399,7 +389,7 @@ const char *VM_SymbolForCompiledPointer( vm_t *vm, void *code ) {
 ParseHex
 ===============
 */
-int	ParseHex( const char *text ) {
+static int	ParseHex( const char *text ) {
 	int		value;
 	int		c;
 
@@ -428,7 +418,7 @@ int	ParseHex( const char *text ) {
 VM_LoadSymbols
 ===============
 */
-void VM_LoadSymbols( vm_t *vm ) {
+static void VM_LoadSymbols( vm_t *vm ) {
 	union {
 		char	*c;
 		void	*v;
@@ -758,7 +748,6 @@ static vmHeader_t *VM_LoadQVM( vm_t *vm, qboolean alloc ) {
 	int					length;
 	unsigned int		dataLength;
 	unsigned int		dataAlloc;
-	int					i;
 	char				filename[MAX_QPATH], *errorMsg;
 	unsigned int		crc32sum;
 	qboolean			tryjts;
@@ -798,17 +787,31 @@ static vmHeader_t *VM_LoadQVM( vm_t *vm, qboolean alloc ) {
 	}
 
 	vm->exactDataLength = header->dataLength + header->litLength + header->bssLength;
-	dataLength = vm->exactDataLength + PROGRAM_STACK_EXTRA;
-	if ( dataLength < PROGRAM_STACK_SIZE + PROGRAM_STACK_EXTRA ) {
-		dataLength = PROGRAM_STACK_SIZE + PROGRAM_STACK_EXTRA;
+
+	dataLength = vm->exactDataLength;
+	if ( dataLength < PROGRAM_STACK_SIZE ) {
+		dataLength = PROGRAM_STACK_SIZE;
 	}
+
+	vm->programStackExtra = PROGRAM_STACK_EXTRA;
+
+	// if rounding difference is larger than extra space we need then reuse it
+	if ( log2pad( dataLength, 1 ) - dataLength >= PROGRAM_STACK_EXTRA ) {
+#ifdef _DEBUG
+		// keep exact size for debug purposes
+#else
+		// reuse it all for release builds
+		vm->programStackExtra = log2pad( dataLength, 1 ) - dataLength;
+		// Com_DPrintf( S_COLOR_CYAN "%s: reuse %i bytes for pStack\n", vm->name, vm->programStackExtra );
+#endif
+	} else {
+		dataLength += vm->programStackExtra;
+	}
+
 	vm->dataLength = dataLength;
 
-	// round up to next power of 2 so all data operations can
-	// be mask protected
-	for ( i = 0 ; dataLength > ( 1 << i ) ; i++ )
-		;
-	dataLength = 1 << i;
+	// round up to next power of 2 so all data operations can be mask protected
+	dataLength = log2pad( dataLength, 1 );
 
 	// reserve some space for effective LOCAL+LOAD* checks
 	dataAlloc = dataLength + VM_DATA_GUARD_SIZE;
@@ -835,7 +838,7 @@ static vmHeader_t *VM_LoadQVM( vm_t *vm, qboolean alloc ) {
 					"VM_Restart()\n", filename );
 			return NULL;
 		}
-		Com_Memset( vm->dataBase, 0, vm->dataAlloc );
+		Com_Memset( vm->dataBase, 0x0, vm->dataAlloc );
 	}
 
 	// copy the intialized data
@@ -1549,7 +1552,7 @@ const char *VM_CheckInstructions( instruction_t *buf,
 	} else {
 __noJTS:
 		v = 0;
-		// instructions with opStack > 0 can't be jump labels so its safe to optimize/merge
+		// instructions with opStack > 0 can't be jump labels so it is safe to optimize/merge
 		for ( i = 0, ci = buf; i < instructionCount; i++, ci++ ) {
 			if ( ci->op == OP_ENTER ) {
 				v = ci->swtch;
@@ -1569,6 +1572,351 @@ __noJTS:
 	VM_Fixup( buf, instructionCount );
 
 	return NULL;
+}
+
+
+/*
+=================
+VM_URT43_CgamePatches
+
+Apply runtime memory patches to the official UrbanTerror 4.3 cgame QVM.
+
+The effective patch bitmask is chosen automatically based on server type:
+  * Custom server (has sv_snapshotFps in serverinfo): cl_urt43cgPatches  (default 7)
+  * Vanilla server (no sv_snapshotFps):               cl_qvmPatchVanilla (default 3)
+cl_urt43serverIsVanilla (CVAR_TEMP) bridges the detection from CL_ParseServerInfo.
+
+Bitmask layout (shared by both cvars):
+
+  Bit 0 (1): Patch 2 -- fix frameInterpolation clamp bounds.
+             The QVM's existing clamp is wrong: lower threshold is 0.1f instead
+             of 0.0f (clips valid small fractions), and the upper clamp value is
+             ~0.99f instead of 1.0f.  Two constant-value fixes at instr 0xa688
+             and 0xa692.
+             Safe on any server -- no server-side dependency.
+
+  Bit 1 (2): Patch 3 -- prevent CG_InterpolateEntityPosition crash when
+             cg.nextSnap == NULL.  The QVM calls CG_Error() (fatal crash) when
+             the next snapshot pointer is NULL during high-latency spikes.
+             Replace the 5-instruction error path with CONST+JUMP to the
+             function's PUSH+LEAVE so it returns silently instead.
+             Safe on any server -- no server-side dependency.
+
+  Bit 2 (4): Patch 1 -- BG_EvaluateTrajectory TR_INTERPOLATE uses velocity
+             extrapolation.  The switch-table entry for trType==TR_INTERPOLATE
+             (case 1) currently falls through to TR_STATIONARY (VectorCopy only).
+             Redirect it to the TR_LINEAR case so entities use velocity-based
+             forward extrapolation when the next snapshot is unavailable.
+             REQUIRES SERVER-SIDE SUPPORT: sv_snapshot.c must anchor pos.trTime
+             to sv.time for every TR_INTERPOLATE client entity; vanilla servers
+             never do this, leaving trTime at 0 and causing enormous dt values
+             that teleport all entities every frame.  Automatically suppressed
+             on vanilla servers (cl_qvmPatchVanilla default excludes bit 2).
+             Also forces cg_smoothClients=1 on the client when applied.
+             CG_CalcEntityLerpPositions (QVM instr 0x1594f) unconditionally
+             writes trType=TR_INTERPOLATE into both currentState and nextState
+             for every player entity (number < 64) when cg_smoothClients==0
+             (the default).  This discards the server's TR_LINEAR trDelta
+             velocity data and routes all player entities through the pure
+             position-lerp path (CG_InterpolateEntityPosition), which evaluates
+             BG_EvaluateTrajectory at snap->serverTime -- giving dt==0 and
+             ignoring trDelta entirely.  At sv_fps > 60 the snap-transition
+             count per render frame is irregular (1 or 2 per frame), causing
+             frameInterpolation to oscillate and player entities to jitter.
+             With cg_smoothClients=1 the trType override is skipped; TR_LINEAR
+             entities use BG_EvaluateTrajectory(cg_time) -- continuous velocity-
+             based extrapolation at the actual render time that is insensitive
+             to snap-transition timing.  The CG_CVAR_SET intercept in
+             cl_cgame.c prevents the QVM from resetting the cvar mid-session.
+
+Target QVM: UrbanTerror 4.3 official binary
+  CRC32:            0x1289DB6B
+  instructionCount: 258563
+  exactDataLength:  38055548
+=================
+*/
+/* Named offsets for the BG_EvaluateTrajectory switch jump table in the
+   UrbanTerror 4.3 cgame data segment.  The switch covers trType values 0-11;
+   each entry is a 4-byte instruction index. */
+#define URT43_JT_BASE              0xdbb0   /* base data address of the table          */
+#define URT43_JT_TR_STATIONARY     (URT43_JT_BASE + 0*4)  /* case 0 (TR_STATIONARY)   */
+#define URT43_JT_TR_INTERPOLATE    (URT43_JT_BASE + 1*4)  /* case 1 (TR_INTERPOLATE)  */
+#define URT43_JT_TR_LINEAR         (URT43_JT_BASE + 2*4)  /* case 2 (TR_LINEAR)       */
+
+/* Expected instruction indices inside BG_EvaluateTrajectory */
+#define URT43_INSTR_TR_STATIONARY_CASE  0x3ab0c  /* VectorCopy handler (cases 0 & 1)  */
+#define URT43_INSTR_TR_LINEAR_CASE      0x3ab15  /* velocity extrapolation handler     */
+/* Dead CG_Error block at the end of BG_EvaluateTrajectory (instr 0x3b434-0x3b43e,
+   11 slots reachable only when trType < 0 or > 11).  We repurpose it as a
+   trTime-guard handler for TR_INTERPOLATE -- see Patch 1 below. */
+#define URT43_INSTR_TR_GUARD_CASE       0x3b434
+/* Frame layout of BG_EvaluateTrajectory (frame_size = 0x154):
+   arg0 (trajectory*) lives at LOCAL[frame_size + 0x8] = LOCAL[0x15c].
+   offsetof(trajectory_t, trTime) = 4 (trType is first, 4 bytes). */
+#define URT43_BGEVALTRAJ_ARG_TRAJECTORY 0x15c
+#define URT43_TRAJECTORY_TRTIME_OFFSET  4
+
+static void VM_URT43_CgamePatches( vm_t *vm, instruction_t *buf ) {
+	int cgPatches;
+	int applied = 0;
+	int skipped = 0;
+	qboolean isVanilla;
+	const char *patchCvar;
+
+	Com_DPrintf( S_COLOR_CYAN "VM_URT43_CgamePatches: entered (CRC=%08X)\n", vm->crc32sum );
+
+	/* Select the patch bitmask based on server type.
+	 * cl_urt43serverIsVanilla is a CVAR_TEMP set by CL_ParseServerInfo each
+	 * time a gamestate is received.  It is 1 for vanilla servers (no
+	 * sv_snapshotFps in serverinfo) and 0 for our custom server.
+	 * When unset (local game, demo playback) it defaults to 0 -> custom path. */
+	isVanilla  = ( Cvar_VariableIntegerValue( "cl_urt43serverIsVanilla" ) != 0 );
+	patchCvar  = isVanilla ? "cl_qvmPatchVanilla" : "cl_urt43cgPatches";
+	cgPatches  = Cvar_VariableIntegerValue( patchCvar );
+
+	Com_DPrintf( S_COLOR_CYAN "UrT43 cgame patch: CRC=%08X ic=%d dl=%d flags=0x%x (%s -> %s)\n",
+		vm->crc32sum, vm->instructionCount, vm->exactDataLength, cgPatches,
+		isVanilla ? "vanilla server" : "custom server", patchCvar );
+
+	/* ---------------------------------------------------------------
+	   Patch 2 (bit 0): Fix frameInterpolation clamp bounds
+	   Instruction 0xa688: lower threshold   0x3dcccccd (0.1f)  -> 0x00000000 (0.0f)
+	   Instruction 0xa692: upper clamp value 0x3f7d70a4 (~0.99f) -> 0x3f800000 (1.0f)
+	   --------------------------------------------------------------- */
+	if ( cgPatches & 1 ) {
+		qboolean ok_lo, ok_hi;
+
+		Com_DPrintf( S_COLOR_CYAN "  [Patch2] frameInterpolation clamp:\n" );
+		Com_DPrintf( "    [0xa688] op=0x%02x val=0x%08x (expect op=0x%02x val=0x%08x)\n",
+			buf[0xa688].op, (unsigned)buf[0xa688].value,
+			OP_CONST, 0x3dcccccdU );
+		Com_DPrintf( "    [0xa692] op=0x%02x val=0x%08x (expect op=0x%02x val=0x%08x)\n",
+			buf[0xa692].op, (unsigned)buf[0xa692].value,
+			OP_CONST, 0x3f7d70a4U );
+
+		ok_lo = ( buf[0xa688].op == OP_CONST && (unsigned)buf[0xa688].value == 0x3dcccccdU );
+		ok_hi = ( buf[0xa692].op == OP_CONST && (unsigned)buf[0xa692].value == 0x3f7d70a4U );
+
+		if ( ok_lo && ok_hi ) {
+			buf[0xa688].value = 0;           /* lower bound: 0.1f -> 0.0f */
+			buf[0xa692].value = 0x3f800000;  /* upper clamp value: ~0.99f -> 1.0f */
+			applied |= 1;
+			Com_DPrintf( S_COLOR_CYAN "    [Patch2] APPLIED: lower=0.0f upper=1.0f\n" );
+		} else {
+			skipped |= 1;
+			if ( !ok_lo )
+				Com_DPrintf( S_COLOR_YELLOW "    [Patch2] SKIP: instr 0xa688 mismatch"
+					" (op=%d val=0x%08x)\n",
+					buf[0xa688].op, (unsigned)buf[0xa688].value );
+			if ( !ok_hi )
+				Com_DPrintf( S_COLOR_YELLOW "    [Patch2] SKIP: instr 0xa692 mismatch"
+					" (op=%d val=0x%08x)\n",
+					buf[0xa692].op, (unsigned)buf[0xa692].value );
+		}
+	} else {
+		Com_DPrintf( S_COLOR_YELLOW "  [Patch2] DISABLED by cvar (bit 0 not set)\n" );
+	}
+
+	/* ---------------------------------------------------------------
+	   Patch 3 (bit 1): CG_InterpolateEntityPosition null-nextSnap crash fix
+	   Instructions 0x15894-0x15898: replace CG_Error path with early return.
+	   0x15894: OP_CONST 0x1594d  (address of PUSH+LEAVE)
+	   0x15895: OP_JUMP
+	   0x15896-0x15898: OP_IGNORE x3
+	   Also mark 0x1594d (PUSH before LEAVE) as a jump target for JIT.
+	   --------------------------------------------------------------- */
+	if ( cgPatches & 2 ) {
+		qboolean ok;
+
+		Com_DPrintf( S_COLOR_CYAN "  [Patch3] CG_InterpolateEntityPosition null crash:\n" );
+		Com_DPrintf( "    [0x15893] op=0x%02x val=0x%08x (expect NE=0x%02x target=0x%08x)\n",
+			buf[0x15893].op, (unsigned)buf[0x15893].value,
+			OP_NE, 0x00015899U );
+		Com_DPrintf( "    [0x15894] op=0x%02x val=0x%08x (expect CONST=0x%02x val=0x%08x)\n",
+			buf[0x15894].op, (unsigned)buf[0x15894].value,
+			OP_CONST, 0x000142ffU );
+		Com_DPrintf( "    [0x15895] op=0x%02x       (expect ARG=0x%02x)\n",
+			buf[0x15895].op, OP_ARG );
+		Com_DPrintf( "    [0x15896] op=0x%02x val=0x%08x (expect CONST=0x%02x val=0x%08x)\n",
+			buf[0x15896].op, (unsigned)buf[0x15896].value,
+			OP_CONST, 0x000006f8U );
+		Com_DPrintf( "    [0x15897] op=0x%02x       (expect CALL=0x%02x)\n",
+			buf[0x15897].op, OP_CALL );
+		Com_DPrintf( "    [0x15898] op=0x%02x       (expect POP=0x%02x)\n",
+			buf[0x15898].op, OP_POP );
+		Com_DPrintf( "    [0x1594d] op=0x%02x       (expect PUSH=0x%02x) [early-return target]\n",
+			buf[0x1594d].op, OP_PUSH );
+		Com_DPrintf( "    [0x1594e] op=0x%02x val=0x%08x (expect LEAVE=0x%02x val=0x%08x)\n",
+			buf[0x1594e].op, (unsigned)buf[0x1594e].value,
+			OP_LEAVE, 0x00000040U );
+
+		ok = ( buf[0x15893].op == OP_NE
+			&& (unsigned)buf[0x15893].value == 0x00015899U
+			&& buf[0x15894].op == OP_CONST
+			&& (unsigned)buf[0x15894].value == 0x000142ffU
+			&& buf[0x15897].op == OP_CALL
+			&& buf[0x15898].op == OP_POP
+			&& buf[0x1594d].op == OP_PUSH
+			&& buf[0x1594e].op == OP_LEAVE
+			&& (unsigned)buf[0x1594e].value == 0x00000040U );
+
+		if ( ok ) {
+			/* Replace the 5-slot CG_Error path with: CONST <return_addr> + JUMP + 3x IGNORE */
+			buf[0x15894].op    = OP_CONST;
+			buf[0x15894].value = 0x1594d;  /* PUSH+LEAVE early-return point */
+			buf[0x15895].op    = OP_JUMP;
+			buf[0x15895].value = 0;
+			VM_IgnoreInstructions( buf + 0x15896, 3 );
+			/* Mark early-return target as a jump target so JIT emits a native label */
+			buf[0x1594d].jused = 1;
+			applied |= 2;
+			Com_DPrintf( S_COLOR_CYAN "    [Patch3] APPLIED: CG_Error->early return at instr 0x1594d\n" );
+		} else {
+			skipped |= 2;
+			Com_DPrintf( S_COLOR_YELLOW "    [Patch3] SKIP: instruction pattern mismatch\n" );
+		}
+	} else {
+		Com_DPrintf( S_COLOR_YELLOW "  [Patch3] DISABLED by cvar (bit 1 not set)\n" );
+	}
+
+	/* ---------------------------------------------------------------
+	   Patch 1 (bit 2): BG_EvaluateTrajectory TR_INTERPOLATE -> TR_LINEAR
+	   with trTime == 0 guard (widest coverage).
+
+	   Step A -- instruction guard (0x3b434-0x3b43e):
+	   BG_EvaluateTrajectory contains a dead CG_Error block at 0x3b434
+	   (reached only when trType < 0 or > 11, which never happens in
+	   normal play).  We overwrite it with a 9-instruction guard:
+
+	     LOCAL  0x15c          ; arg0 = trajectory*
+	     LOAD4                 ; dereference
+	     CONST  0x4            ; offsetof(trajectory_t, trTime) = 4
+	     ADD                   ; &trajectory->trTime
+	     LOAD4                 ; trTime value
+	     CONST  0              ; 0
+	     EQ     TR_STATIONARY  ; if trTime==0 -> VectorCopy (safe, no extrapolation)
+	     CONST  TR_LINEAR      ; else fall through to velocity extrapolation
+	     JUMP
+
+	   This catches every caller: predicted player entity (trTime=0 because
+	   BG_PlayerStateToEntityState never writes it for snap=qfalse), any
+	   future entity type that forgets trTime, etc.
+
+	   Step B -- data-segment redirect:
+	   The switch jump table entry for TR_INTERPOLATE (case 1) is updated
+	   from TR_STATIONARY_CASE (0x3ab0c) to TR_GUARD_CASE (0x3b434) so
+	   that TR_INTERPOLATE entities flow through the guard instead of
+	   going directly to TR_LINEAR or TR_STATIONARY.
+
+	   Vanilla-server safety: this patch block is gated on cgPatches & 4,
+	   which is taken from cl_qvmPatchVanilla (not cl_urt43cgPatches) when
+	   cl_urt43serverIsVanilla is set, so vanilla servers that do not anchor
+	   trTime server-side will never enable bit 2 and this code never runs.
+	   --------------------------------------------------------------- */
+	if ( cgPatches & 4 ) {
+		int32_t *jt_case0 = (int32_t *)(vm->dataBase + URT43_JT_TR_STATIONARY);
+		int32_t *jt_case1 = (int32_t *)(vm->dataBase + URT43_JT_TR_INTERPOLATE);
+		int32_t *jt_case2 = (int32_t *)(vm->dataBase + URT43_JT_TR_LINEAR);
+
+		Com_DPrintf( S_COLOR_CYAN "  [Patch1] BG_EvaluateTrajectory TR_INTERPOLATE->TR_LINEAR+guard:\n" );
+		Com_DPrintf( "    data[0x%05x] case0(TR_STATIONARY) =0x%05x (expect 0x%05x)\n",
+			URT43_JT_TR_STATIONARY,  *jt_case0, URT43_INSTR_TR_STATIONARY_CASE );
+		Com_DPrintf( "    data[0x%05x] case1(TR_INTERPOLATE)=0x%05x (expect 0x%05x -> patch to 0x%05x)\n",
+			URT43_JT_TR_INTERPOLATE, *jt_case1,
+			URT43_INSTR_TR_STATIONARY_CASE, URT43_INSTR_TR_GUARD_CASE );
+		Com_DPrintf( "    data[0x%05x] case2(TR_LINEAR)     =0x%05x (expect 0x%05x)\n",
+			URT43_JT_TR_LINEAR,      *jt_case2, URT43_INSTR_TR_LINEAR_CASE );
+		Com_DPrintf( "    guard instr [0x%05x] op=0x%02x (expect OP_CONST=0x%02x val=1)\n",
+			URT43_INSTR_TR_GUARD_CASE,
+			buf[URT43_INSTR_TR_GUARD_CASE].op, OP_CONST );
+		Com_DPrintf( "    guard instr [0x%05x] op=0x%02x (expect OP_CALL=0x%02x)\n",
+			URT43_INSTR_TR_GUARD_CASE + 9,
+			buf[URT43_INSTR_TR_GUARD_CASE + 9].op, OP_CALL );
+
+		/* Guard: only patch if the table still contains the original values
+		   and the guard slot still contains the expected original instructions.
+		   On VM restart the case1 entry already equals TR_GUARD_CASE so the
+		   first check fails and we skip cleanly. */
+		if ( *jt_case0 == URT43_INSTR_TR_STATIONARY_CASE
+			&& *jt_case1 == URT43_INSTR_TR_STATIONARY_CASE
+			&& *jt_case2 == URT43_INSTR_TR_LINEAR_CASE
+			&& buf[URT43_INSTR_TR_GUARD_CASE].op    == OP_CONST
+			&& buf[URT43_INSTR_TR_GUARD_CASE].value == 1
+			&& buf[URT43_INSTR_TR_GUARD_CASE + 9].op == OP_CALL ) {
+
+			/* Step A: write the trTime==0 guard into the dead CG_Error block.
+			   LOCAL 0x15c / LOAD4 / CONST 4 / ADD / LOAD4 / CONST 0 /
+			   EQ->TR_STATIONARY / CONST TR_LINEAR / JUMP / IGNORE / IGNORE */
+			buf[URT43_INSTR_TR_GUARD_CASE + 0].op    = OP_LOCAL;
+			buf[URT43_INSTR_TR_GUARD_CASE + 0].value = URT43_BGEVALTRAJ_ARG_TRAJECTORY;
+			buf[URT43_INSTR_TR_GUARD_CASE + 1].op    = OP_LOAD4;
+			buf[URT43_INSTR_TR_GUARD_CASE + 1].value = 0;
+			buf[URT43_INSTR_TR_GUARD_CASE + 2].op    = OP_CONST;
+			buf[URT43_INSTR_TR_GUARD_CASE + 2].value = URT43_TRAJECTORY_TRTIME_OFFSET;
+			buf[URT43_INSTR_TR_GUARD_CASE + 3].op    = OP_ADD;
+			buf[URT43_INSTR_TR_GUARD_CASE + 3].value = 0;
+			buf[URT43_INSTR_TR_GUARD_CASE + 4].op    = OP_LOAD4;
+			buf[URT43_INSTR_TR_GUARD_CASE + 4].value = 0;
+			buf[URT43_INSTR_TR_GUARD_CASE + 5].op    = OP_CONST;
+			buf[URT43_INSTR_TR_GUARD_CASE + 5].value = 0;
+			buf[URT43_INSTR_TR_GUARD_CASE + 6].op    = OP_EQ;
+			buf[URT43_INSTR_TR_GUARD_CASE + 6].value = URT43_INSTR_TR_STATIONARY_CASE;
+			buf[URT43_INSTR_TR_GUARD_CASE + 7].op    = OP_CONST;
+			buf[URT43_INSTR_TR_GUARD_CASE + 7].value = URT43_INSTR_TR_LINEAR_CASE;
+			buf[URT43_INSTR_TR_GUARD_CASE + 8].op    = OP_JUMP;
+			buf[URT43_INSTR_TR_GUARD_CASE + 8].value = 0;
+			VM_IgnoreInstructions( buf + URT43_INSTR_TR_GUARD_CASE + 9, 2 );
+
+			/* Mark the guard entry as a jump target so the JIT emits a label */
+			buf[URT43_INSTR_TR_GUARD_CASE].jused = 1;
+			/* TR_STATIONARY and TR_LINEAR are now also jumped-to from new code */
+			buf[URT43_INSTR_TR_STATIONARY_CASE].jused = 1;
+			buf[URT43_INSTR_TR_LINEAR_CASE].jused     = 1;
+
+			/* Step B: redirect TR_INTERPOLATE switch entry to the guard */
+			*jt_case1 = URT43_INSTR_TR_GUARD_CASE;
+
+			applied |= 4;
+			Com_DPrintf( S_COLOR_CYAN "    [Patch1] APPLIED: TR_INTERPOLATE -> guard(0x%05x)"
+				" trTime==0->TR_STATIONARY else->TR_LINEAR\n",
+				URT43_INSTR_TR_GUARD_CASE );
+
+			/* Force cg_smoothClients=1 on custom servers so that
+			   CG_CalcEntityLerpPositions (instr 0x1594f) does NOT override the
+			   server's TR_LINEAR trajectory type for player entities.  Without
+			   this, the QVM writes trType=TR_INTERPOLATE into both currentState
+			   and nextState for every player entity (number < 64) when
+			   cg_smoothClients==0 (the default), silently discarding the trDelta
+			   velocity supplied by sv_smoothClients=1.  With cg_smoothClients=1
+			   that branch is skipped: TR_LINEAR entities are evaluated via
+			   BG_EvaluateTrajectory(cg_time) -- continuous velocity-based
+			   extrapolation independent of snap-transition timing, which
+			   eliminates the jitter seen at sv_fps > 60.
+			   Gated on !isVanilla: vanilla servers do not anchor trTime, so
+			   forcing cg_smoothClients=1 there would expose the raw trDelta==0
+			   path and freeze entities.  The CG_CVAR_SET intercept in cl_cgame.c
+			   prevents the QVM from resetting this value during the session. */
+			if ( !isVanilla ) {
+				Cvar_Set( "cg_smoothClients", "1" );
+				Com_DPrintf( S_COLOR_CYAN "    [Patch1] cg_smoothClients forced to 1 (custom server)\n" );
+			}
+		} else {
+			skipped |= 4;
+			Com_DPrintf( S_COLOR_YELLOW "    [Patch1] SKIP: mismatch"
+				" (case0=0x%05x case1=0x%05x case2=0x%05x"
+				" guard_op=%d guard+9_op=%d)\n",
+				*jt_case0, *jt_case1, *jt_case2,
+				buf[URT43_INSTR_TR_GUARD_CASE].op,
+				buf[URT43_INSTR_TR_GUARD_CASE + 9].op );
+		}
+	} else {
+		Com_DPrintf( S_COLOR_YELLOW "  [Patch1] DISABLED by cvar (bit 2 not set)\n" );
+	}
+
+	/* Summary line -- always visible */
+	Com_Printf( S_COLOR_CYAN "UrT43 cgame patch: applied=0x%x skipped=0x%x%s\n",
+		applied, skipped,
+		applied ? "" : " (no patches applied)" );
 }
 
 
@@ -1612,6 +1960,15 @@ void VM_ReplaceInstructions( vm_t *vm, instruction_t *buf ) {
 			if ( ip->value == 70943 ) {
 				VM_IgnoreInstructions( ip, 8 );
 			}
+		} else
+		/* UrbanTerror 4.3 official cgame binary */
+		if ( vm->crc32sum == 0x1289DB6B && vm->instructionCount == 258563 && vm->exactDataLength == 38055548 ) {
+			VM_URT43_CgamePatches( vm, buf );
+		} else {
+			/* Log a VMINFO line for any unrecognised cgame so patch dev can identify future versions */
+			Com_DPrintf( S_COLOR_YELLOW "UrT43 cgame patch: unrecognised cgame CRC=%08X ic=%d dl=%d"
+				" (patches not applied)\n",
+				vm->crc32sum, vm->instructionCount, vm->exactDataLength );
 		}
 	}
 
@@ -1697,18 +2054,13 @@ Used to load a development dll instead of a virtual machine
 TTimo: added some verbosity in debug
 =================
 */
-static void * QDECL VM_LoadDll( const char *name, dllSyscall_t *entryPoint, dllSyscall_t systemcalls ) {
+static void * QDECL VM_LoadDll( const char *name, vmMainFunc_t *entryPoint, dllSyscall_t systemcalls ) {
 
-	const char	*gamedir = Cvar_VariableString( "fs_game" );
 	char		filename[ MAX_QPATH ];
 	void		*libHandle;
 	dllEntry_t	dllEntry;
 
-	if ( !*gamedir ) {
-		gamedir = Cvar_VariableString( "fs_basegame" );
-	}
-
-	Com_sprintf( filename, sizeof( filename ), "%s%c%s" ARCH_STRING DLL_EXT, gamedir, PATH_SEP, name );
+	Com_sprintf( filename, sizeof( filename ), "%s" ARCH_STRING DLL_EXT, name );
 
 	libHandle = FS_LoadLibrary( filename );
 
@@ -1815,7 +2167,7 @@ vm_t *VM_Create( vmIndex_t index, syscall_t systemCalls, dllSyscall_t dllSyscall
 
 	// the stack is implicitly at the end of the image
 	vm->programStack = vm->dataMask + 1;
-	vm->stackBottom = vm->programStack - PROGRAM_STACK_SIZE - PROGRAM_STACK_EXTRA;
+	vm->stackBottom = vm->programStack - PROGRAM_STACK_SIZE - vm->programStackExtra;
 
 	vm->compiled = qfalse;
 
@@ -1955,7 +2307,13 @@ intptr_t QDECL VM_Call( vm_t *vm, int nargs, int callnum, ... )
 	}
 #endif
 
+	// reset syscall counter for top-level calls to detect infinite loops
+	if ( vm->callLevel == 0 ) {
+		vm->syscallCount = 0;
+	}
+
 	++vm->callLevel;
+
 	// if we have a dll loaded, call it directly
 	if ( vm->entryPoint )
 	{
@@ -1964,9 +2322,9 @@ intptr_t QDECL VM_Call( vm_t *vm, int nargs, int callnum, ... )
 		va_list ap;
 		va_start( ap, callnum );
 		for ( i = 0; i < nargs; i++ ) {
-			args[i] = va_arg( ap, int );
+			args[i] = va_arg( ap, int32_t );
 		}
-		va_end(ap);
+		va_end( ap );
 
 		// add more arguments if you're changed MAX_VMMAIN_CALL_ARGS:
 		r = vm->entryPoint( callnum, args[0], args[1], args[2] );
@@ -1985,7 +2343,7 @@ intptr_t QDECL VM_Call( vm_t *vm, int nargs, int callnum, ... )
 		args[0] = callnum;
 		va_start( ap, callnum );
 		for ( i = 0; i < nargs; i++ ) {
-			args[i+1] = va_arg( ap, int );
+			args[i+1] = va_arg( ap, int32_t );
 		}
 		va_end(ap);
 #ifndef NO_VM_COMPILED
@@ -2107,7 +2465,7 @@ VM_VmInfo_f
 ==============
 */
 static void VM_VmInfo_f( void ) {
-	vm_t	*vm;
+	const vm_t	*vm;
 	int		i;
 
 	Com_Printf( "Registered virtual machines:\n" );

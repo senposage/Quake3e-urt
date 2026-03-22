@@ -26,18 +26,6 @@
   |  |  sv.time  += frameMsec                                 | |
   |  |                                                        | |
   |  |  +--------------------------------------------------+  | |
-  |  |  | ANTILAG SUB-TICK RECORDING                       |  | |
-  |  |  | for ( s = 0; s < sv_physicsScale; s++ )          |  | |
-  |  |  |   SV_Antilag_RecordPositions()                   |  | |
-  |  |  |                                                  |  | |
-  |  |  | Records each active player's position into       |  | |
-  |  |  | per-client ring buffer at sv_fps * scale Hz.     |  | |
-  |  |  | (e.g. 60 * 3 = 180Hz shadow history)             |  | |
-  |  |  | Bots excluded — their positions only change      |  | |
-  |  |  | at game frame rate.                              |  | |
-  |  |  +--------------------------------------------------+  | |
-  |  |                                                        | |
-  |  |  +--------------------------------------------------+  | |
   |  |  | GAME FRAME (sv_gameHz inner loop)                |  | |
   |  |  |                                                  |  | |
   |  |  | sv.gameTimeResidual += frameMsec                 |  | |
@@ -62,6 +50,21 @@
   |  |  |   SV_BotFrame( sv.gameTime )                     |  | |
   |  |  |   VM_Call( gvm, GAME_RUN_FRAME, sv.gameTime )    |  | |
   |  |  +--------------------------------------------------+  | |
+  |  |                                                        | |
+  |  |  +--------------------------------------------------+  | |
+  |  |  | ANTILAG RECORDING (after game frame)             |  | |
+  |  |  | SV_Antilag_RecordPositions()                     |  | |
+  |  |  |                                                  |  | |
+  |  |  | Records each active player's position into       |  | |
+  |  |  | per-client ring buffer at sv_fps Hz.             |  | |
+  |  |  | Runs AFTER the game frame so shadow[T] holds     |  | |
+  |  |  | post-game positions == what snapshot[T] shows.   |  | |
+  |  |  | Only runs if game frame executed this tick        |  | |
+  |  |  | (_gameFrameRan guard — prevents duplicate        |  | |
+  |  |  | entries when sv_gameHz > 0 skips a tick).        |  | |
+  |  |  | Human clients only — bots excluded (FIFO        |  | |
+  |  |  | antilag handles bot targets; including bots      |  | |
+  |  |  | creates a double-rewind conflict).               |  | |
   |  |                                                        | |
   |  |  +--------------------------------------------------+  | |
   |  |  | PER-TICK SNAPSHOT DISPATCH                       |  | |
@@ -221,11 +224,15 @@
       |
       +-- sv_smoothClients 1?  (TR_LINEAR velocity mode)
       |     |
-      |     YES --> SV_SmoothGetAverageVelocity( sv_velSmooth samples )
-      |             Average velocity over last N ring buffer entries.
-      |             Set entity to TR_LINEAR with averaged velocity.
+      |     YES --> SV_SmoothGetAverageVelocity( sv_velSmooth window )
+      |             Exponential weighted average (alpha=0.5/step) over ring buffer.
+      |             Set entity to TR_LINEAR with EWA velocity.
       |             No latency cost, cgame evaluates trajectory continuously.
-      |             (Only when actually moving — idle = TR_INTERPOLATE)
+      |             EWA prevents uniform-cancel edge cases:
+      |               - Rapid L/R strafe: alternating ±v cancels to 0 uniformly,
+      |                 EWA yields non-zero (unequal weights) → stays TR_LINEAR.
+      |               - Jump in place (no fwd vel): Z near 0 at peak but older
+      |                 non-zero samples retain partial weight → stays TR_LINEAR.
       |
       +-- Neither? --> Write ps->origin directly into entity state.
                        TR_INTERPOLATE. Standard behavior.
@@ -242,13 +249,19 @@
         head++
         (safe double-mod: ((head % N + N) % N) handles int overflow)
 
-  SV_SmoothGetPosition( targetTime )     SV_SmoothGetAverageVelocity( count )
+  SV_SmoothGetPosition( targetTime )     SV_SmoothGetAverageVelocity( windowMs )
   |                                       |
   v                                       v
-  Walk backwards from head,               Average last N velocity samples.
-  find two slots bracketing               Smooths rapid direction changes
-  targetTime, lerp between them.          without adding latency.
-  Returns delayed position.               Returns averaged velocity vector.
+  Walk backwards from head,               Exponential weighted average (EWA)
+  find two slots bracketing               of velocity entries in window.
+  targetTime, lerp between them.          alpha=0.5/step: newest ~53% weight.
+  Returns delayed position.               Fixes two flip-flop edge cases:
+                                          - Rapid L/R strafe: ±v alternation
+                                            only partially cancels in EWA
+                                            (uniform average gives exactly 0).
+                                          - Jump peak (no fwd vel): older
+                                            non-zero Z samples retain weight,
+                                            keeping average above idle threshold.
 
   Ring buffer only records when:
   - (sv_bufferMs > 0 OR sv_velSmooth > 0) AND sv_extrapolate is on
@@ -258,20 +271,20 @@
 ## 6. Antilag System (sv_antilag.c)
 
 ```
-  RECORDING (per sv_fps tick, sv_physicsScale sub-ticks):
+  RECORDING (once per sv_fps tick):
 
   SV_Antilag_RecordPositions()
   |
-  for each active non-bot client:
+  for each active human client (bots excluded — FIFO antilag handles bot targets):
     shadowHistory[client].slots[ head % historySlots ] = {
       origin (from entity state),
       mins/maxs (bounding box),
-      time (svs.time)
+      time (sv.time)
     }
     head++
 
-  History depth: sv_fps * sv_physicsScale * windowMs / 1000
-  (e.g. 60 * 3 * 800ms / 1000 = 144 slots, covering 800ms)
+  History depth: sv_fps * windowMs / 1000
+  (e.g. 60 * 300ms / 1000 = 18 slots per second, ~300ms covered)
 
   REWINDING (on weapon trace):
 
@@ -400,6 +413,16 @@
     |            cl.serverTime     |           |
     |            (targeted here    |           |
     |             at ~50% mark)    |           |
+
+  NOTE — netgraph Ext counter at 60Hz:
+    At high fps (snapshotMsec < 30), the feedback loop uses equal backward/
+    forward steps (-2 / +2) to keep serverTimeDelta rock-stable (no ping
+    jitter).  This equilibrates at ~50% detection-zone entries, so Ext shows
+    approximately snapsHz/2 per second (e.g. ~30/s at sv_fps 60).
+    This is EXPECTED behaviour — the safety cap (Clp) prevents cl.serverTime
+    from passing the snapshot; Ext here reflects loop equilibrium, not genuine
+    client-side extrapolation.  The netgraph colour thresholds are raised
+    accordingly for snapshotMsec < 30 to avoid spurious yellow/red alerts.
 ```
 
 ## 9. Net Monitor Widget (cl_scrn.c)
@@ -535,7 +558,7 @@
                                                      |
                                                      v
                                                Antilag records position
-                                               (sv_fps * physicsScale Hz)
+                                               (sv_fps Hz, all clients)
                                                      |
                                                      v
                                                SV_BuildCommonSnapshot()

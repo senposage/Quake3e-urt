@@ -39,9 +39,9 @@ static void GetClientState( uiClientState_t *state ) {
 	Q_strncpyz( state->servername, cls.servername, sizeof( state->servername ) );
 	Q_strncpyz( state->updateInfoString, cls.updateInfoString, sizeof( state->updateInfoString ) );
 	Q_strncpyz( state->messageString, clc.serverMessage, sizeof( state->messageString ) );
-    state->clientNum = cl.snap.ps.clientNum;
+	state->clientNum = cl.snap.ps.clientNum;
 #ifdef USE_AUTH
-    Q_strncpyz( state->serverAddress, NET_AdrToStringwPort(&clc.serverAddress), sizeof( state->serverAddress ) );
+	Q_strncpyz( state->serverAddress, NET_AdrToStringwPort( &clc.serverAddress ), sizeof( state->serverAddress ) );
 #endif
 }
 
@@ -51,7 +51,7 @@ static void GetClientState( uiClientState_t *state ) {
 LAN_LoadCachedServers
 ====================
 */
-void LAN_LoadCachedServers( void ) {
+static void LAN_LoadCachedServers( void ) {
 	fileHandle_t fileIn;
 	int size, file_size;
 
@@ -87,7 +87,7 @@ void LAN_LoadCachedServers( void ) {
 LAN_SaveServersToCache
 ====================
 */
-void LAN_SaveServersToCache( void ) {
+static void LAN_SaveServersToCache( void ) {
 	fileHandle_t fileOut;
 	int size;
 
@@ -314,7 +314,7 @@ static void LAN_GetServerInfo( int source, int n, char *buf, int buflen ) {
 		Info_SetValueForKey( info, "hostname", server->hostName);
 		Info_SetValueForKey( info, "mapname", server->mapName);
 		Info_SetValueForKey( info, "clients", va("%i",server->clients));
-        Info_SetValueForKey( info, "bots", va("%i",server->bots));
+		Info_SetValueForKey( info, "bots", va("%i",server->bots));
 		Info_SetValueForKey( info, "sv_maxclients", va("%i",server->maxClients));
 		Info_SetValueForKey( info, "ping", va("%i",server->ping));
 		Info_SetValueForKey( info, "minping", va("%i",server->minPing));
@@ -324,9 +324,11 @@ static void LAN_GetServerInfo( int source, int n, char *buf, int buflen ) {
 		Info_SetValueForKey( info, "nettype", va("%i",server->netType));
 		Info_SetValueForKey( info, "addr", NET_AdrToStringwPort(&server->adr));
 		Info_SetValueForKey( info, "punkbuster", va("%i", server->punkbuster));
-        Info_SetValueForKey( info, "auth", va("%i", server->auth));
-        Info_SetValueForKey( info, "password", va("%i", server->password));
-        Info_SetValueForKey( info, "modversion", server->modversion);
+#ifdef USE_AUTH
+		Info_SetValueForKey( info, "auth", va("%i", server->auth));
+		Info_SetValueForKey( info, "password", va("%i", server->password));
+		Info_SetValueForKey( info, "modversion", server->modversion);
+#endif
 		Info_SetValueForKey( info, "g_needpass", va("%i", server->g_needpass));
 		Info_SetValueForKey( info, "g_humanplayers", va("%i", server->g_humanplayers));
 		Q_strncpyz(buf, info, buflen);
@@ -591,7 +593,7 @@ static int LAN_ServerIsVisible(int source, int n ) {
 LAN_UpdateVisiblePings
 =======================
 */
-qboolean LAN_UpdateVisiblePings(int source ) {
+static qboolean LAN_UpdateVisiblePings(int source ) {
 	return CL_UpdateVisiblePings_f(source);
 }
 
@@ -699,11 +701,11 @@ static void CLUI_SetCDKey( char *buf ) {
 	if ( UI_usesUniqueCDKey() && gamedir[0] != '\0' ) {
 		Com_Memcpy( &cl_cdkey[16], buf, 16 );
 		cl_cdkey[32] = '\0';
-		// set the flag so the fle will be written at the next opportunity
+		// set the flag so the flag will be written at the next opportunity
 		cvar_modifiedFlags |= CVAR_ARCHIVE;
 	} else {
 		Com_Memcpy( cl_cdkey, buf, 16 );
-		// set the flag so the fle will be written at the next opportunity
+		// set the flag so the flag will be written at the next opportunity
 		cvar_modifiedFlags |= CVAR_ARCHIVE;
 	}
 }
@@ -777,9 +779,38 @@ static qboolean UI_GetValue( char* value, int valueSize, const char* key ) {
 		return qtrue;
 	}
 
+	if ( !Q_stricmp( key, "trap_Cvar_SetDescription_Q3E" ) ) {
+		Com_sprintf( value, valueSize, "%i", UI_CVAR_SETDESCRIPTION );
+		return qtrue;
+	}
+
 	return qfalse;
 }
 
+
+/*
+====================
+UI_IsCvarWriteBlocked
+
+Returns qtrue if the named CVar must not be written by the UI/auth QVM
+when cl_authSecure is enabled.  cl_guid is included because the auth
+system legitimately reads it but must never be allowed to overwrite it.
+====================
+*/
+#ifdef USE_AUTH
+static qboolean UI_IsCvarWriteBlocked( const char *name ) {
+	return ( Q_stricmp( name, "cl_guid"           ) == 0
+		||   Q_stricmp( name, "snaps"             ) == 0
+		||   Q_stricmp( name, "cg_smoothClients"  ) == 0
+		||   Q_stricmp( name, "net_qport"         ) == 0
+		||   Q_stricmp( name, "net_dropsim"       ) == 0
+		||   Q_stricmp( name, "cl_packetdelay"    ) == 0
+		||   Q_stricmp( name, "cl_packetdup"      ) == 0
+		||   Q_stricmp( name, "cl_timeout"        ) == 0
+		||   Q_stricmp( name, "in_mouse"          ) == 0
+		||   Q_stricmp( name, "cl_noOOBDisconnect") == 0 );
+}
+#endif
 
 /*
 ====================
@@ -810,11 +841,47 @@ static intptr_t CL_UISystemCalls( intptr_t *args ) {
 		return 0;
 
 	case UI_CVAR_SET:
+		// When cl_authSecure is enabled: mirror the CG_CVAR_SET protection
+		// so the closed-binary auth/UI QVM cannot force or fingerprint CVars.
+		// cl_guid is explicitly named because auth reads it legitimately but
+		// must never be allowed to overwrite it.
+		// When cl_authSecure is 0 fall through to the plain Cvar_SetSafe.
+#ifdef USE_AUTH
+		if ( cl_authSecure && cl_authSecure->integer ) {
+			const char *cvarName  = (const char *)VMA(1);
+			const char *cvarValue = (const char *)VMA(2);
+			unsigned cvFlags = Cvar_Flags( cvarName );
+
+			if ( UI_IsCvarWriteBlocked( cvarName )
+				|| ( Q_stricmp( cvarName, "rate" ) == 0
+					&& atoi( cvarValue ) <= 0 ) ) {
+				SCR_LogNote( "UI:SET_INTERCEPTED",
+					va( "\"%s\" = \"%s\" (silently ignored)",
+						cvarName, cvarValue ) );
+				return 0;
+			}
+			if ( cvFlags != CVAR_NONEXISTENT
+				&& ( cvFlags & ( CVAR_PROTECTED | CVAR_PRIVATE ) ) ) {
+				SCR_LogNote( "UI:SET_BLOCKED",
+					va( "\"%s\" = \"%s\" (protected)",
+						cvarName, cvarValue ) );
+				// fall through -- Cvar_SetSafe will refuse it
+			}
+		}
+#endif
 		Cvar_SetSafe( VMA(1), VMA(2) );
 		return 0;
 
 	case UI_CVAR_VARIABLEVALUE:
-		return FloatAsInt( Cvar_VariableValue( VMA(1) ) );
+		// Always filter CVAR_PRIVATE -- matches existing VARIABLESTRINGBUFFER
+		// behaviour and prevents the auth QVM reading private cvars as floats.
+		{
+			const char *cvarName = (const char *)VMA(1);
+			unsigned cvFlags = Cvar_Flags( cvarName );
+			if ( cvFlags != CVAR_NONEXISTENT && ( cvFlags & CVAR_PRIVATE ) )
+				return FloatAsInt( 0.0f );
+			return FloatAsInt( Cvar_VariableValue( cvarName ) );
+		}
 
 	case UI_CVAR_VARIABLESTRINGBUFFER:
 		VM_CHECKBOUNDS( uivm, args[2], args[3] );
@@ -822,10 +889,48 @@ static intptr_t CL_UISystemCalls( intptr_t *args ) {
 		return 0;
 
 	case UI_CVAR_SETVALUE:
+		// Same gate as UI_CVAR_SET.
+#ifdef USE_AUTH
+		if ( cl_authSecure && cl_authSecure->integer ) {
+			const char *cvarName = (const char *)VMA(1);
+			unsigned cvFlags = Cvar_Flags( cvarName );
+
+			if ( UI_IsCvarWriteBlocked( cvarName )
+				|| ( Q_stricmp( cvarName, "rate" ) == 0
+					&& VMF(2) <= 0.0f ) ) {
+				SCR_LogNote( "UI:SETVALUE_INTERCEPTED",
+					va( "\"%s\" = \"%g\" (silently ignored)",
+						cvarName, VMF(2) ) );
+				return 0;
+			}
+			if ( cvFlags != CVAR_NONEXISTENT
+				&& ( cvFlags & ( CVAR_PROTECTED | CVAR_PRIVATE ) ) ) {
+				SCR_LogNote( "UI:SETVALUE_BLOCKED",
+					va( "\"%s\" = \"%g\" (protected)",
+						cvarName, VMF(2) ) );
+				// fall through -- Cvar_SetValueSafe will refuse it
+			}
+		}
+#endif
 		Cvar_SetValueSafe( VMA(1), VMF(2) );
 		return 0;
 
 	case UI_CVAR_RESET:
+		// Block resets of CVAR_PROTECTED/PRIVATE when cl_authSecure is on.
+		// Resetting cl_guidOverride would clear the user's random GUID;
+		// resetting cl_noOOBDisconnect / cl_timeNudge etc. undoes hardening.
+#ifdef USE_AUTH
+		if ( cl_authSecure && cl_authSecure->integer ) {
+			const char *cvarName = (const char *)VMA(1);
+			unsigned cvFlags = Cvar_Flags( cvarName );
+			if ( cvFlags != CVAR_NONEXISTENT
+				&& ( cvFlags & ( CVAR_PROTECTED | CVAR_PRIVATE ) ) ) {
+				SCR_LogNote( "UI:RESET_BLOCKED",
+					va( "\"%s\" (protected)", cvarName ) );
+				return 0;
+			}
+		}
+#endif
 		Cvar_Reset( VMA(1) );
 		return 0;
 
@@ -834,7 +939,16 @@ static intptr_t CL_UISystemCalls( intptr_t *args ) {
 		return 0;
 
 	case UI_CVAR_INFOSTRINGBUFFER:
+		// Log all calls under cl_authSecure so info-dump attempts by the
+		// auth QVM are visible in the session log.  The call itself is
+		// always allowed -- the UI needs this to display server/client info.
 		VM_CHECKBOUNDS( uivm, args[2], args[3] );
+#ifdef USE_AUTH
+		if ( cl_authSecure && cl_authSecure->integer ) {
+			SCR_LogNote( "UI:INFOSTRING",
+				va( "flags=0x%x", (unsigned)args[1] ) );
+		}
+#endif
 		Cvar_InfoStringBuffer( args[1], VMA(2), args[3] );
 		return 0;
 
@@ -847,16 +961,55 @@ static intptr_t CL_UISystemCalls( intptr_t *args ) {
 		return 0;
 
 	case UI_CMD_EXECUTETEXT:
-		if(args[1] == EXEC_NOW
-		&& (!strncmp(VMA(2), "snd_restart", 11)
-		|| !strncmp(VMA(2), "vid_restart", 11)
-		|| !strncmp(VMA(2), "disconnect", 10)
-		|| !strncmp(VMA(2), "quit", 5)))
+		// When cl_authSecure is enabled: log every command the UI QVM
+		// (including the auth module) injects, and block a wider set of
+		// dangerous commands than the original upstream check.
 		{
-			Com_Printf (S_COLOR_YELLOW "turning EXEC_NOW '%.11s' into EXEC_INSERT\n", (const char*)VMA(2));
-			args[1] = EXEC_INSERT;
+			const char *uiCmd = (const char *)VMA(2);
+#ifdef USE_AUTH
+			if ( cl_authSecure && cl_authSecure->integer ) {
+				char tok[64];
+				size_t ti = 0;
+
+				// Extract first token.
+				while ( ti < sizeof(tok) - 1 && uiCmd[ti]
+					&& uiCmd[ti] != ' ' && uiCmd[ti] != '\t'
+					&& uiCmd[ti] != '\n' && uiCmd[ti] != ';' ) {
+					tok[ti] = uiCmd[ti]; ti++;
+				}
+				tok[ti] = '\0';
+
+				// Block dangerous commands regardless of exec mode.
+				if ( Q_stricmp( tok, "quit"         ) == 0
+					|| Q_stricmp( tok, "exit"        ) == 0
+					|| Q_stricmp( tok, "exec"        ) == 0
+					|| Q_stricmp( tok, "writeconfig" ) == 0
+					|| Q_stricmp( tok, "condump"     ) == 0 ) {
+					SCR_LogNote( "UI:EXEC_BLOCKED",
+						va( "dangerous cmd blocked: \"%s\"", uiCmd ) );
+					Com_Printf( S_COLOR_YELLOW
+						"WARNING: UI QVM tried to inject dangerous command"
+						" -- blocked: \"%s\"\n", uiCmd );
+					return 0;
+				}
+
+				SCR_LogNote( "UI:EXEC",
+					va( "mode=%d cmd=\"%s\"", (int)args[1], uiCmd ) );
+			}
+#endif
+			// Upstream guard: prevent EXEC_NOW on restart/disconnect cmds.
+			if ( args[1] == EXEC_NOW
+				&& ( !Q_stricmp( uiCmd, "snd_restart" )
+					|| !Q_stricmp( uiCmd, "vid_restart" )
+					|| !Q_stricmp( uiCmd, "disconnect"  )
+					|| !Q_stricmp( uiCmd, "quit"        ) ) ) {
+				Com_Printf( S_COLOR_YELLOW
+					"turning EXEC_NOW '%.11s' into EXEC_INSERT\n", uiCmd );
+				args[1] = EXEC_INSERT;
+			}
+
+			Cbuf_ExecuteText( args[1], uiCmd );
 		}
-		Cbuf_ExecuteText( args[1], VMA(2) );
 		return 0;
 
 	case UI_FS_FOPENFILE:
@@ -1067,8 +1220,8 @@ static intptr_t CL_UISystemCalls( intptr_t *args ) {
 		return Hunk_MemoryRemaining();
 
 	case UI_GET_CDKEY:
-//		VM_CHECKBOUNDS( uivm, args[1], args[2] );
-//		CLUI_GetCDKey( VMA(1), args[2] );
+		VM_CHECKBOUNDS( uivm, args[1], args[2] );
+		CLUI_GetCDKey( VMA(1), args[2] );
 		return 0;
 
 	case UI_SET_CDKEY:
@@ -1098,7 +1251,7 @@ static intptr_t CL_UISystemCalls( intptr_t *args ) {
 
 	case TRAP_STRNCPY:
 		VM_CHECKBOUNDS( uivm, args[1], args[3] );
-		strncpy( VMA(1), VMA(2), args[3] );
+		Q_strncpy( VMA(1), VMA(2), args[3] );
 		return args[1];
 
 	case TRAP_SIN:
@@ -1141,20 +1294,17 @@ static intptr_t CL_UISystemCalls( intptr_t *args ) {
 		return Com_RealTime( VMA(1) );
 
 	case UI_CIN_PLAYCINEMATIC:
-//		Com_DPrintf("UI_CIN_PlayCinematic\n");
-//		return CIN_PlayCinematic(VMA(1), args[2], args[3], args[4], args[5], args[6]);
-        return 0;
+		Com_DPrintf("UI_CIN_PlayCinematic\n");
+		return CIN_PlayCinematic(VMA(1), args[2], args[3], args[4], args[5], args[6]);
 
 	case UI_CIN_STOPCINEMATIC:
-//		return CIN_StopCinematic(args[1]);
-        return 0;
+		return CIN_StopCinematic(args[1]);
 
 	case UI_CIN_RUNCINEMATIC:
-//		return CIN_RunCinematic(args[1]);
-        return 0;
+		return CIN_RunCinematic(args[1]);
 
 	case UI_CIN_DRAWCINEMATIC:
-//		CIN_DrawCinematic(args[1]);
+		CIN_DrawCinematic(args[1]);
 		return 0;
 
 	case UI_CIN_SETEXTENTS:
@@ -1166,7 +1316,7 @@ static intptr_t CL_UISystemCalls( intptr_t *args ) {
 		return 0;
 
 	case UI_VERIFY_CDKEY:
-		return 0;
+		return Com_CDKeyValidate(VMA(1), VMA(2));
 
 	// engine extensions
 	case UI_R_ADDREFENTITYTOSCENE2:
@@ -1178,35 +1328,34 @@ static intptr_t CL_UISystemCalls( intptr_t *args ) {
 		re.AddLinearLightToScene( VMA(1), VMA(2), VMF(3), VMF(4), VMF(5), VMF(6) );
 		return 0;
 
+	case UI_CVAR_SETDESCRIPTION:
+		Cvar_SetDescription2( (const char*)VMA(1), (const char*)VMA(2) );
+		return 0;
+
 	case UI_TRAP_GETVALUE:
 		VM_CHECKBOUNDS( uivm, args[1], args[2] );
 		return UI_GetValue( VMA(1), args[2], VMA(3) );
 
 #ifdef USE_AUTH
-    case UI_NET_STRINGTOADR:
-		return NET_StringToAdr( VMA(1), VMA(2), NA_IP);
+	case UI_NET_STRINGTOADR:
+		Com_DPrintf( "UI_NET_STRINGTOADR: %s\n", (const char *)VMA(1) );
+		return NET_StringToAdr( VMA(1), VMA(2), NA_IP );
 
 	case UI_Q_VSNPRINTF:
-		return Q_vsnprintf( VMA(1), *((size_t *)VMA(2)), VMA(3), VMA(4));
+		return Q_vsnprintf( VMA(1), *((size_t *)VMA(2)), VMA(3), VMA(4) );
 
 	case UI_NET_SENDPACKET:
 		{
 			netadr_t addr;
-			const char * destination = VMA(4);
-
-			NET_StringToAdr( destination, &addr, NA_IP);
+			const char *destination = VMA(4);
+			NET_StringToAdr( destination, &addr, NA_IP );
 			NET_SendPacket( args[1], args[2], VMA(3), &addr );
 		}
 		return 0;
 
 	case UI_COPYSTRING:
-		CopyString(VMA(1));
+		CopyString( VMA(1) );
 		return 0;
-
-//	case UI_SYS_STARTPROCESS:
-//		Sys_StartProcess( VMA(1), VMA(2) );
-//		return 0;
-
 #endif
 
 	default:

@@ -1,4 +1,3 @@
-# Client Subsystem
 
 > Covers all files in `code/client/`. Custom changes are marked **[CUSTOM]**.
 
@@ -29,20 +28,20 @@
 
 | File | Lines | Custom? | Purpose |
 |------|-------|---------|---------|
-| `cl_main.c` | 5463 | no | Connection, demo recording, init/shutdown |
+| `cl_main.c` | ~5500 | **YES** | Connection, URT demo recording, auth, cvar defaults |
 | `cl_parse.c` | 1300 | **YES** | Parse server messages, snapshot EMA |
-| `cl_cgame.c` | 1050 | **YES** | cgame QVM syscall handler, time sync |
+| `cl_cgame.c` | ~1100 | **YES** | cgame QVM syscall handler, time sync, clientScreenshot |
 | `cl_input.c` | 820 | **YES** | Key→usercmd, download packet throttle |
 | `cl_keys.c` | 640 | no | Key binding management |
 | `cl_console.c` | 580 | no | In-game console |
-| `cl_scrn.c` | 560 | no | Screen layout, loading screens |
+| `cl_scrn.c` | ~800 | **YES** | Screen layout, net monitor widget (cl_netgraph) |
 | `cl_ui.c` | 550 | no | UI QVM interface |
 | `cl_cin.c` | 1744 | no | RoQ video decoder |
 | `cl_net_chan.c` | 200 | no | Client netchan (+ demo filter) |
 | `cl_avi.c` | 580 | no | AVI video capture |
 | `cl_curl.c` | 800 | no | HTTP download (libcurl) |
 | `cl_jpeg.c` | 160 | no | JPEG screenshot writer |
-| `client.h` | 700 | **YES** | clientActive_t with snapshotMsec |
+| `client.h` | ~750 | **YES** | clientActive_t with snapshotMsec, auth, demoprotocol fields |
 
 ---
 
@@ -64,6 +63,17 @@ CL_Init:
   CL_RegisterCvars()        ← register all client cvars
   Cmd_AddCommand()          ← connect, disconnect, demo, record, etc.
 ```
+
+  [URT cvar defaults]:
+    rate          "90000"        (upstream: 25000)
+    snaps         "60" + CVAR_PROTECTED  (upstream: 40, unprotected)
+    cl_timeNudge  CVAR_PROTECTED (upstream: CVAR_TEMP)
+    cl_allowDownload CVAR_ROM|CVAR_PROTECTED (upstream: CVAR_ARCHIVE_ND)
+    cl_mapAutoDownload "1"       (upstream: 0)
+    cl_dlURL      "http://urt.li/q3ut4" (upstream: ws.q3df.org)
+    com_maxfps    + CVAR_PROTECTED
+    com_maxfpsUnfocused "0"      (upstream: 60)
+    com_blood     uncommented and declared
 
 ### CL_Frame(msec)
 
@@ -104,14 +114,23 @@ Retransmit logic during connection:
 
 ### Demo Recording
 
-`CL_Record_f()` — start recording to a `.dm_68` file:
+`CL_Record_f()` — start recording to a `.dm_68` or `.urtdemo` file `[USE_URT_DEMO]`:
 - `CL_WriteGamestate(true)` — write full gamestate first
+- `[USE_URT_DEMO]` Writes URT header (modversion + `URT_PROTOCOL_VERSION=70` + 2 reserved ints)
 - Subsequent packets stored by `CL_WriteDemoMessage` in `cl_net_chan.c`
+- `[USE_URT_DEMO]` Writes backward-play size markers per frame
 
 `CL_StopRecord_f()` — flush and close demo file.
 
+`CL_CheckDemoProtocol()` `[USE_URT_DEMO]` — determines protocol version from file extension:
+- `.urtdemo` → `demoprotocol = URT_PROTOCOL_VERSION (70)`
+- `.dm_NN` → `demoprotocol = NN`
+
 `CL_PlayDemo_f()` — load and play a demo:
-- Opens `.dm_68` (or `.dm_67`, `.dm_84`, `.dm_91` for older protocols)
+- Opens `.urtdemo` (URT format) or `.dm_68` / `.dm_67` / `.dm_84` / `.dm_91`
+- `[USE_URT_DEMO]` Reads URT header, verifies protocol, sets `clc.demoprotocol`
+- `[USE_URT_DEMO]` Skips backward-play size markers on read
+- `[USE_URT_DEMO]` Zero-size URT end-of-demo check
 - Reads messages as if they were incoming network packets
 - Demo time driven by `cls.realtime`
 
@@ -244,12 +263,40 @@ Computes `cl.serverTime` for the cgame. The most change-heavy function in the cl
 CL_SetCGameTime:
     if !cl.snap.valid: handle extrapolation
     
-    [CUSTOM: proportional clamp]
-    // Clamp serverTime so it can never get more than snapshotMsec ahead
-    // of the latest snapshot. Vanilla hardcoded 5ms which worked at 20Hz
-    // but caused overshooting at 60Hz.
-    if (cl.serverTime > cl.snap.serverTime + cl.snapshotMsec):
-        cl.serverTime = cl.snap.serverTime + cl.snapshotMsec
+    [CUSTOM: safety cap — correct architecture, not a workaround]
+    // WHY A CAP: usercmd.serverTime is stamped directly from cl.serverTime
+    // (CL_FinishMove), so if cl.serverTime runs ahead of sv.time the URT game
+    // QVM computes a negative (→ 999) ping, triggering a ping-kick that feeds
+    // the zombie-state reconnect flood.  Capping cl.serverTime here is the
+    // correct fix — the only alternative would be to decouple usercmd.serverTime
+    // from cl.serverTime, which is a much larger refactor.
+    //
+    // MARGIN vs BACKSTOP: capMs = snapshotMsec/4.  The extrapolate threshold
+    // below is snapshotMsec/3 — slightly larger — so CL_AdjustTimeDelta starts
+    // pulling serverTimeDelta back BEFORE cl.serverTime reaches the cap boundary.
+    // In normal operation the cap fires rarely (jitter spikes only); it is a
+    // backstop, not a primary timing control.  A 1ms margin (historical bug)
+    // made the cap fire every inter-snapshot frame, freezing cl.serverTime and
+    // causing visible stutter and movement lag.
+    //
+    // RELEASE (2000ms): absolute wall-clock server-silence detector — not
+    // proportional to snapshotMsec.  Once the last snapshot is >2s old the
+    // server is presumed dead; the cap releases so cl.serverTime can advance
+    // and the engine can extrapolate gracefully until cl_timeout fires.
+    //
+    // History vs vanilla:
+    //   Vanilla Q3e:   NO cap — cl.serverTime could freely exceed snap.serverTime.
+    //   PR #65/66:     cap = 1ms, but gated on cl_adaptiveTiming && !vanillaServer
+    //                  (vanilla servers were excluded, so the flood bug persisted).
+    //   PR #68:        cap = 1ms, unconditional — correct architecture, but 1ms
+    //                  was too tight: cap fired every inter-snapshot frame → freeze.
+    //   Commit 571ab66: tried to raise to 2ms but only changed the comment; the
+    //                  actual -1 value was never updated.
+    //   Current:       cap = snapshotMsec/4, clamped [2, 8] ms, unconditional.
+    //                  At 20Hz (snapshotMsec=50) → 8ms.  At 60Hz (16ms) → 4ms.
+    capMs = clamp(snapshotMsec / 4, 2, 8)
+    if (cl.serverTime >= cl.snap.serverTime AND drift < 2000):
+        cl.serverTime = cl.snap.serverTime - capMs
 
     [CUSTOM: proportional extrapolate threshold]
     // Vanilla: if serverTime >= snap.serverTime - 5ms: set extrapolatedSnapshot
@@ -276,7 +323,7 @@ if deltaDelta > resetTime:   hard reset to newDelta; slowFrac = 0
 elif deltaDelta > fastAdjust: cl.serverTimeDelta = (old + new) / 2; slowFrac = 0
 else (slow drift — fractional accumulator):
     if extrapolatedSnapshot:
-        slowFrac -= (snapshotMsec < 30) ? 2 : 4   // -½ms or -1ms
+        slowFrac -= (snapshotMsec < 30) ? 2 : 4   // -½ms (60Hz: equal to fwd → stable serverTimeDelta) or -1ms (20Hz)
     else:
         slowFrac += 2                               // +½ms always
     if |slowFrac| >= 4:                             // commit threshold = ±1ms
@@ -288,12 +335,21 @@ else (slow drift — fractional accumulator):
         slowFrac -= 4 (or += 4)
 ```
 
-**Fractional accumulator:** Prevents ±1ms oscillation at equilibrium. At 60Hz, equilibrium extrap rate is 50% (-2 and +2 cancel). At 20Hz, 33% (-4 and +2 cancel at 1:2 ratio). slowFrac oscillates in [-2, +2] at equilibrium — never reaching the ±4 commit threshold, so serverTimeDelta stays rock stable.
+**Fractional accumulator:** Prevents ±1ms oscillation at equilibrium. At 60Hz (snapshotMsec < 30), the backward and forward steps are equal (-2 / +2): slowFrac oscillates in [-2, +2] without ever reaching the ±4 commit threshold — serverTimeDelta stays rock-stable with zero ping jitter. The tradeoff is a ~50% detection-zone entry rate, visible as **Ext ≈ snapsHz/2 in the netgraph** (e.g. ~30/s at sv_fps 60). **This is expected behaviour, not actual client-side extrapolation.** The safety cap (Clp counter) prevents cl.serverTime from passing the snapshot; the Ext counter reflects feedback-loop equilibrium. At 20Hz (snapshotMsec ≥ 30), 33% rate (-4 and +2 cancel at 1:2 ratio).
+
+**Relationship to the safety cap:** `extrapolateThresh = snapshotMsec/3` (set in the CL_SetCGameTime block below the cap). `capMs = snapshotMsec/4`. Because snapshotMsec/3 > snapshotMsec/4, the extrapolate flag fires and AdjustTimeDelta starts pulling serverTimeDelta back *before* cl.serverTime reaches the cap boundary. In steady state the cap should fire rarely — only during sudden jitter spikes. It is a backstop, not the primary timing control.
 
 **cl_adaptiveTiming modes:**
 - **0**: vanilla Q3e thresholds (hardcoded). slowFrac accumulator still active.
 - **1** (default): snapshotMsec-scaled thresholds. 1ms commits (jitter-resistant).
 - **2**: proportional. Commits scale to 25% of deltaDelta when error > snapshotMsec. Faster mid-range recovery (0.3s vs 1.3s for a 40ms disturbance), but amplifies random walk under sustained jitter. Best on stable wired connections.
+
+**Server-side control — `sv_allowClientAdaptiveTiming` [CUSTOM]:**
+The server broadcasts `sv_allowClientAdaptiveTiming` in SERVERINFO (default `1`). During `CL_ParseGamestate`, the client reads this key:
+- If absent or `"1"`: `cl.serverForbidsAdaptiveTiming = qfalse` — adaptive timing active (modes 1 and 2 work normally).
+- If `"0"`: `cl.serverForbidsAdaptiveTiming = qtrue` — `cl_adaptiveTiming` is silently suppressed; the client runs pure vanilla Q3e thresholds regardless of the cvar value.
+
+This lets server admins on vanilla Q3e/URT servers (which don't set the cvar at all) automatically fall back to safe vanilla behavior, while FTWGL servers opt in by leaving `sv_allowClientAdaptiveTiming 1` in their config. The `cl.serverForbidsAdaptiveTiming` flag is cleared on disconnect so local settings are restored immediately.
 
 ### CG_CVAR_SET Intercept [CUSTOM]
 
@@ -420,6 +476,62 @@ if (*clc.downloadTempName && cls.realtime - clc.lastPacketSentTime < throttleMs)
 
 ---
 
+## URT Client Additions [CUSTOM/URT]
+
+### Auth System (cl_main.c, client.h) [USE_AUTH]
+
+The client provides hooks for the UrbanTerror auth server. Auth is handled primarily in the UI/QVM layer; the engine provides:
+
+#### client.h additions
+
+`serverInfo_t` gains:
+```c
+#ifdef USE_AUTH
+    char    auth[BIG_INFO_STRING];
+    char    password[MAX_INFO_STRING];
+    char    modversion[MAX_INFO_STRING];
+#endif
+```
+
+Extern cvar declarations (defined in cl_main.c):
+```c
+#ifdef USE_AUTH
+extern cvar_t *cl_auth_engine;
+extern cvar_t *cl_auth;
+extern cvar_t *cl_authc;
+extern cvar_t *cl_authl;
+#endif
+```
+
+#### cl_main.c additions
+
+- Cvar registration: `cl_auth_engine`, `cl_auth` (USERINFO), `cl_authc` (USERINFO), `cl_authl` (USERINFO)
+- AUTH:CL packet handler: receives auth server packet and calls `VM_Call(uivm, UI_AUTHSERVER_PACKET, ...)`
+- `ticket` userinfo cvar (CVAR_USERINFO|CVAR_TEMP) — anti-cheat ticket
+
+### Client Screenshot Response (cl_cgame.c) [USE_FTWGL]
+
+When the server sends a `clientScreenshot` command (via `SV_ClientScreenshot_f`), the client handler in `CL_CgameSystemCalls` intercepts it and calls `screenshot silent [filename]` locally.
+
+### URT Demo Format (cl_main.c) [USE_URT_DEMO]
+
+See the Demo Recording section under cl_main.c for full details.
+
+#### CL_WalkDemoExt / CL_DemoNameCallback_f / CL_CompleteDemoName
+
+All demo listing and tab-completion functions extended to recognize `.urtdemo` extension alongside `.dm_??`.
+
+#### client.h: demoprotocol field
+
+`clientConnection_t` gains:
+```c
+#ifdef USE_URT_DEMO
+    int     demoprotocol;    // 0 = Q3 (dm_NN), URT_PROTOCOL_VERSION = URT demo
+#endif
+```
+
+---
+
 ## cl_keys.c — Key Binding
 
 **File:** `code/client/cl_keys.c`  
@@ -491,10 +603,10 @@ typedef struct {
 
 ---
 
-## cl_scrn.c — Screen Layout
+## cl_scrn.c — Screen Layout [CUSTOM]
 
 **File:** `code/client/cl_scrn.c`  
-**Size:** ~560 lines
+**Size:** ~800 lines
 
 Manages the overall screen layout for non-cgame frames:
 
@@ -508,6 +620,62 @@ Manages the overall screen layout for non-cgame frames:
 | `SCR_UpdateScreen()` | Called from `CL_Frame`: `re.BeginFrame` → draw → `re.EndFrame` |
 | `SCR_Init()` | Register screen cvars |
 | `SCR_AdjustFrom640(x, y, w, h)` | Scale from 640×480 reference to screen coordinates |
+
+### Net Monitor Widget [CUSTOM]
+
+`cl_netgraph 1` enables a 10-row overlay HUD widget with real-time network diagnostics. Configurable position and scale:
+
+| Cvar | Default | Description |
+|---|---|---|
+| `cl_netgraph` | 0 | 0=off, 1=show widget |
+| `cl_netgraph_x` | 580 | X position (640×480 coords) |
+| `cl_netgraph_y` | 10 | Y position |
+| `cl_netgraph_scale` | 1.0 | Text/box scale multiplier |
+| `cl_netlog` | 0 | 0=off, 1=log FAST/RESET events, 2=periodic stats |
+| `cl_laggotannounce` | 1 | Auto-say "[NET]..." on bad conditions |
+
+#### Widget Rows
+
+The widget shows (color-coded):
+- Snap rate / interval (ms)
+- Ping with min/max
+- Frame interpolation fraction
+- Frame time
+- Server time delta
+- Drops / extrapolations / cap hits
+- Bandwidth (in/out bytes/sec)
+- Snap jitter
+- Sequence number
+- Adjustments (fast/slow/reset)
+
+#### Public Hook Functions
+
+Called from other client files to feed data into the widget:
+
+| Hook | Called From |
+|---|---|
+| `SCR_NetMonitorAddIncoming()` | cl_parse.c (snapshot received) |
+| `SCR_NetMonitorAddOutgoing()` | cl_input.c (packet sent) |
+| `SCR_NetMonitorAddFrametime(ms)` | cl_cgame.c (frame time) |
+| `SCR_NetMonitorAddSnapInterval(ms)` | cl_parse.c |
+| `SCR_NetMonitorAddCapHit()` | cl_cgame.c (serverTime cap) |
+| `SCR_NetMonitorAddExtrap()` | cl_cgame.c (extrapolation) |
+| `SCR_NetMonitorAddChoke()` | cl_input.c (packet choke) |
+| `SCR_NetMonitorAddTimeDelta(d)` | cl_cgame.c |
+| `SCR_NetMonitorAddPing(ms)` | cl_parse.c |
+| `SCR_NetMonitorAddFastAdjust()` | cl_cgame.c |
+| `SCR_NetMonitorAddResetAdjust()` | cl_cgame.c |
+| `SCR_NetMonitorAddSlowAdjust(d)` | cl_cgame.c |
+
+#### Laggot Announce
+
+`cl_laggotannounce 1`: maintains a 30-second ring buffer of network events. Automatically sends `[NET] ...` via `say` command when conditions are poor (packet loss, fast resets, snap jitter, extrapolation, low fps, choke). Cooldown prevents spamming.
+
+#### Net Debug Logging
+
+`cl_netlog 1`: logs FAST/RESET/SNAP LATE/PING JITTER events to a session log file.
+`cl_netlog 2`: also logs periodic per-second statistics.
+`netgraph_dump` command: writes a full stats snapshot to the log file on demand.
 
 ---
 
@@ -635,7 +803,9 @@ typedef struct {
     qboolean    extrapolatedSnapshot;
     qboolean    newSnapshots;
 
-    int         snapshotMsec;       // [CUSTOM] EMA of snapshot interval
+    int         snapshotMsec;       // [CUSTOM] EMA of snapshot intervals, clamped [8,100]
+    float       frameInterpolation; // [CUSTOM] interpolation fraction for cgame (0.0–1.0)
+    qboolean    serverForbidsAdaptiveTiming; // [CUSTOM] true when server sets sv_allowClientAdaptiveTiming 0
 
     gameState_t gameState;          // configstrings from server
     char        mapname[MAX_QPATH];
@@ -681,6 +851,18 @@ typedef struct {
     int         serverCommandSequence;
     char        serverCommands[MAX_RELIABLE_COMMANDS][MAX_STRING_CHARS];
 } clientConnection_t;
+```
+
+#### URT client.h additions
+
+```c
+// USE_AUTH additions to serverInfo_t:
+char    auth[BIG_INFO_STRING];
+char    password[MAX_INFO_STRING];
+char    modversion[MAX_INFO_STRING];
+
+// USE_URT_DEMO additions to clientConnection_t:
+int     demoprotocol;    // 0=Q3 protocol, 70=URT protocol
 ```
 
 ### clientStatic_t cls — Persistent Client State
@@ -763,3 +945,4 @@ Com_Frame()
     │
     └── S_Update(msec)                    ← sound mixing
 ```
+___BEGIN___COMMAND_DONE_MARKER___0

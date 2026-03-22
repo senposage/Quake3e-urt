@@ -96,24 +96,6 @@ static void CL_GetCurrentSnapshotNumber( int *snapshotNumber, int *serverTime ) 
 	*serverTime = cl.snap.serverTime;
 }
 
-#ifdef USE_MV
-/*
-====================
-CL_GetParsedEntityIndexByID
-====================
-*/
-static int CL_GetParsedEntityIndexByID( const clSnapshot_t *clSnap, int entityID, int startIndex, int *parsedIndex ) {
-    int index, n;
-    for ( index = startIndex; index < clSnap->numEntities; ++index ) {
-        n = ( clSnap->parseEntitiesNum + index ) & (MAX_PARSE_ENTITIES-1);
-        if ( cl.parseEntities[ n ].number == entityID ) {
-            *parsedIndex = n;
-            return index;
-        }
-    }
-    return -1;
-}
-#endif // USE_MV
 
 /*
 ====================
@@ -150,70 +132,6 @@ static qboolean CL_GetSnapshot( int snapshotNumber, snapshot_t *snapshot ) {
 	snapshot->serverCommandSequence = clSnap->serverCommandNum;
 	snapshot->ping = clSnap->ping;
 	snapshot->serverTime = clSnap->serverTime;
-
-#ifdef USE_MV
-    if ( clSnap->multiview ) {
-        int		entityNum;
-        int		startIndex;
-        int		parsedIndex;
-        byte	*entMask;
-
-        if ( clSnap->clps[ clc.clientView ].valid ) {
-            //clientView = clc.clientView;
-        } else {
-            // we need to select another POV
-            if ( clSnap->clps[ clc.clientNum ].valid ) {
-                Com_DPrintf( S_COLOR_CYAN "multiview: switch POV back from %d to %d\n", clc.clientView, clc.clientNum );
-                clc.clientView = clc.clientNum; // fixup to avoid glitches
-            } else {
-                // invalid primary id? search for any valid
-                for ( i = 0; i < MAX_CLIENTS; i++ ) {
-                    if ( clSnap->clps[ i ].valid ) {
-                        /*clientView = */ clc.clientNum = clc.clientView = i;
-                        Com_Printf( S_COLOR_CYAN "multiview: set primary client id %d\n", clc.clientNum );
-                        break;
-                    }
-                }
-                if ( i == MAX_CLIENTS ) {
-                    if ( !( snapshot->snapFlags & SNAPFLAG_NOT_ACTIVE ) ) {
-                        Com_Error( ERR_DROP, "Unable to find any playerState in multiview" );
-                        return qfalse;
-                    }
-                }
-            }
-        }
-        Com_Memcpy( snapshot->areamask, clSnap->clps[ clc.clientView ].areamask, sizeof( snapshot->areamask ) );
-        snapshot->ps = clSnap->clps[ clc.clientView ].ps;
-        entMask = clSnap->clps[ clc.clientView ].entMask;
-
-        count = 0;
-        startIndex = 0;
-        for ( entityNum = 0; entityNum < MAX_GENTITIES-1; entityNum++ ) {
-            if ( GET_ABIT( entMask, entityNum ) ) {
-                // skip own and spectated entity
-                if ( entityNum != clc.clientView && entityNum != snapshot->ps.clientNum )
-                {
-                    startIndex = CL_GetParsedEntityIndexByID( clSnap, entityNum, startIndex, &parsedIndex );
-                    if ( startIndex >= 0 ) {
-                        // should never happen but anyway:
-                        if ( count >= MAX_ENTITIES_IN_SNAPSHOT ) {
-                            Com_Error( ERR_DROP, "snapshot entities count overflow for %i", clc.clientView );
-                            break;
-                        }
-                        snapshot->entities[ count++ ] = cl.parseEntities[ parsedIndex ];
-                    } else {
-                        Com_Error( ERR_DROP, "packet entity not found in snapshot: %i", entityNum );
-                        break;
-                    }
-                }
-            }
-        }
-
-        snapshot->numEntities = count;
-        return qtrue;
-    }
-#endif // USE_MV
-
 	Com_Memcpy( snapshot->areamask, clSnap->areamask, sizeof( snapshot->areamask ) );
 	snapshot->ps = clSnap->ps;
 	count = clSnap->numEntities;
@@ -336,6 +254,11 @@ static qboolean CL_GetServerCommand( int serverCommandNumber ) {
 			Cmd_Clear();
 			return qfalse;
 		}
+		SCR_LogNote( "WARN:CMDCYCLED",
+			va( "reliable cmd cycled out: req=%d stored=%d gap=%d",
+				serverCommandNumber, clc.serverCommandSequence,
+				clc.serverCommandSequence - serverCommandNumber ) );
+		SCR_LogDisconnect( "reliable cmd cycled out (ERR_DROP)" );
 		Com_Error( ERR_DROP, "CL_GetServerCommand: a reliable command was cycled out" );
 		return qfalse;
 	}
@@ -364,8 +287,19 @@ rescan:
 	if ( !strcmp( cmd, "disconnect" ) ) {
 		// https://zerowing.idsoftware.com/bugzilla/show_bug.cgi?id=552
 		// allow server to indicate why they were disconnected
+		const char *reason = ( argc >= 2 ) ? Cmd_Argv( 1 ) : "(no reason)";
+		/* Log the in-band disconnect before acting on it so we always have
+		   a record of what the server sent even if the reason string helps
+		   trace bad-faith server behaviour. */
+		SCR_LogNote( "SVCMD:DISCONNECT",
+			va( "in-band reliable disconnect: reason=\"%s\""
+				"  cmdSeq=%d  relSeq=%d  relAck=%d",
+				reason,
+				clc.serverCommandSequence,
+				clc.reliableSequence, clc.reliableAcknowledge ) );
+		SCR_LogDisconnect( reason );
 		if ( argc >= 2 )
-			Com_Error( ERR_SERVERDISCONNECT, "Server disconnected - %s", Cmd_Argv( 1 ) );
+			Com_Error( ERR_SERVERDISCONNECT, "Server disconnected - %s", reason );
 		else
 			Com_Error( ERR_SERVERDISCONNECT, "Server disconnected" );
 	}
@@ -433,20 +367,48 @@ rescan:
 	}
 
 #ifdef USE_FTWGL
-    if ( !strcmp( cmd, "clientScreenshot" ) ) {
-        if ( Cmd_Argc() == 1 ) {
-            Cbuf_AddText( "wait ; wait ; wait ; wait ; screenshot silent\n" );
-        } else if ( Cmd_Argc() == 2 ) {
-            static char filename[BIG_INFO_STRING];
-            Com_sprintf( filename, BIG_INFO_STRING, "wait ; wait ; wait ; wait ; screenshot silent %s\n",
-                         Cmd_Argv(1));
-
-            Cbuf_AddText( filename );
-        }
-
-        return qfalse;
-    }
+	if ( !strcmp( cmd, "clientScreenshot" ) ) {
+		if ( Cmd_Argc() == 1 ) {
+			Cbuf_AddText( "wait ; wait ; wait ; wait ; screenshot silent\n" );
+		} else if ( Cmd_Argc() == 2 ) {
+			Cbuf_AddText( va( "wait ; wait ; wait ; wait ; screenshot silent %s\n", Cmd_Argv(1) ) );
+		}
+		return qfalse;
+	}
 #endif
+
+	// Intercept the UrT QVM "cv <cvarname>" probe.
+	//
+	// The QVM sends this reliable server command to request the value of a
+	// named cvar from every connected client.  We block the command (return
+	// qfalse so it never reaches the cgame) when the requested cvar:
+	//
+	//   1. Does not exist -- prevents the server from detecting our custom
+	//      features by probing for their cvar names.
+	//   2. Is CVAR_PRIVATE -- these are internal-only cvars that the QVM
+	//      cannot read anyway, but we also suppress the command itself so
+	//      the server cannot even infer existence from a missing reply.
+	//   3. Is CVAR_PROTECTED -- we don't want the server reading cvars that
+	//      are protected from VM modification (e.g. cl_guid, cl_timeNudge).
+	//
+	// All blocked probes are logged for audit.
+	if ( !strcmp( cmd, "cv" ) ) {
+		if ( argc >= 2 ) {
+			const char *cvarName = Cmd_Argv( 1 );
+			unsigned flags = Cvar_Flags( cvarName );
+
+			if ( flags == CVAR_NONEXISTENT
+				|| ( flags & ( CVAR_PROTECTED | CVAR_PRIVATE ) ) ) {
+				SCR_LogNote( "SVCMD:CV_BLOCKED",
+					va( "cv probe blocked: \"%s\" (flags=0x%x)", cvarName, flags ) );
+				return qfalse;
+			}
+		} else {
+			// malformed -- no cvar name supplied
+			SCR_LogNote( "SVCMD:CV_BLOCKED", "cv probe blocked: no cvar name" );
+			return qfalse;
+		}
+	}
 
 	// we may want to put a "connect to other server" command here
 
@@ -534,6 +496,11 @@ static qboolean CL_GetValue( char* value, int valueSize, const char* key ) {
 		return qtrue;
 	}
 
+	if ( !Q_stricmp( key, "trap_Cvar_SetDescription_Q3E" ) ) {
+		Com_sprintf( value, valueSize, "%i", CG_CVAR_SETDESCRIPTION );
+		return qtrue;
+	}
+
 	return qfalse;
 }
 
@@ -572,12 +539,62 @@ static intptr_t CL_CgameSystemCalls( intptr_t *args ) {
 		Cvar_Update( VMA(1), cgvm->privateFlag );
 		return 0;
 	case CG_CVAR_SET:
-		// exclude some game module cvars
-		if (!Q_stricmp((char *)VMA(1), "snaps") ||
-			!Q_stricmp((char *)VMA(1), "cg_smoothClients")) {
-			return 0;
+		// Prevent QVM from overriding cvars that could be weaponised by a
+		// malicious or buggy server to sabotage the client connection or
+		// degrade gameplay.  Every interception is logged so we can see
+		// what the vanilla QVM is attempting.
+		//
+		// Unconditionally intercepted (silently ignored):
+		//   snaps           -- server controls delivery rate anyway; wrong value
+		//                     here breaks our snapshot-interval logic
+		//   cg_smoothClients -- purely client-side rendering preference
+		//   net_qport       -- changing port mid-session breaks the netchan
+		//   rate=0          -- zero rate causes server to stop sending snapshots
+		//   net_dropsim     -- simulates packet drops on outgoing traffic;
+		//                     a server setting this would cause us to shed our
+		//                     own packets, making us appear to time out
+		//   cl_packetdelay  -- adds artificial send latency; could push ping
+		//                     above sv_maxPing and trigger a server ping-kick
+		//   cl_packetdup    -- controls redundant command retransmission;
+		//                     a server zeroing this removes loss mitigation,
+		//                     while a server setting it high floods the server
+		//   cl_timeout      -- lowering this lets the server trigger our own
+		//                     timeout watchdog at will
+		//   in_mouse        -- disabling mouse input is pure sabotage
+		//   cl_noOOBDisconnect -- already CVAR_PROTECTED, but explicit here
+		//                        for clarity: a server must not be able to
+		//                        disarm our OOB-disconnect guard
+		//
+		// Also blocked by Cvar_SetSafe for CVAR_PROTECTED/PRIVATE cvars
+		// (e.g. com_maxfps, cl_timeNudge) -- those are logged as QVM:SET_BLOCKED.
+		if ( Q_stricmp( (const char *)VMA(1), "snaps"            ) == 0
+			|| Q_stricmp( (const char *)VMA(1), "cg_smoothClients" ) == 0
+			|| Q_stricmp( (const char *)VMA(1), "net_qport"        ) == 0
+			|| Q_stricmp( (const char *)VMA(1), "net_dropsim"      ) == 0
+			|| Q_stricmp( (const char *)VMA(1), "cl_packetdelay"   ) == 0
+			|| Q_stricmp( (const char *)VMA(1), "cl_packetdup"     ) == 0
+			|| Q_stricmp( (const char *)VMA(1), "cl_timeout"       ) == 0
+			|| Q_stricmp( (const char *)VMA(1), "in_mouse"         ) == 0
+			|| Q_stricmp( (const char *)VMA(1), "cl_noOOBDisconnect" ) == 0
+			|| ( Q_stricmp( (const char *)VMA(1), "rate" ) == 0
+				&& atoi( (const char *)VMA(2) ) <= 0 ) ) {
+			SCR_LogNote( "QVM:SET_INTERCEPTED",
+				va( "\"%s\" = \"%s\" (silently ignored)",
+					(const char *)VMA(1), (const char *)VMA(2) ) );
+		} else {
+			// Check whether Cvar_SetSafe will block it (CVAR_PROTECTED/PRIVATE)
+			// before calling it, so we can log the attempt regardless.
+			{
+				unsigned cvFlags = Cvar_Flags( (const char *)VMA(1) );
+				if ( cvFlags != CVAR_NONEXISTENT
+					&& ( cvFlags & ( CVAR_PROTECTED | CVAR_PRIVATE ) ) ) {
+					SCR_LogNote( "QVM:SET_BLOCKED",
+						va( "\"%s\" = \"%s\" (protected)",
+							(const char *)VMA(1), (const char *)VMA(2) ) );
+				}
+			}
+			Cvar_SetSafe( VMA(1), VMA(2) );
 		}
-		Cvar_SetSafe( VMA(1), VMA(2) );
 		return 0;
 	case CG_CVAR_VARIABLESTRINGBUFFER:
 		VM_CHECKBOUNDS( cgvm, args[2], args[3] );
@@ -610,9 +627,43 @@ static intptr_t CL_CgameSystemCalls( intptr_t *args ) {
 	case CG_FS_SEEK:
 		return FS_VM_SeekFile( args[1], args[2], args[3], H_CGAME );
 
-	case CG_SENDCONSOLECOMMAND:
-		Cbuf_AddText( VMA(1) );
+	case CG_SENDCONSOLECOMMAND: {
+		const char *cmd = VMA(1);
+
+		/* Log every console command the QVM injects so we have a full trace.
+		   At level 1 flag any command that could force a disconnect or quit;
+		   at level 2 log all of them for completeness. */
+		{
+			char   tok[64];
+			size_t i = 0;
+			/* Extract the first token (command name) from the string. */
+			while ( i < sizeof(tok) - 1 && cmd[i] && cmd[i] != ' '
+				&& cmd[i] != '\t' && cmd[i] != '\n' && cmd[i] != ';' ) {
+				tok[i] = cmd[i]; i++;
+			}
+			tok[i] = '\0';
+
+			if ( Q_stricmp( tok, "disconnect" ) == 0
+				|| Q_stricmp( tok, "quit"       ) == 0
+				|| Q_stricmp( tok, "exit"       ) == 0
+				|| Q_stricmp( tok, "exec"       ) == 0 ) {
+				/* Dangerous: log at level 1 so it always appears in the log.
+				   Block execution -- the server should not be able to force
+				   these through the cgame console-command channel. */
+				SCR_LogNote( "QVM:CONSOLECMD_BLOCKED",
+					va( "dangerous cmd blocked: \"%s\"", cmd ) );
+				Com_Printf( S_COLOR_YELLOW
+					"WARNING: server tried to inject dangerous console command"
+					" via cgame -- blocked: \"%s\"\n", cmd );
+				return 0;
+			}
+
+			SCR_LogNote( "QVM:CONSOLECMD", va( "\"%s\"", cmd ) );
+		}
+
+		Cbuf_NestedAdd( cmd );
 		return 0;
+	}
 	case CG_ADDCOMMAND:
 		CL_AddCgameCommand( VMA(1) );
 		return 0;
@@ -782,7 +833,7 @@ static intptr_t CL_CgameSystemCalls( intptr_t *args ) {
 		return args[1];
 	case TRAP_STRNCPY:
 		VM_CHECKBOUNDS( cgvm, args[1], args[3] );
-		strncpy( VMA(1), VMA(2), args[3] );
+		Q_strncpy( VMA(1), VMA(2), args[3] );
 		return args[1];
 	case TRAP_SIN:
 		return FloatAsInt( sin( VMF(1) ) );
@@ -880,6 +931,10 @@ static intptr_t CL_CgameSystemCalls( intptr_t *args ) {
 	case CG_IS_RECORDING_DEMO:
 		return clc.demorecording;
 
+	case CG_CVAR_SETDESCRIPTION:
+		Cvar_SetDescription2( (const char*)VMA(1), (const char*)VMA(2) );
+		return 0;
+
 	case CG_TRAP_GETVALUE:
 		VM_CHECKBOUNDS( cgvm, args[1], args[2] );
 		return CL_GetValue( VMA(1), args[2], VMA(3) );
@@ -928,6 +983,8 @@ void CL_InitCGame( void ) {
 	int					t1, t2;
 	vmInterpret_t		interpret;
 
+	Cbuf_NestedReset();
+
 	t1 = Sys_Milliseconds();
 
 	// put away the console
@@ -949,6 +1006,38 @@ void CL_InitCGame( void ) {
 		if ( interpret != VMI_COMPILED && interpret != VMI_BYTECODE )
 			interpret = VMI_COMPILED;
 	}
+
+	// Register UrT 4.3 cgame patch cvars before loading the VM so
+	// VM_ReplaceInstructions sees the correct default values.
+	// CVAR_PROTECTED prevents the QVM from disabling its own patches.
+	//
+	// Bitmask (both cvars share the same bit layout):
+	//   bit 0 = Patch 2: frameInterpolation clamp fix (safe on any server)
+	//   bit 1 = Patch 3: nextSnap null-pointer crash fix (safe on any server)
+	//   bit 2 = Patch 1: TR_INTERPOLATE velocity extrapolation / TR_LINEAR
+	//           Requires server-side trTime anchor -- only safe on our custom
+	//           server.  Auto-suppressed on vanilla servers via
+	//           cl_qvmPatchVanilla + cl_urt43serverIsVanilla.
+	//
+	// cl_urt43cgPatches  -- used when connected to our custom server (default 7)
+	// cl_qvmPatchVanilla -- used when connected to a vanilla server   (default 3)
+	Cvar_Get( "cl_urt43cgPatches", "7", CVAR_ARCHIVE | CVAR_PROTECTED | CVAR_PRIVATE );
+	Cvar_SetDescription2( "cl_urt43cgPatches",
+		"QVM patch bitmask applied when connected to a custom (Quake3e-urt) server. "
+		"Bit 0 = Patch2 (frameInterpolation clamp), "
+		"bit 1 = Patch3 (null-snapshot crash fix), "
+		"bit 2 = Patch1 (TR_LINEAR velocity extrapolation -- requires server-side trTime anchor). "
+		"Default 7 (all patches). "
+		"On vanilla servers cl_qvmPatchVanilla is used instead." );
+	Cvar_Get( "cl_qvmPatchVanilla", "3", CVAR_ARCHIVE | CVAR_PRIVATE );
+	Cvar_SetDescription2( "cl_qvmPatchVanilla",
+		"QVM patch bitmask applied when connected to a vanilla UrT server "
+		"(server lacks sv_snapshotFps -- no server-side trTime anchor for TR_LINEAR). "
+		"Bit 0 = Patch2 (frameInterpolation clamp), "
+		"bit 1 = Patch3 (null-snapshot crash fix -- prevents CG_Error crash on first frame), "
+		"bit 2 = Patch1 (TR_LINEAR -- unsafe on vanilla servers, leave unset). "
+		"Default 3 (Patches 2+3 safe on any server; Patch1/bit2 requires server-side trTime anchor). "
+		"On custom servers cl_urt43cgPatches is used instead." );
 
 	cgvm = VM_Create( VM_CGAME, CL_CgameSystemCalls, CL_DllSyscall, interpret );
 	if ( !cgvm ) {
@@ -997,12 +1086,19 @@ CL_GameCommand
 See if the current console command is claimed by the cgame
 ====================
 */
+
 qboolean CL_GameCommand( void ) {
+	qboolean bRes;
+
 	if ( !cgvm ) {
 		return qfalse;
 	}
 
-	return VM_Call( cgvm, 0, CG_CONSOLE_COMMAND );
+	bRes = (qboolean)VM_Call( cgvm, 0, CG_CONSOLE_COMMAND );
+
+	Cbuf_NestedReset();
+
+	return bRes;
 }
 
 
@@ -1040,19 +1136,9 @@ or bursted delayed packets.
 */
 
 // Sub-millisecond fractional accumulator for the slow drift path.
-// 1 unit = ¼ ms; each slow-path step adds ±2 units (= ±½ ms);
-// commit threshold is ±4 units (= ±1 ms).
-//
-// File-scope so CL_SetCGameTime() can fold it into the extrapolation
-// check (evaluated in ¼ms units).  At the equilibrium threshold the
-// condition then alternates extrap/non-extrap each snap
-// (slowFrac: 0 → −2 → 0 → −2 …) so the accumulator never reaches ±4
-// and serverTimeDelta stays constant — eliminating the ±1ms oscillation
-// that causes the 32↔48ms ping jitter and feelable lag.
-// RESET and FAST branches clear it since stale slow-drift history would
-// corrupt recovery from a large correction.
-// Applied unconditionally (both cl_adaptiveTiming=0 and =1) so the fix
-// works regardless of the adaptive timing setting.
+// 1 unit = 1/4 ms; each slow-path step adds +/-2 units (= +/-0.5 ms);
+// commit threshold is +/-4 units (= +/-1 ms).
+// Eliminates the +/-1ms oscillation that causes ping jitter.
 static int slowFrac = 0;
 
 static void CL_AdjustTimeDelta( void ) {
@@ -1063,9 +1149,10 @@ static void CL_AdjustTimeDelta( void ) {
 
 	// Scale thresholds proportionally to the measured snapshot interval so the
 	// system reacts at the same number-of-snapshots equivalent across all rates.
-	// At 20Hz (snapshotMsec=50): resetTime=500, fastAdjust=100 — same as vanilla.
-	// At 60Hz (snapshotMsec=16): resetTime=500 (floor), fastAdjust=32.
-	if ( cl_adaptiveTiming->integer ) {
+	// At 20Hz (snapshotMsec=50): resetTime=500, fastAdjust=100 -- same as vanilla.
+	// At 60Hz (snapshotMsec=16): resetTime=500 (floor), fastAdjust=50 (floor).
+	// Disabled on vanilla servers and when the server forbids adaptive timing.
+	if ( cl_adaptiveTiming->integer && !cl.serverForbidsAdaptiveTiming ) {
 		resetTime  = cl.snapshotMsec * 10;
 		fastAdjust = cl.snapshotMsec * 2;
 		if ( resetTime  < 500 ) resetTime  = 500;
@@ -1086,10 +1173,27 @@ static void CL_AdjustTimeDelta( void ) {
 	deltaDelta = abs( newDelta - cl.serverTimeDelta );
 
 	if ( deltaDelta > resetTime ) {
+		Com_Printf( S_COLOR_YELLOW "TIMING RESET: deltaDelta=%d > resetTime=%d, oldDelta=%d newDelta=%d snapT=%d cmdT=%d\n",
+			deltaDelta, resetTime, cl.serverTimeDelta, newDelta,
+			cl.snap.serverTime, cl.snap.ps.commandTime );
 		cl.serverTimeDelta = newDelta;
-		cl.oldServerTime = cl.snap.serverTime;	// FIXME: is this a problem for cgame?
-		cl.serverTime = cl.snap.serverTime;
-		slowFrac = 0; // stale slow-drift history is irrelevant after a hard reset
+		cl.oldServerTime = cl.snap.serverTime;
+		// Snap to just above the known commandTime rather than to
+		// snap.serverTime.  Snapping all the way to snap.serverTime
+		// would advance commandTime to sv.time on the server, putting
+		// the client briefly "ahead" of the snapshot timeline.
+		// Gated on non-vanilla servers: on vanilla servers the
+		// serverTimeDelta snap can trigger a FAST-adjust on the next
+		// snapshot which can undershoot again and re-trigger the floor,
+		// creating an oscillation loop that causes the server to drop
+		// the client.  Fall back to vanilla handling (snap.serverTime)
+		// on vanilla servers.
+		if ( !cl.vanillaServer && cl.snap.ps.commandTime > 0 ) {
+			cl.serverTime = cl.snap.ps.commandTime + 1;
+		} else {
+			cl.serverTime = cl.snap.serverTime;
+		}
+		slowFrac = 0;
 		if ( cl_showTimeDelta->integer ) {
 			Com_Printf( "<RESET> " );
 		}
@@ -1097,57 +1201,69 @@ static void CL_AdjustTimeDelta( void ) {
 		SCR_LogTimingEvent( "RESET", cl.serverTimeDelta, deltaDelta );
 	} else if ( deltaDelta > fastAdjust ) {
 		// fast adjust, cut the difference in half
+		Com_Printf( S_COLOR_YELLOW "TIMING FAST: deltaDelta=%d > fastAdjust=%d, oldDelta=%d newDelta=%d\n",
+			deltaDelta, fastAdjust, cl.serverTimeDelta, newDelta );
 		if ( cl_showTimeDelta->integer ) {
 			Com_Printf( "<FAST> " );
 		}
 		cl.serverTimeDelta = ( cl.serverTimeDelta + newDelta ) >> 1;
-		slowFrac = 0; // stale slow-drift history is irrelevant after a fast correction
+		slowFrac = 0;
 		SCR_NetMonitorAddFastAdjust();
 		SCR_LogTimingEvent( "FAST ", cl.serverTimeDelta, deltaDelta );
 	} else {
-		// slow drift adjust, only move 1 or 2 msec
-
 		// if any of the frames between this and the previous snapshot
 		// had to be extrapolated, nudge our sense of time back a little
-		// the granularity of +1 / -2 is too high for timescale modified frametimes
 		if ( com_timescale->value == 0 || com_timescale->value == 1 ) {
-			// Use a half-millisecond fractional accumulator (4 units = 1 ms) so
-			// that at the equilibrium extrapolation rate (50% at 60 Hz, 1/3 at
-			// 20 Hz) the net per-snap adjustment is exactly zero and
-			// serverTimeDelta does not oscillate ±1 ms each snap.
-			// Applied unconditionally so the fix works with cl_adaptiveTiming=0 too.
-			if ( cl.extrapolatedSnapshot ) {
-				cl.extrapolatedSnapshot = qfalse;
-				slowFrac -= ( cl.snapshotMsec < 30 ) ? 2 : 4;
+			if ( cl.serverForbidsAdaptiveTiming ) {
+				// vanilla Q3: direct ms adjustment, no fractional accumulator
+				if ( cl.extrapolatedSnapshot ) {
+					cl.extrapolatedSnapshot = qfalse;
+					cl.serverTimeDelta -= 2;
+					SCR_NetMonitorAddSlowAdjust( -2 );
+				} else {
+					cl.serverTimeDelta++;
+					SCR_NetMonitorAddSlowAdjust( +1 );
+				}
 			} else {
-				slowFrac += 2; // +½ ms per snap (half the old +1 ms step)
-			}
-			// Commit a whole-ms adjustment once the accumulator reaches ±1 ms.
-			// Mode 2 (proportional): when deltaDelta > snapshotMsec, scale
-			// the commit to 25% of remaining error for faster convergence on
-			// mid-range disturbances (5–50ms).  Trades jitter resistance for
-			// recovery speed — best on stable wired connections.
-			// At equilibrium slowFrac never reaches ±4, so this never activates.
-			if ( slowFrac >= 4 ) {
-				int step = 1;
-				if ( cl_adaptiveTiming->integer >= 2 && deltaDelta > cl.snapshotMsec ) {
-					step = deltaDelta / 4;
-					if ( step < 1 ) step = 1;
-					if ( step > deltaDelta / 2 ) step = deltaDelta / 2;
+				// adaptive timing: slow drift via fractional accumulator
+				if ( cl.extrapolatedSnapshot ) {
+					cl.extrapolatedSnapshot = qfalse;
+					// At high fps (snapshotMsec < 30, e.g. 60Hz) the backward step equals
+					// the forward step (-2 / +2), so slowFrac oscillates in [-2,+2] without
+					// ever reaching the +/-4 commit threshold.  serverTimeDelta stays rock-stable
+					// (no +/-1ms ping jitter) at the cost of a ~50% detection-zone entry rate.
+					// This appears in the netgraph as Ext ~ snapsHz/2 (e.g. ~30/s at 60Hz)
+					// and is EXPECTED BEHAVIOR, not actual client-side extrapolation.
+					// CL_AdjustTimeDelta pulls cl.serverTime back before it drifts far.
+					// At low fps (snapshotMsec >= 30, e.g. 20Hz): -4 gives a 33% rate.
+					slowFrac -= ( cl.snapshotMsec < 30 ) ? 2 : 4;
+				} else {
+					slowFrac += 2;
 				}
-				cl.serverTimeDelta += step;
-				slowFrac -= 4;
-				SCR_NetMonitorAddSlowAdjust( +step );
-			} else if ( slowFrac <= -4 ) {
-				int step = 1;
-				if ( cl_adaptiveTiming->integer >= 2 && deltaDelta > cl.snapshotMsec ) {
-					step = deltaDelta / 4;
-					if ( step < 1 ) step = 1;
-					if ( step > deltaDelta / 2 ) step = deltaDelta / 2;
+				// Commit a whole-ms adjustment once the accumulator reaches +/-1 ms.
+				// Mode 2 (proportional): scale commit to 25% of remaining error
+				// for faster convergence on mid-range disturbances.
+				if ( slowFrac >= 4 ) {
+					int step = 1;
+					if ( cl_adaptiveTiming->integer >= 2 && !cl.serverForbidsAdaptiveTiming && deltaDelta > cl.snapshotMsec ) {
+						step = deltaDelta / 4;
+						if ( step < 1 ) step = 1;
+						if ( step > deltaDelta / 2 ) step = deltaDelta / 2;
+					}
+					cl.serverTimeDelta += step;
+					slowFrac -= 4;
+					SCR_NetMonitorAddSlowAdjust( +step );
+				} else if ( slowFrac <= -4 ) {
+					int step = 1;
+					if ( cl_adaptiveTiming->integer >= 2 && !cl.serverForbidsAdaptiveTiming && deltaDelta > cl.snapshotMsec ) {
+						step = deltaDelta / 4;
+						if ( step < 1 ) step = 1;
+						if ( step > deltaDelta / 2 ) step = deltaDelta / 2;
+					}
+					cl.serverTimeDelta -= step;
+					slowFrac += 4;
+					SCR_NetMonitorAddSlowAdjust( -step );
 				}
-				cl.serverTimeDelta -= step;
-				slowFrac += 4;
-				SCR_NetMonitorAddSlowAdjust( -step );
 			}
 		}
 	}
@@ -1176,6 +1292,7 @@ static void CL_FirstSnapshot( void ) {
 	// set the timedelta so we are exactly on this first frame
 	cl.serverTimeDelta = cl.snap.serverTime - cls.realtime;
 	cl.oldServerTime = cl.snap.serverTime;
+	slowFrac = 0;
 
 	clc.timeDemoBaseTime = cl.snap.serverTime;
 
@@ -1317,30 +1434,91 @@ void CL_SetCGameTime( void ) {
 		if ( cl.serverTime - cl.oldServerTime < 0 ) {
 			cl.serverTime = cl.oldServerTime;
 		}
-		// Cap serverTime one millisecond below the latest received snapshot
-		// (adaptive timing only — vanilla has no such cap).
-		// Release the cap when the uncapped time drifts several snapshot
-		// intervals past the last snapshot — the server has likely stopped
-		// sending (quit/crash/timeout).  Without this, the frozen cap
-		// prevents the cgame from processing pending server commands
-		// like "disconnect" and the client hangs indefinitely.
-		if ( cl_adaptiveTiming->integer ) {
-			if ( cl.serverTime >= cl.snap.serverTime ) {
-				int drift = cl.serverTime - cl.snap.serverTime;
-				int capLimit = 1000;
-				if ( drift < capLimit ) {
-					cl.serverTime = cl.snap.serverTime - 1;
-					SCR_NetMonitorAddCapHit();
-				}
+
+		// commandTime floor: ensure usercmds are never sent "in the past".
+		//
+		// After a FAST adjust overcorrects (e.g. 150ms OS hitch ->
+		// serverTimeDelta averaged to -125 instead of correct -50),
+		// cl.serverTime can land well below the server's commandTime.
+		// Every usercmd is then skipped (serverTime < commandTime) and
+		// the slow drift takes ~4 seconds to recover at +1ms/snapshot.
+		// During those seconds: ping=999, lagometer black bars, and the
+		// server may kick for apparent timeout or sv_maxPing.
+		//
+		// The floor uses commandTime from the latest snapshot as the
+		// minimum.  If cl.serverTime falls below it, snap both
+		// cl.serverTime AND serverTimeDelta so recovery is instant
+		// instead of seconds-long.
+		//
+		// Gated on non-vanilla servers only: on vanilla servers the
+		// serverTimeDelta snap can trigger a FAST-adjust on the very
+		// next snapshot (deltaDelta > 100), which can undershoot again
+		// and re-trigger the floor, creating an oscillation loop that
+		// causes the server to drop the client.
+		if ( !cl.vanillaServer &&
+			 cl.snap.ps.commandTime > 0 &&
+			 !( cl.snap.ps.pm_flags & 4096 ) && // PMF_FOLLOW -- commandTime belongs to followed player
+			 cl.serverTime <= cl.snap.ps.commandTime ) {
+			int oldSrvTime = cl.serverTime;
+			int oldDelta = cl.serverTimeDelta;
+			cl.serverTime = cl.snap.ps.commandTime + 1;
+			// Fix serverTimeDelta to match so the correction persists
+			cl.serverTimeDelta = cl.serverTime - cls.realtime + CL_TimeNudge();
+			{
+				char buf[256];
+				Com_sprintf( buf, sizeof(buf),
+					"srvT %d <= cmdTime %d corrected=%d dT %d->%d snapT=%d",
+					oldSrvTime, cl.snap.ps.commandTime,
+					cl.serverTime, oldDelta, cl.serverTimeDelta,
+					cl.snap.serverTime );
+				Com_Printf( S_COLOR_RED "TIMING FLOOR: %s\n", buf );
+				SCR_LogNote( "TIMING_FLOOR", buf );
 			}
 		}
+
+		// NOTE: serverTime safety cap REMOVED.  It was clamping outgoing
+		// usercmd.serverTime at snap.serverTime in CL_FinishMove, but the
+		// clamp caused usercmd coalescing -> server skips -> ping=999 -> kick.
+		// FTWGL runs with zero protection and no issues on vanilla servers.
+		// CL_AdjustTimeDelta keeps cl.serverTime close enough on its own.
+
+		// Periodic timing state dump -- captures the full picture every 5s
+		// so we can see exactly what the timing loop is doing over time.
+		{
+			static int timingLastDump;
+			static int timingMaxOverSnap;   // max(cl.serverTime - snap.serverTime)
+			static int timingMinUnderSnap;  // min(cl.serverTime - snap.serverTime)
+			static int timingFloorHits;
+			static int timingBackwardHits;
+			int overSnap = cl.serverTime - cl.snap.serverTime;
+
+			if ( overSnap > timingMaxOverSnap ) timingMaxOverSnap = overSnap;
+			if ( overSnap < timingMinUnderSnap ) timingMinUnderSnap = overSnap;
+
+			if ( cls.realtime - timingLastDump > 5000 ) {
+				char buf[512];
+				int silenceMs = (clc.lastPacketTime > 0) ?
+					cls.realtime - clc.lastPacketTime : -1;
+				Com_sprintf( buf, sizeof(buf),
+					"srvT=%d snapT=%d cmdTime=%d dT=%d "
+					"overSnap=[%d,%d] extrap=%d realtime=%d "
+					"silenceMs=%d snapMs=%d seqNum=%d",
+					cl.serverTime, cl.snap.serverTime,
+					cl.snap.ps.commandTime, cl.serverTimeDelta,
+					timingMinUnderSnap, timingMaxOverSnap,
+					(int)cl.extrapolatedSnapshot, cls.realtime,
+					silenceMs, cl.snapshotMsec,
+					clc.serverMessageSequence );
+				SCR_LogNote( "TIMING_STATE", buf );
+				timingMaxOverSnap = overSnap;
+				timingMinUnderSnap = overSnap;
+				timingLastDump = cls.realtime;
+			}
+		}
+
 		cl.oldServerTime = cl.serverTime;
 
-		// Compute estimated QVM frameInterpolation: mirrors the calculation the
-		// cgame QVM performs internally between its cg.snap (prev) and cg.nextSnap
-		// (cl.snap).  cl.serverTime is capped at cl.snap.serverTime - 1, so this
-		// value is always in [0, ~0.94] at 60 Hz / [0, ~0.98] at 20 Hz.
-		// Used by the net monitor widget.
+		// Compute estimated frameInterpolation for the net monitor widget
 		{
 			const clSnapshot_t *prevSnap = &cl.snapshots[ (cl.snap.messageNum - 1) & PACKET_MASK ];
 			int interval = cl.snap.serverTime - prevSnap->serverTime;
@@ -1357,10 +1535,10 @@ void CL_SetCGameTime( void ) {
 
 		// note if we are almost past the latest frame (without timeNudge),
 		// so we will try and adjust back a bit when the next snapshot arrives.
-		if ( cl_adaptiveTiming->integer ) {
+		if ( cl_adaptiveTiming->integer && !cl.serverForbidsAdaptiveTiming ) {
 			// Scale the detection window with the measured snapshot interval.
-			// Evaluated in ¼ms units (diff×4 + slowFrac) so the half-ms
-			// accumulator's state is visible to the condition.
+			// Evaluated in 1/4ms units so slowFrac state is visible.
+			// At 20Hz: thresh=16ms (vs hardcoded 5ms) -> better equilibrium on vanilla.
 			int extrapolateThresh = cl.snapshotMsec / 3;
 			if ( extrapolateThresh <  3 ) extrapolateThresh =  3;
 			if ( extrapolateThresh > 16 ) extrapolateThresh = 16;
@@ -1369,10 +1547,9 @@ void CL_SetCGameTime( void ) {
 				SCR_NetMonitorAddExtrap();
 			}
 		} else {
-			// vanilla: hardcoded 5ms threshold; include fractional accumulator
-			// state (in ¼ms units) so the self-stabilising feedback operates
-			// the same way as the adaptive path.
-			if ( ( cls.realtime + cl.serverTimeDelta - cl.snap.serverTime ) * 4 + slowFrac >= -20 ) {
+			// vanilla Q3: diff >= -5ms equivalent (when slowFrac=0, the full
+			// adaptive check "(diff * 4 + slowFrac) >= -20" reduces to "diff >= -5")
+			if ( cls.realtime + cl.serverTimeDelta - cl.snap.serverTime >= -5 ) {
 				cl.extrapolatedSnapshot = qtrue;
 			}
 		}
@@ -1402,7 +1579,7 @@ void CL_SetCGameTime( void ) {
 			clc.timeDemoStart = Sys_Milliseconds();
 		}
 		clc.timeDemoFrames++;
-		cl.serverTime = clc.timeDemoBaseTime + clc.timeDemoFrames * ( cl_adaptiveTiming->integer ? cl.snapshotMsec : 50 );
+		cl.serverTime = clc.timeDemoBaseTime + clc.timeDemoFrames * ( cl.snapshotMsec > 0 ? cl.snapshotMsec : 50 );
 	}
 
 	//while ( cl.serverTime >= cl.snap.serverTime ) {

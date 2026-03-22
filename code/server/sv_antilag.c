@@ -2,34 +2,9 @@
 ===========================================================================
 sv_antilag.c - Engine-side shadow antilag system for Quake3e / UrbanTerror
 
-Architecture overview:
-───────────────────────────────────────────────────────────────────────────
-  GAME TICK (sv_gameHz Hz, or sv_fps Hz when sv_gameHz <= 0)
-                               → QVM sees this. level.time advances here.
-                                 QVM's own FIFO antilag runs here unchanged.
-
-  SHADOW RECORDING (sv_fps Hz — one entry per engine tick)
-                                 → Engine only. Records entity positions into
-                                   svShadowHistory[]. QVM never sees this.
-
-  HIT REGISTRY (on G_TRACE syscall)
-                                 → Engine intercepts trap_Trace from QVM.
-                                   Rewinds entity positions to shooter's
-                                   clientFireTime using shadow history.
-                                   Runs trace. Restores ALL positions.
-                                   Returns result to QVM. QVM sees no diff.
-───────────────────────────────────────────────────────────────────────────
-
-QVM CONTRACT (never violated):
-  - level.time advances exactly (1000/sv_gameHz) ms per game frame
-    (or 1000/sv_fps when sv_gameHz <= 0 — GAME_RUN_FRAME fires every engine tick)
-  - Entity state is stable and correct at every GAME_RUN_FRAME entry
-  - G_Damage is called with valid entity pointers, same signature
-  - trap_Trace returns results consistent with current game state
-    (from QVM perspective — we rewind/restore before QVM can observe)
-  - nextthink / events fire at expected times
-  - The QVM's own G_StoreFIFOTrail / G_TimeShiftAllClients are untouched
-
+Shadow recording at sv_fps Hz, hit registry via G_TRACE syscall intercept.
+QVM contract never violated: level.time untouched, entity state restored
+before control returns to VM.
 ===========================================================================
 */
 
@@ -37,7 +12,7 @@ QVM CONTRACT (never violated):
 #include "sv_antilag.h"
 
 // ---------------------------------------------------------------------------
-// Internal types - engine only, never exposed to QVM
+// Internal types
 // ---------------------------------------------------------------------------
 
 typedef struct {
@@ -62,19 +37,19 @@ typedef struct {
 } svShadowSaved_t;
 
 // ---------------------------------------------------------------------------
-// Per-client observed rate tracking (for sv_antilagDebug 3)
+// Rate tracking (sv_antilagRateDebug)
 // ---------------------------------------------------------------------------
 
-#define SV_RATE_WINDOW_MS   2000    // measure over a 2-second rolling window
-#define SV_RATE_SAMPLES     32      // ring of snapshot-send timestamps
+#define SV_RATE_WINDOW_MS   2000
+#define SV_RATE_SAMPLES     32
 
 typedef struct {
-    int     snapTimes[SV_RATE_SAMPLES]; // ring of svs.time when snapshot was sent
-    int     snapHead;                   // next write index
-    int     snapCount;                  // valid entries
-    int     lastSeq;                    // netchan outgoingSequence at last sample
-    int     lastSeqTime;                // svs.time when lastSeq was captured
-    int     reportTimer;                // next svs.time to print report
+    int     snapTimes[SV_RATE_SAMPLES];
+    int     snapHead;
+    int     snapCount;
+    int     lastSeq;
+    int     lastSeqTime;
+    int     reportTimer;
 } svRateTrack_t;
 
 static svRateTrack_t sv_rateTrack[MAX_CLIENTS];
@@ -83,53 +58,44 @@ static svRateTrack_t sv_rateTrack[MAX_CLIENTS];
 // Cvars
 // ---------------------------------------------------------------------------
 
-cvar_t *sv_antilagEnable;
-cvar_t *sv_physicsScale;
+cvar_t *sv_antilag;
 cvar_t *sv_antilagMaxMs;
-cvar_t *sv_antilagDebug;     // 0=off 1=per-trace summary 2=verbose per-client rewind
-cvar_t *sv_antilagRateDebug; // 0=off 1=print per-client observed snap/packet rate every 5s
+cvar_t *sv_antilagDebug;
+cvar_t *sv_antilagRateDebug;
 
 // ---------------------------------------------------------------------------
-// Per-client shadow history state
+// State
 // ---------------------------------------------------------------------------
 
 static svShadowHistory_t    sv_shadowHistory[MAX_CLIENTS];
 static svShadowSaved_t      sv_shadowSaved[MAX_CLIENTS];
 
-// Shadow sub-tick accumulator — tracks fractional ms between engine ticks
-static int                  sv_shadowAccumulator = 0;
-static int                  sv_shadowTickMs = 0;        // computed each frame
-static int                  sv_shadowHistorySlots = 0;  // computed on init/change
-static int                  sv_antilag_lastFpsValue = 0; // track sv_fps value independently (sv_fps->modified cleared by SV_TrackCvarChanges before we see it)
+static int                  sv_shadowTickMs = 0;
+static int                  sv_shadowHistorySlots = 0;
+static int                  sv_antilag_lastFpsValue = 0;
+
 
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-/*
-SV_Antilag_ComputeConfig
-
-Recomputes shadow tick interval and history depth from current cvars.
-Called on init and whenever sv_fps or sv_antilagMaxMs change.
-
-Recording happens once per engine tick (sv_fps Hz), so the slot count
-and tick interval are based on sv_fps alone.  sv_physicsScale no longer
-affects the recording rate — it was removed from the recording loop to
-avoid filling the ring buffer with duplicate-timestamp entries.
-*/
 static void SV_Antilag_ComputeConfig( void ) {
     int fps   = sv_fps ? sv_fps->integer : 40;
     int winMs = sv_antilagMaxMs ? sv_antilagMaxMs->integer : SV_ANTILAG_HISTORY_WINDOW_MS;
 
     if ( fps < 1 ) fps = 1;
 
-    // Shadow tick = engine tick interval (e.g. 25ms at sv_fps 40)
+    // Shadow tick rate equals sv_fps.
+    //
+    // SV_Antilag_RecordPositions() is called exactly once per engine tick,
+    // so positions are captured at sv_fps Hz.  Clients also only receive
+    // snapshots at sv_fps Hz, meaning the finest position granularity a
+    // shooter ever saw is one sv_fps frame.  At sv_fps 60 (16.7 ms/tick)
+    // or sv_fps 125 (8 ms/tick) the sampling is already fine enough that
+    // interpolation error is well under one frame.
     sv_shadowTickMs = 1000 / fps;
     if ( sv_shadowTickMs < 1 ) sv_shadowTickMs = 1;
 
-    // History depth = enough slots to cover the window at sv_fps Hz.
-    // +1 ensures the oldest entry fully reaches the window boundary
-    // (N slots span (N-1) intervals).
     sv_shadowHistorySlots = ( fps * winMs ) / 1000 + 1;
     if ( sv_shadowHistorySlots < 4 )
         sv_shadowHistorySlots = 4;
@@ -138,18 +104,13 @@ static void SV_Antilag_ComputeConfig( void ) {
 }
 
 
-/*
-SV_Antilag_RecordClient
-
-Records the current position of one client into their shadow history ring.
-*/
 static void SV_Antilag_RecordClient( int clientNum, int time ) {
     svShadowHistory_t   *hist;
     svShadowPos_t       *slot;
     sharedEntity_t      *gent;
     int                 idx;
 
-    if ( clientNum < 0 || clientNum >= sv_maxclients->integer )
+    if ( clientNum < 0 || clientNum >= sv.maxclients )
         return;
 
     gent = SV_GentityNum( clientNum );
@@ -172,12 +133,6 @@ static void SV_Antilag_RecordClient( int clientNum, int time ) {
 }
 
 
-/*
-SV_Antilag_GetPositionAtTime
-
-Interpolates a client's shadow position at an arbitrary past time.
-Returns qfalse if no history is available for that time range.
-*/
 static qboolean SV_Antilag_GetPositionAtTime(
     int         clientNum,
     int         targetTime,
@@ -187,22 +142,22 @@ static qboolean SV_Antilag_GetPositionAtTime(
 ) {
     svShadowHistory_t   *hist;
     svShadowPos_t       *before = NULL, *after = NULL;
+    svShadowPos_t       *s;
     int                 i, idx;
     float               frac;
 
-    if ( clientNum < 0 || clientNum >= sv_maxclients->integer )
+    if ( clientNum < 0 || clientNum >= sv.maxclients )
         return qfalse;
 
     hist = &sv_shadowHistory[clientNum];
     if ( hist->count == 0 )
         return qfalse;
 
-    // Walk the valid portion of the ring buffer
     for ( i = 0; i < hist->count; i++ ) {
         idx = ( hist->head - 1 - i + sv_shadowHistorySlots )
               % sv_shadowHistorySlots;
 
-        svShadowPos_t *s = &hist->slots[idx];
+        s = &hist->slots[idx];
         if ( !s->valid ) continue;
 
         if ( s->serverTime <= targetTime ) {
@@ -212,30 +167,30 @@ static qboolean SV_Antilag_GetPositionAtTime(
             if ( !after || s->serverTime < after->serverTime )
                 after = s;
         }
+
+        // Early exit: we iterate newest-first (backward from head).
+        // Once we have both brackets and are now below before's
+        // timestamp, no further entry can improve either bracket.
+        if ( before && after && s->serverTime < before->serverTime )
+            break;
     }
 
-    if ( !before ) {
-        // Target time is older than our entire history — use oldest entry
+    if ( !before )
         return qfalse;
-    }
 
     if ( !after ) {
-        // Target time is at or beyond most recent entry — use it directly
         VectorCopy( before->origin, outOrigin );
         VectorCopy( before->absmin, outAbsmin );
         VectorCopy( before->absmax, outAbsmax );
         return qtrue;
     }
 
-    // Interpolate between before and after
     if ( after->serverTime == before->serverTime ) {
         frac = 0.0f;
     } else {
         frac = (float)( targetTime - before->serverTime )
              / (float)( after->serverTime - before->serverTime );
     }
-
-    // Clamp to [0,1] — should always be true but be safe
     if ( frac < 0.0f ) frac = 0.0f;
     if ( frac > 1.0f ) frac = 1.0f;
 
@@ -255,66 +210,47 @@ static qboolean SV_Antilag_GetPositionAtTime(
 }
 
 
-/*
-SV_Antilag_GetClientFireTime
-
-Returns the time to rewind targets to for a given shooter.
-
-Uses sv.time - cl->ping / 2 — the server's current time minus the
-estimated one-way latency.  cl->ping is the full RTT, so ping/2
-approximates how far behind sv.time the client is seeing the world.
-
-Previous approach (PR #35) used cl->lastUsercmd.serverTime, which
-includes the client's local interpolation delay (cl_timeNudge,
-cl_autoNudge, snapshot buffering) on top of the network delay.  This
-produced ~70 ms rewind for a 45 ms ping player (correct ≈ 22 ms),
-making hit registration feel delayed and spongy compared to the QVM's
-own FIFO antilag.
-
-The original code used svs.time - cl->ping (full RTT, wrong time
-domain).  The new formula is the same idea but correctly uses sv.time
-and divides by 2 for one-way latency.
-
-CRITICAL: all time comparisons use sv.time, NOT svs.time.
-Snapshots send sv.time to clients, and shadow history records at
-sv.time.  svs.time is a different clock (persists across map changes)
-and using it here would create a constant offset that forces every
-shot to clamp to max rewind.
-*/
 static int SV_Antilag_GetClientFireTime( int shooterNum ) {
     client_t *cl;
     int fireTime;
     int maxRewind;
 
-    if ( shooterNum < 0 || shooterNum >= sv_maxclients->integer )
+    if ( shooterNum < 0 || shooterNum >= sv.maxclients )
         return sv.time;
 
     cl = &svs.clients[shooterNum];
 
-    // Use half the measured round-trip time as a one-way latency estimate.
+    // Full timing path (recording-after-game-frame ensures shadow[T] == snapshot[T]):
     //
-    // The shadow history records entity positions at sv.time.  The client
-    // sees those positions after approximately one-way latency (the time
-    // for the snapshot to travel from server to client).  cl->ping is the
-    // full RTT, so ping/2 is the best approximation of one-way delay.
+    //   T0        positions recorded into shadow history (after game frame at tick T0)
+    //   T0        snapshot built and sent; messageSent = Sys_Milliseconds()
+    //             shadow[T0] == snapshot[T0]  <- guaranteed by recording order
+    //   T0+RTT/2  client receives snapshot; latest server time in client = T0
+    //   T0+RTT/2  client renders target at T0 - snapshotMsec because the Q3/URT
+    //             client interpolates one snapshot interval behind its latest
+    //             received snapshot (cl_interp ~ snapshotMsec)
+    //   T0+RTT/2  client fires; sends usercmd
+    //   T0+RTT    server receives usercmd; messageAcked = Sys_Milliseconds()
+    //             cl->ping  = messageAcked - messageSent = RTT  (server-measured)
+    //             cl->snapshotMsec = 1000/snapHz  (per-client, from sv_fps/sv_snapshotFps)
+    //             sv.time  ~ T0 + RTT
     //
-    // Why NOT cl->lastUsercmd.serverTime:
-    //   lastUsercmd.serverTime includes the client's local interpolation
-    //   buffering (cl_timeNudge, cl_autoNudge, snapshot smoothing) on top
-    //   of the network delay.  This produces excessive rewind — e.g. 70 ms
-    //   for a 45 ms ping player instead of the correct ~22 ms — making
-    //   hits feel delayed and spongy.  The QVM's FIFO antilag uses it
-    //   correctly (its trail is in the level.time domain where those
-    //   offsets cancel out), but the shadow system records at sv.time
-    //   where the extra delay doubles up.
-    fireTime = sv.time - cl->ping / 2;
+    //   Target position the client was aiming at: shadow[T0 - snapshotMsec]
+    //   fireTime = sv.time - ping - snapshotMsec
+    //            = (T0 + RTT) - RTT - snapshotMsec
+    //            = T0 - snapshotMsec  [ok]
+    //
+    // Limitation -- dropped/late snapshots:
+    //   If a snapshot was dropped in transit the client interpolates across a
+    //   two-snapshot gap, effectively increasing cl_interp by snapshotMsec.
+    //   The server cannot detect this without client-reported data, so the
+    //   rewind will be snapshotMsec too shallow and the shot may miss.
+    //   This is unavoidable without a client-side interp report.
+    fireTime = sv.time - cl->ping - cl->snapshotMsec;
 
-    // Clamp: never rewind more than sv_antilagMaxMs
     maxRewind = sv_antilagMaxMs ? sv_antilagMaxMs->integer : SV_ANTILAG_MAX_REWIND_MS;
     if ( sv.time - fireTime > maxRewind )
         fireTime = sv.time - maxRewind;
-
-    // Clamp: never go into the future
     if ( fireTime > sv.time )
         fireTime = sv.time;
 
@@ -322,63 +258,54 @@ static int SV_Antilag_GetClientFireTime( int shooterNum ) {
 }
 
 
-/*
-SV_Antilag_RewindAll
-
-Saves and rewinds all active non-shooter clients to targetTime.
-
-Critical: the QVM's G_TimeShiftAllClients may have ALREADY run before
-this is called.  For human targets the FIFO has shifted them to past
-positions; for bots the FIFO typically skips them (zero lag).
-
-We save each entity's CURRENT position (whatever the engine/FIFO has
-set) and restore to that exact state after the trace.  This guarantees
-the entity returns to its pre-intercept state regardless of whether the
-QVM's G_UnTimeShiftAllClients covers it.  For FIFO-shifted humans the
-subsequent G_UnTimeShiftAllClients restores to the pre-FIFO position;
-for bots (which FIFO skips) our restore alone keeps them at the correct
-current position.
-
-MUST be paired with SV_Antilag_RestoreAll.
-*/
 static int SV_Antilag_RewindAll( int shooterNum, int targetTime ) {
     int             i, rewound = 0;
     sharedEntity_t  *gent;
     client_t        *cl;
     vec3_t          rwOrigin, rwAbsmin, rwAbsmax;
 
-    for ( i = 0; i < sv_maxclients->integer; i++ ) {
+    for ( i = 0; i < sv.maxclients; i++ ) {
         cl = &svs.clients[i];
 
-        // Skip shooter, free slots, spectators
-        if ( i == shooterNum )          continue;
-        if ( cl->state != CS_ACTIVE )   continue;
+        if ( i == shooterNum )                              continue;
+        if ( cl->state != CS_ACTIVE )                       continue;
+        // Bots ARE included in the shadow rewind.
+        // The human shooter sees all entities -- including bots -- through the same
+        // snapshot/interpolation pipeline.  A shooter with 100 ms ping is aiming
+        // at the bot's position from ~(ping + snapshotMsec) ms ago, just as they
+        // would be for a human target.  Excluding bots produced a systematic miss
+        // for any human vs. bot engagement at non-trivial ping.
+        //
+        // The original "double-rewind conflict" concern: when g_antilag 1, the QVM
+        // FIFO antilag rewinds entities before calling trap_Trace.  The engine
+        // intercepts that syscall and applies its OWN rewind on top, which was
+        // assumed to conflict.  In practice both save/restore cycles are independent
+        // and commute correctly:
+        //   1. QVM FIFO may move entities (including any bot if FIFO touches it)
+        //   2. Engine saves the post-FIFO state
+        //   3. Engine applies shadow rewind -> trace -> restores to post-FIFO state
+        //   4. QVM FIFO restores to original
+        // The trace always sees shadow-recorded positions; entities end up back at
+        // original.  No conflict.
+        // sv_antilag 1 also auto-forces g_antilag 0 (SV_TrackCvarChanges) which
+        // eliminates any FIFO pre-setup entirely, making the ordering unambiguous.
 
         gent = SV_GentityNum( i );
         if ( !gent || !gent->r.linked ) continue;
 
-        // Step 1: Save the entity's CURRENT position for restore.
-        // This is whatever the engine/QVM has set — it may be a FIFO-
-        // shifted position (for human targets) or the actual current
-        // position (for bots, which FIFO typically skips).  After the
-        // trace we restore to exactly this state so the entity is back
-        // to its pre-intercept position.  The QVM's G_UnTimeShiftAllClients
-        // then handles the final FIFO restore for human targets; for bots
-        // our restore alone keeps them at the correct current position.
         sv_shadowSaved[i].saved = qtrue;
         VectorCopy( gent->r.currentOrigin, sv_shadowSaved[i].origin );
         VectorCopy( gent->r.absmin,        sv_shadowSaved[i].absmin );
         VectorCopy( gent->r.absmax,        sv_shadowSaved[i].absmax );
 
-        // Step 2: Apply our high-resolution shadow rewind to targetTime.
-        // This is the actual lag compensation — done at shadow Hz resolution.
         if ( SV_Antilag_GetPositionAtTime( i, targetTime,
                 rwOrigin, rwAbsmin, rwAbsmax ) ) {
 
             if ( sv_antilagDebug && sv_antilagDebug->integer >= 2 ) {
                 vec3_t delta;
+                float dist;
                 VectorSubtract( rwOrigin, sv_shadowSaved[i].origin, delta );
-                float dist = sqrt( delta[0]*delta[0] + delta[1]*delta[1] + delta[2]*delta[2] );
+                dist = VectorLength( delta );
                 Com_Printf( "  AL rewind cl[%d]: %.1f %.1f %.1f -> %.1f %.1f %.1f (moved %.1f units back)\n",
                     i,
                     sv_shadowSaved[i].origin[0], sv_shadowSaved[i].origin[1], sv_shadowSaved[i].origin[2],
@@ -392,30 +319,19 @@ static int SV_Antilag_RewindAll( int shooterNum, int targetTime ) {
             SV_LinkEntity( gent );
             rewound++;
         }
-        // else: no shadow history for targetTime — leave the entity at
-        // its current position.  The trace will run against whatever the
-        // QVM's own antilag (or lack thereof for bots) has set.
     }
 
     return rewound;
 }
 
 
-/*
-SV_Antilag_RestoreAll
-
-Restores all clients that were saved by SV_Antilag_RewindAll.
-Called unconditionally after trace, regardless of errors.
-This is the guarantee that makes the system QVM-safe.
-*/
 static void SV_Antilag_RestoreAll( int shooterNum ) {
     int             i;
     sharedEntity_t  *gent;
     client_t        *cl;
 
-    for ( i = 0; i < sv_maxclients->integer; i++ ) {
+    for ( i = 0; i < sv.maxclients; i++ ) {
         if ( i == shooterNum ) continue;
-
         if ( !sv_shadowSaved[i].saved ) continue;
         sv_shadowSaved[i].saved = qfalse;
 
@@ -438,141 +354,100 @@ static void SV_Antilag_RestoreAll( int shooterNum ) {
 // ---------------------------------------------------------------------------
 
 /*
-SV_Antilag_Init
+SV_Antilag_ClearClient
 
-Registers cvars and resets state. Called from SV_Init.
+Zeroes the shadow history ring buffer for a single client slot.
+Called when a client disconnects so that a new occupant (bot or human)
+does not inherit stale position entries recorded for the previous player.
 */
+void SV_Antilag_ClearClient( int clientNum ) {
+    if ( clientNum < 0 || clientNum >= MAX_CLIENTS )
+        return;
+    Com_Memset( &sv_shadowHistory[clientNum], 0, sizeof( sv_shadowHistory[clientNum] ) );
+}
+
+
 void SV_Antilag_Init( void ) {
-    sv_antilagEnable = Cvar_Get( "sv_antilagEnable", "1",   CVAR_SERVERINFO );
-    sv_physicsScale  = Cvar_Get( "sv_physicsScale",  "3",   CVAR_SERVERINFO );
+    sv_antilag       = Cvar_Get( "sv_antilag",       "0",   CVAR_SERVERINFO );
     sv_antilagMaxMs  = Cvar_Get( "sv_antilagMaxMs",  "200", CVAR_SERVERINFO );
     sv_antilagDebug      = Cvar_Get( "sv_antilagDebug",      "0", CVAR_TEMP );
     sv_antilagRateDebug  = Cvar_Get( "sv_antilagRateDebug",  "0", CVAR_TEMP );
 
     Com_Memset( sv_shadowHistory, 0, sizeof( sv_shadowHistory ) );
     Com_Memset( sv_shadowSaved,   0, sizeof( sv_shadowSaved ) );
-    Com_Memset( sv_rateTrack,      0, sizeof( sv_rateTrack ) );
+    Com_Memset( sv_rateTrack,     0, sizeof( sv_rateTrack ) );
 
-    sv_shadowAccumulator = 0;
     sv_antilag_lastFpsValue = sv_fps ? sv_fps->integer : 40;
 
     SV_Antilag_ComputeConfig();
 
-    Com_Printf( "SV_Antilag: game=%dHz shadow=%dHz slots=%d covers~%dms maxRewind=%dms debug=%d rateDebug=%d\n",
-        (sv_gameHz && sv_gameHz->integer > 0) ? sv_gameHz->integer : (sv_fps ? sv_fps->integer : 20),
+    Com_Printf( "SV_Antilag: shadow=%dHz slots=%d covers~%dms maxRewind=%dms\n",
         1000 / sv_shadowTickMs,
         sv_shadowHistorySlots,
         sv_shadowHistorySlots * sv_shadowTickMs,
-        sv_antilagMaxMs->integer,
-        sv_antilagDebug ? sv_antilagDebug->integer : 0,
-        sv_antilagRateDebug ? sv_antilagRateDebug->integer : 0 );
+        sv_antilagMaxMs->integer );
 }
 
 
-/*
-SV_Antilag_RecordPositions
-
-Called from SV_Frame() once per engine tick, BEFORE GAME_RUN_FRAME.
-Records all active clients into the shadow history ring buffer.
-Recomputes config if sv_fps or sv_antilagMaxMs changed.
-*/
 void SV_Antilag_RecordPositions( void ) {
     int i;
 
-    // Recompute config if relevant cvars changed.
-    // sv_fps affects shadow Hz and slot count — must be included.
-    // NOTE: sv_fps->modified is cleared by SV_TrackCvarChanges before we run,
-    // so we track the actual integer value to detect changes independently.
     {
         int currentFps = sv_fps ? sv_fps->integer : 40;
         qboolean fpsChanged = ( currentFps != sv_antilag_lastFpsValue );
 
-        if ( sv_physicsScale->modified || sv_antilagMaxMs->modified || fpsChanged ) {
+        if ( sv_antilagMaxMs->modified || fpsChanged ) {
             SV_Antilag_ComputeConfig();
-            sv_physicsScale->modified = qfalse;
             sv_antilagMaxMs->modified = qfalse;
             sv_antilag_lastFpsValue = currentFps;
-
-            // Always flush all ring buffers on any timing change.
-            // Stale entries recorded at the old tick rate have wrong timestamp
-            // spacing and produce incorrect interpolation even if the slot count
-            // happens to remain the same (e.g. sv_fps 60→40→60 round-trip).
-            // Without this flush, the corruption persists until server reboot.
             Com_Memset( sv_shadowHistory, 0, sizeof( sv_shadowHistory ) );
-
-            Com_Printf( "SV_Antilag: reconfigured — shadow Hz=%d, historySlots=%d (history flushed)\n",
+            Com_Printf( "SV_Antilag: reconfigured -- shadow Hz=%d, historySlots=%d (history flushed)\n",
                 1000 / sv_shadowTickMs, sv_shadowHistorySlots );
         }
     }
 
-    // Record active human clients into shadow history.
-    // Bots are excluded: the QVM's FIFO antilag already handles bot
-    // targets (FIFO skips bots — zero lag — so their position is already
-    // correct).  Recording bots would cause a double-rewind conflict:
-    // FIFO shifts the bot to position A, then shadow overwrites with
-    // position B from a different time formula, and the trace runs
-    // against a position neither system intended.
-    //
-    // Timestamps use sv.time (not svs.time) because fire time is
-    // computed from sv.time and shadow history lookups must be in
-    // the same time domain.
-    for ( i = 0; i < sv_maxclients->integer; i++ ) {
+    for ( i = 0; i < sv.maxclients; i++ ) {
         client_t *cl = &svs.clients[i];
         if ( cl->state != CS_ACTIVE ) continue;
-        if ( cl->netchan.remoteAddress.type == NA_BOT ) continue;
+        // Bots ARE recorded.  Their positions must be in shadow history so that
+        // human-vs-bot traces can be rewound to the shooter's fireTime, giving
+        // fair hit registration at non-trivial ping (see SV_Antilag_RewindAll).
         SV_Antilag_RecordClient( i, sv.time );
     }
 }
 
 
-/*
-SV_Antilag_NoteSnapshot
-
-Called from sv_snapshot.c each time a snapshot is actually sent to a client.
-Records the send time into the rolling window for rate measurement.
-Only active when sv_antilagDebug >= 3.
-*/
 void SV_Antilag_NoteSnapshot( int clientNum ) {
     svRateTrack_t   *rt;
     client_t        *cl;
     int             idx;
-    static qboolean s_noted = qfalse;
 
-    if ( !sv_antilagRateDebug || !sv_antilagRateDebug->integer ) {
-        s_noted = qfalse;   // reset so we log again if re-enabled
+    if ( !sv_antilagRateDebug || !sv_antilagRateDebug->integer )
         return;
-    }
 
-    // Print once when rate debug becomes active
-    if ( !s_noted ) {
-        s_noted = qtrue;
-        Com_Printf( "SV_Antilag: rate monitoring active (sv_antilagRateDebug 1) — reporting every 5s\n" );
-    }
-
-    if ( clientNum < 0 || clientNum >= sv_maxclients->integer )
+    if ( clientNum < 0 || clientNum >= sv.maxclients )
         return;
 
     rt = &sv_rateTrack[clientNum];
     cl = &svs.clients[clientNum];
 
-    // Record snapshot send time
     idx = rt->snapHead % SV_RATE_SAMPLES;
     rt->snapTimes[idx] = svs.time;
     rt->snapHead++;
     if ( rt->snapCount < SV_RATE_SAMPLES )
         rt->snapCount++;
 
-    // Periodic report: every 5 seconds per client
     if ( svs.time < rt->reportTimer )
         return;
     rt->reportTimer = svs.time + 5000;
 
-    // Count snaps within the last WINDOW ms
     {
         int windowStart = svs.time - SV_RATE_WINDOW_MS;
         int snapsSeen   = 0;
         int oldest = svs.time, newest = 0;
         int i;
+        float obsHz = 0.0f;
+        float pktHz = 0.0f;
 
         for ( i = 0; i < rt->snapCount; i++ ) {
             int t = rt->snapTimes[( rt->snapHead - 1 - i + SV_RATE_SAMPLES ) % SV_RATE_SAMPLES];
@@ -583,14 +458,9 @@ void SV_Antilag_NoteSnapshot( int clientNum ) {
             }
         }
 
-        // Observed snap rate over window
-        float obsHz = 0.0f;
-        if ( snapsSeen > 1 && newest > oldest ) {
+        if ( snapsSeen > 1 && newest > oldest )
             obsHz = ( snapsSeen - 1 ) * 1000.0f / (float)( newest - oldest );
-        }
 
-        // Observed packet rate from netchan sequence
-        float pktHz = 0.0f;
         if ( rt->lastSeqTime > 0 && svs.time > rt->lastSeqTime ) {
             int seqDelta  = cl->netchan.outgoingSequence - rt->lastSeq;
             int timeDelta = svs.time - rt->lastSeqTime;
@@ -599,38 +469,14 @@ void SV_Antilag_NoteSnapshot( int clientNum ) {
         rt->lastSeq     = cl->netchan.outgoingSequence;
         rt->lastSeqTime = svs.time;
 
-        Com_Printf( "RATE cl[%2d] %-16s | snap: obs=%.1fHz target=%dHz (%dms) | pkt: %.1fHz | ping=%dms | %s\n",
-            clientNum,
-            cl->name,
-            obsHz,
+        Com_Printf( "RATE cl[%2d] %-16s | snap: obs=%.1fHz target=%dHz | pkt: %.1fHz | ping=%dms\n",
+            clientNum, cl->name, obsHz,
             1000 / ( cl->snapshotMsec > 0 ? cl->snapshotMsec : 1 ),
-            cl->snapshotMsec,
-            pktHz,
-            cl->ping,
-            ( obsHz > 0 && cl->snapshotMsec > 0 &&
-              obsHz < ( 1000.0f / cl->snapshotMsec ) * 0.85f )
-              ? "CHOKED" : "ok"
-        );
+            pktHz, cl->ping );
     }
 }
 
 
-/*
-SV_Antilag_InterceptTrace
-
-Called from the G_TRACE / G_TRACECAPSULE syscall handler in sv_game.c,
-replacing the normal SV_Trace when the shooter has antilag enabled.
-
-The intercept:
-  1. Determines rewind target time from shooter's ping
-  2. Saves + rewinds all other clients in shadow history
-  3. Runs the actual SV_Trace at the rewound world state
-  4. Restores ALL clients unconditionally
-  5. Returns result to QVM
-
-The QVM never sees entities in a rewound state — the restore happens
-before control returns to the VM. level.time is never touched.
-*/
 qboolean SV_Antilag_InterceptTrace(
     trace_t         *results,
     const vec3_t    start,
@@ -644,20 +490,13 @@ qboolean SV_Antilag_InterceptTrace(
     int fireTime;
     int rewound;
 
-    // Master switch
-    if ( !sv_antilagEnable || !sv_antilagEnable->integer )
+    if ( !sv_antilag || !sv_antilag->integer )
         return qfalse;
 
-    // Only intercept if passEntityNum is a valid active player
-    // (shooters pass their own entity num as passEntityNum in utTrace)
-    if ( passEntityNum < 0 || passEntityNum >= sv_maxclients->integer )
+    if ( passEntityNum < 0 || passEntityNum >= sv.maxclients )
         return qfalse;
 
-    // Skip movement traces — only intercept weapon/damage traces.
-    // Pmove uses MASK_PLAYERSOLID (includes CONTENTS_PLAYERCLIP) for collision;
-    // weapon traces use MASK_SHOT (no CONTENTS_PLAYERCLIP).
-    // Rewinding movement traces causes players to collide against historical
-    // positions instead of current ones, allowing them to phase through each other.
+    // Skip movement traces -- only intercept weapon traces (no CONTENTS_PLAYERCLIP)
     if ( contentmask & CONTENTS_PLAYERCLIP )
         return qfalse;
 
@@ -665,29 +504,23 @@ qboolean SV_Antilag_InterceptTrace(
         client_t *shooter = &svs.clients[passEntityNum];
         if ( shooter->state != CS_ACTIVE )
             return qfalse;
-        // Don't apply to bots — they have no lag to compensate
         if ( shooter->netchan.remoteAddress.type == NA_BOT )
             return qfalse;
     }
 
-    // Determine the rewind target time
     fireTime = SV_Antilag_GetClientFireTime( passEntityNum );
 
     if ( sv_antilagDebug && sv_antilagDebug->integer >= 1 ) {
         client_t *shooter = &svs.clients[ passEntityNum ];
-        int rewindMs = sv.time - fireTime;
-        Com_Printf( "AL shot cl[%d] ping=%d rewind=%dms (sv.time=%d fireTime=%d)\n",
-            passEntityNum, shooter->ping, rewindMs, sv.time, fireTime );
+        Com_Printf( "AL shot cl[%d] ping=%d snapMsec=%d rewind=%dms (sv.time=%d fireTime=%d)\n",
+            passEntityNum, shooter->ping, shooter->snapshotMsec,
+            sv.time - fireTime, sv.time, fireTime );
     }
 
-    // Rewind all other clients into shadow positions
     rewound = SV_Antilag_RewindAll( passEntityNum, fireTime );
 
-    // Run the actual trace at the rewound world state
-    // This is identical to what sv_game.c would have called
     SV_Trace( results, start, mins, maxs, end, passEntityNum, contentmask, capsule );
 
-    // Unconditional restore — QVM sees a clean world after this returns
     SV_Antilag_RestoreAll( passEntityNum );
 
     if ( sv_antilagDebug && sv_antilagDebug->integer >= 1 ) {
@@ -698,5 +531,5 @@ qboolean SV_Antilag_InterceptTrace(
             hitStr, results->entityNum, results->fraction, rewound );
     }
 
-    return qtrue; // we handled it, caller should not call SV_Trace again
+    return qtrue;
 }

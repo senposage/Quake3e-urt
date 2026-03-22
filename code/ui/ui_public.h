@@ -32,10 +32,9 @@ typedef struct {
 	char			servername[MAX_STRING_CHARS];
 	char			updateInfoString[MAX_STRING_CHARS];
 	char			messageString[MAX_STRING_CHARS];
-
-    #ifdef USE_AUTH
-    char		serverAddress[MAX_STRING_CHARS];
-    #endif
+#ifdef USE_AUTH
+	char			serverAddress[MAX_STRING_CHARS];
+#endif
 } uiClientState_t;
 
 typedef enum {
@@ -129,14 +128,14 @@ typedef enum {
 	UI_FS_SEEK,
 	UI_SET_PBCLSTATUS,
 
-    #ifdef USE_AUTH
-    UI_NET_STRINGTOADR, //@Barbatos
+#ifdef USE_AUTH
+	UI_NET_STRINGTOADR,
 	UI_Q_VSNPRINTF,
 	UI_NET_SENDPACKET,
 	UI_COPYSTRING,
 	UI_SYS_STARTPROCESS,
-    UI_NET_COMPAREBASEADR, // (== 93)
-    #endif
+	UI_NET_COMPAREBASEADR, // == 93
+#endif
 
 	UI_FLOOR = 107,
 	UI_CEIL,
@@ -144,6 +143,7 @@ typedef enum {
 	// engine extensions
 	UI_R_ADDREFENTITYTOSCENE2,
 	UI_R_ADDLINEARLIGHTTOSCENE,
+	UI_CVAR_SETDESCRIPTION,
 	UI_TRAP_GETVALUE = COM_TRAP_GETVALUE,
 
 } uiImport_t;
@@ -201,10 +201,9 @@ typedef enum {
 // a GetClientState syscall will be made to get the current strings
 
 #ifdef USE_AUTH
-    //@Barbatos @Kalish
 	UI_AUTHSERVER_PACKET,
 #endif
-	
+
 	UI_EXPORT_LAST,
 } uiExport_t;
 

@@ -25,6 +25,10 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 
 extern cvar_t *s_khz;
 
+#ifndef NO_DMAHD
+extern qboolean dmaHD_Enabled( void );
+#endif
+
 static qboolean	dsound_init;
 static qboolean SNDDMA_InitDS( void );
 
@@ -96,7 +100,7 @@ static LPWSTR DeviceID = NULL;
 static qboolean doSndRestart = qfalse;
 
 static IAudioRenderClient	*iAudioRenderClient = NULL;
-static IAudioClient			*iAudioClient = NULL;
+static IAudioClient			*iAudioClient = NULL; 
 static IMMDeviceEnumerator	*pEnumerator = NULL;
 static IMMDevice			*iMMDevice = NULL;
 
@@ -104,8 +108,8 @@ static void initFormat( WAVEFORMATEXTENSIBLE *wave, int nChannels, int nSamples,
 {
 	Com_Memset( wave, 0, sizeof( *wave ) );
 
-	// wave->Format.wFormatTag = WAVE_FORMAT_EXTENSIBLE;
-	wave->Format.wFormatTag = WAVE_FORMAT_PCM;
+	// Use IEEE float for 32-bit; PCM for everything else.
+	wave->Format.wFormatTag = (nBits == 32) ? WAVE_FORMAT_IEEE_FLOAT : WAVE_FORMAT_PCM;
 	wave->Format.nChannels = nChannels;
 	wave->Format.nSamplesPerSec = nSamples;
 	wave->Format.nBlockAlign = (nChannels * nBits) / 8;
@@ -235,6 +239,9 @@ static DWORD WINAPI ThreadProc( HANDLE hInited )
 					n = samples;
 
 				Com_Memcpy( pData + dwOffset, dma.buffer + bufferPosition * bufferSampleSize, n * bufferSampleSize );
+				// Zero the consumed region so a wrap-around under a game-loop stall
+				// plays silence rather than repeating the previous cycle's audio.
+				Com_Memset( dma.buffer + bufferPosition * bufferSampleSize, 0, n * bufferSampleSize );
 
 				dwOffset += n * bufferSampleSize;
 				bufferPosition = ( bufferPosition + n ) & ( dma.fullsamples - 1 );
@@ -270,7 +277,7 @@ err_exit:
 
 
 static BOOL ValidFormat( const WAVEFORMATEXTENSIBLE *format, const WORD wFormatTag, const GUID *SubFormat ) {
-
+	
 	if ( format->Format.wFormatTag == wFormatTag )
 	{
 		return TRUE;
@@ -297,7 +304,7 @@ NotificationClient_t;
 
 static HRESULT STDMETHODCALLTYPE QueryInterface( IMMNotificationClient *this, REFIID riid, VOID **ppvInterface )
 {
-	if ( !memcmp( riid, &IID_IUnknown, sizeof( GUID ) ) || !memcmp( riid, &IID_IMMNotificationClient, sizeof( GUID ) ) )
+	if ( !memcmp( riid, &IID_IUnknown, sizeof( GUID ) ) || !memcmp( riid, &IID_IMMNotificationClient, sizeof( GUID ) ) ) 
 	{
 		*ppvInterface = (void**)this;
 		this->lpVtbl->AddRef( this );
@@ -383,6 +390,7 @@ static qboolean SNDDMA_InitWASAPI( void )
 	DWORD					dwStreamFlags = AUDCLNT_STREAMFLAGS_EVENTCALLBACK;
 	WAVEFORMATEXTENSIBLE	desiredFormat;
 	WAVEFORMATEXTENSIBLE	*closest = NULL;
+	WAVEFORMATEX			*mixFormat = NULL;
 	DWORD					dwThreadID;
 	HANDLE					hInited;
 	qboolean				isfloat;
@@ -429,27 +437,65 @@ static qboolean SNDDMA_InitWASAPI( void )
 	dma.channels = 2;
 	dma.samplebits = 16;
 
-	switch ( s_khz->integer ) {
-		case 48: dma.speed = 48000; break;
-		case 44: dma.speed = 44100; break;
-		case 11: dma.speed = 11025; break;
-		case 22:
-		default: dma.speed = 22050; break;
-	};
-
-	initFormat( &desiredFormat, dma.channels, dma.speed, dma.samplebits );
-
-#if 0
-	iAudioClient->lpVtbl->GetMixFormat( iAudioClient, (WAVEFORMATEX**) &mixFormat );
-	if ( mixFormat )
+#ifndef NO_DMAHD
+	if ( dmaHD_Enabled() )
 	{
-		Com_Printf( "MIX FORMAT\n" );
-		Com_Printf( "subformat: %x-%x-%x-%x\n", mixFormat->SubFormat.Data1, mixFormat->SubFormat.Data2, mixFormat->SubFormat.Data3, mixFormat->SubFormat.Data4 );
-		Com_Printf( "channels: %i\n", mixFormat->Format.nChannels );
-		Com_Printf( "samples per sec: %i\n", mixFormat->Format.nSamplesPerSec );
-		Com_Printf( "bits per sample: %i\n", mixFormat->Format.wBitsPerSample );
+		// Query the device's own mix format so we feed samples at exactly the
+		// rate and depth the Windows audio engine is already running at.
+		// This makes WASAPI operate bit-perfect: no internal resampling, no
+		// Windows Audio Processing Object (APO) disruption, minimum latency.
+		if ( iAudioClient->lpVtbl->GetMixFormat( iAudioClient, &mixFormat ) == S_OK && mixFormat )
+		{
+			// Copy the mix format verbatim into desiredFormat.
+			// GetMixFormat can return either a plain WAVEFORMATEX or a
+			// WAVEFORMATEXTENSIBLE (indicated by wFormatTag==WAVE_FORMAT_EXTENSIBLE
+			// and cbSize covering the extra fields).
+			if ( mixFormat->wFormatTag == WAVE_FORMAT_EXTENSIBLE &&
+			     mixFormat->cbSize >= sizeof( WAVEFORMATEXTENSIBLE ) - sizeof( WAVEFORMATEX ) )
+			{
+				Com_Memcpy( &desiredFormat, mixFormat, sizeof( WAVEFORMATEXTENSIBLE ) );
+			}
+			else
+			{
+				Com_Memset( &desiredFormat, 0, sizeof( desiredFormat ) );
+				Com_Memcpy( &desiredFormat, mixFormat, sizeof( WAVEFORMATEX ) );
+			}
+
+			CoTaskMemFree( mixFormat );
+			mixFormat = NULL;
+
+			// Force stereo: HRTF spatialisation always needs a stereo output.
+			desiredFormat.Format.nChannels        = 2;
+			desiredFormat.Format.nBlockAlign      = (WORD)( desiredFormat.Format.nChannels * desiredFormat.Format.wBitsPerSample / 8 );
+			desiredFormat.Format.nAvgBytesPerSec  = desiredFormat.Format.nSamplesPerSec * desiredFormat.Format.nBlockAlign;
+
+			dma.speed     = (int)desiredFormat.Format.nSamplesPerSec;
+			dma.samplebits = desiredFormat.Format.wBitsPerSample;
+
+			Com_DPrintf( "dmaHD: targeting WASAPI native format %i Hz / %i-bit\n", dma.speed, dma.samplebits );
+		}
+		else
+		{
+			// GetMixFormat unavailable - safe fallback: 48 kHz 32-bit float.
+			dma.speed      = 48000;
+			dma.samplebits = 32;
+			initFormat( &desiredFormat, dma.channels, dma.speed, dma.samplebits );
+			Com_DPrintf( "dmaHD: WASAPI GetMixFormat failed, using %i Hz / %i-bit fallback\n", dma.speed, dma.samplebits );
+		}
 	}
+	else
 #endif
+	{
+		switch ( s_khz->integer ) {
+			case 48: dma.speed = 48000; break;
+			case 44: dma.speed = 44100; break;
+			case 11: dma.speed = 11025; break;
+			case 8:  dma.speed = 8000;  break;
+			case 22:
+			default: dma.speed = 22050; break;
+		};
+		initFormat( &desiredFormat, dma.channels, dma.speed, dma.samplebits );
+	}
 
 	hr = iAudioClient->lpVtbl->IsFormatSupported( iAudioClient, AUDCLNT_SHAREMODE_SHARED, (const WAVEFORMATEX *) &desiredFormat, (WAVEFORMATEX **) &closest );
 	if ( hr != S_OK )
@@ -486,12 +532,22 @@ static qboolean SNDDMA_InitWASAPI( void )
 			isfloat = qfalse;
 			break;
 		case 32:
-			if ( !ValidFormat( &desiredFormat, WAVE_FORMAT_IEEE_FLOAT, &FloatSubformatGuid ) )
+			if ( ValidFormat( &desiredFormat, WAVE_FORMAT_IEEE_FLOAT, &FloatSubformatGuid ) )
+			{
+				isfloat = qtrue;
+			}
+			else if ( ValidFormat( &desiredFormat, WAVE_FORMAT_PCM, &PcmSubformatGuid ) )
+			{
+				// 32-bit integer PCM container - e.g. 24-valid-bits-in-32 (common on
+				// some DACs/interfaces).  Not float; the transfer path will write
+				// samples MSB-aligned in the 32-bit container.
+				isfloat = qfalse;
+			}
+			else
 			{
 				Com_Printf( S_COLOR_YELLOW "WASAPI: unsupported format for %i-bit samples\n", desiredFormat.Format.wBitsPerSample );
 				goto error3;
 			}
-			isfloat = qtrue;
 			break;
 		default:
 			Com_Printf( S_COLOR_YELLOW "WASAPI: unsupported sample count %i\n", desiredFormat.Format.wBitsPerSample );
@@ -520,7 +576,7 @@ static qboolean SNDDMA_InitWASAPI( void )
 		// because we will call Initialize() with hnsBufferDuration=0 to select minimal buffer size
 		REFERENCE_TIME defDuration;
 		iAudioClient->lpVtbl->GetDevicePeriod( iAudioClient, &defDuration, NULL );
-		Com_Printf( S_COLOR_CYAN "WASAPI buffer duration: %i.%i millisecons\n",
+		Com_Printf( S_COLOR_CYAN "WASAPI buffer duration: %i.%i millisecons\n", 
 			(int)(defDuration / 10000), (int)(( ( defDuration + 500 ) / 1000 ) % 10) );
 	}
 
@@ -547,13 +603,26 @@ static qboolean SNDDMA_InitWASAPI( void )
 	}
 
 	Com_DPrintf( "WASAPI buffer frame count: %i\n", bufferFrameCount );
-
+	
 	dma.submission_chunk = 1;
 	dma.buffer = buffer;
 	dma.isfloat = isfloat;
 	dma.channels = desiredFormat.Format.nChannels;
 	dma.speed = desiredFormat.Format.nSamplesPerSec;
 	dma.samplebits = desiredFormat.Format.wBitsPerSample;
+
+	/* For WAVEFORMATEXTENSIBLE the container width (wBitsPerSample) can
+	 * differ from the actual valid bits (wValidBitsPerSample), e.g. Windows
+	 * reports wBitsPerSample=32 and wValidBitsPerSample=24 when the device is
+	 * configured for 24-bit audio.  Store the valid bit depth separately so
+	 * s_info can display the correct value to the user while the transfer path
+	 * continues to use dma.samplebits (32) for its output-format switch. */
+	if ( desiredFormat.Format.wFormatTag == WAVE_FORMAT_EXTENSIBLE &&
+	     desiredFormat.Samples.wValidBitsPerSample != 0 &&
+	     desiredFormat.Samples.wValidBitsPerSample != desiredFormat.Format.wBitsPerSample )
+		dma.validbits = desiredFormat.Samples.wValidBitsPerSample;
+	else
+		dma.validbits = 0;
 
 	dma.fullsamples = log2pad( bufferFrameCount * 8, 1 );
 	while ( dma.fullsamples * desiredFormat.Format.nBlockAlign > sizeof( buffer ) )
@@ -628,7 +697,6 @@ error2:
 
 	if ( notification_client.lpVtbl->QueryInterface ) {
 		pEnumerator->lpVtbl->UnregisterEndpointNotificationCallback( pEnumerator, (IMMNotificationClient *)&notification_client );
-		Com_Memset( &notification_client, 0, sizeof( notification_client ) );
 	}
 
 	pEnumerator->lpVtbl->Release( pEnumerator ); pEnumerator = NULL;
@@ -765,10 +833,6 @@ void SNDDMA_Shutdown( void ) {
 }
 
 
-#ifndef NO_DMAHD
-qboolean dmaHD_Enabled(void);
-#endif
-
 /*
 ==================
 SNDDMA_Init
@@ -783,25 +847,17 @@ qboolean SNDDMA_Init( void ) {
 	const char *defdrv;
 	cvar_t *s_driver;
 
-#ifndef NO_DMAHD
-	if ( IsWindows7OrGreater() && !dmaHD_Enabled())
-#else
-    if ( IsWindows7OrGreater() )
-#endif
+	if ( IsWindows7OrGreater() )
 		defdrv = "wasapi";
-    else
+	else
 		defdrv = "dsound";
 
-    s_driver = Cvar_Get( "s_driver", defdrv, CVAR_LATCH | CVAR_ARCHIVE_ND );
-	Cvar_SetDescription( s_driver, "Specify sound subsystem in win32 environment:\n"
-		" dsound - DirectSound (forced with `dmaHD_enable 1`)\n"
-        " wasapi - WASAPI (cannot be used with `dmaHD_enable 1`)\n" );
+	s_driver = Cvar_Get( "s_driver", defdrv, CVAR_LATCH | CVAR_ARCHIVE_ND );
 
-#ifndef NO_DMAHD
-	if ( dmaHD_Enabled() ) {
-	    Cvar_Set("s_driver", "dsound");
-	}
-#endif
+	Cvar_SetDescription( s_driver, "Specify sound subsystem in win32 environment:\n"
+		" dsound - DirectSound\n"
+		" wasapi - WASAPI\n" );
+
 #endif
 
 	memset( &dma, 0, sizeof( dma ) );
@@ -888,6 +944,16 @@ static qboolean SNDDMA_InitDS( void )
 	dma.channels = 2;
 	dma.samplebits = 16;
 
+#ifndef NO_DMAHD
+	if ( dmaHD_Enabled() )
+	{
+		// dmaHD uses 48 kHz, stereo, 16-bit for DirectSound (PCM only)
+		dma.speed = 48000;
+		dma.channels = 2;
+		dma.samplebits = 16;
+	}
+	else
+#endif
 	switch ( s_khz->integer ) {
 		case 48: dma.speed = 48000; break;
 		case 44: dma.speed = 44100; break;
@@ -896,24 +962,14 @@ static qboolean SNDDMA_InitDS( void )
 		default: dma.speed = 22050; break;
 	};
 
-#ifndef NO_DMAHD
-    if (dmaHD_Enabled())
-    {
-        // p5yc0runn3r - Fix dmaHD sound to 44KHz, Stereo and 16 bits per sample.
-        dma.speed = 44100;
-        dma.channels = 2;
-        dma.samplebits = 16;
-    }
-#endif
-
-	memset (&format, 0, sizeof(format));
+	memset( &format, 0, sizeof( format ) );
 	format.wFormatTag = WAVE_FORMAT_PCM;
 	format.nChannels = dma.channels;
 	format.wBitsPerSample = dma.samplebits;
 	format.nSamplesPerSec = dma.speed;
 	format.nBlockAlign = format.nChannels * format.wBitsPerSample / 8;
 	format.cbSize = 0;
-	format.nAvgBytesPerSec = format.nSamplesPerSec*format.nBlockAlign;
+	format.nAvgBytesPerSec = format.nSamplesPerSec*format.nBlockAlign; 
 
 	memset( &dsbuf, 0, sizeof( dsbuf ) );
 	dsbuf.dwSize = sizeof(DSBUFFERDESC);
@@ -1011,9 +1067,9 @@ int SNDDMA_GetDMAPos( void ) {
 		DWORD	dwWriteCursor;
 
 		// write position is the only safe position to start update
-		pDSBuf->lpVtbl->GetCurrentPosition(pDSBuf, NULL, &dwWriteCursor);
+		pDSBuf->lpVtbl->GetCurrentPosition( pDSBuf, NULL, &dwWriteCursor );
 
-        return ( dwWriteCursor >> sample16 ) & ( dma.samples - 1 );
+		return ( dwWriteCursor >> sample16 ) & ( dma.samples - 1 );
 	}
 
 	return 0;

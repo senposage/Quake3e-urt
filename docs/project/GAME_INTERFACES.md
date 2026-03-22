@@ -265,8 +265,11 @@ typedef struct {
 | Call | Custom Handler | Notes |
 |---|---|---|
 | `CG_CVAR_SET(name, value)` | `Cvar_SetSafe` instead of `Cvar_Set` | Respects CVAR_PROTECTED |
+| `CG_CONSOLE_COMMAND` | Custom handler for `clientScreenshot` server command | `#ifdef USE_FTWGL` |
 
 This prevents the cgame QVM from overriding `snaps` or `cg_smoothClients`.
+
+The `clientScreenshot` command is sent to cgame as a server command. The engine handler in `cl_cgame.c` intercepts it and calls `screenshot silent [filename]`.
 
 ---
 
@@ -303,6 +306,14 @@ The UI module has the same renderer, sound, filesystem, and cvar access as cgame
 | `UI_LAN_REMOVESERVER(source, addr)` | Remove favorite |
 | `UI_GETSTORAGE(...)` | Read ui/storage.bin |
 | `UI_SETSTORAGE(...)` | Write ui/storage.bin |
+
+### FTWGL-Specific UI Entry Points [CUSTOM]
+
+| Callnum | When Called | Guard |
+|---|---|---|
+| `UI_AUTHSERVER_PACKET` | Auth server packet received (AUTH:CLIENT) | `#ifdef USE_AUTH` |
+
+`UI_AUTHSERVER_PACKET` is called by the engine when the auth server sends a `CLIENT` packet. The engine forwards it to the UI QVM which handles accept/reject display. Defined in `code/ui/ui_public.h`.
 
 ---
 
@@ -375,6 +386,10 @@ typedef struct {
 // TR_GRAVITY: result = trBase + trDelta * dt - 0.5 * gravity * dt²
 // TR_SINE: result = trBase + sin(dt/trDuration * 2π) * trDelta
 // TR_INTERPOLATE/TR_STATIONARY: result = trBase (client does the lerp)
+// Note: in the URT43 cgame with cl_urt43cgPatches bit 2 enabled, TR_INTERPOLATE
+// is redirected to the TR_LINEAR handler. sv_snapshot.c anchors pos.trTime = sv.time
+// for every TR_INTERPOLATE snapshot entity so that dt ≈ 0 at snap.serverTime
+// (preserving normal interpolation) and dt > 0 at cg.time (forward extrapolation).
 ```
 
 ### Pmove — Player Movement
@@ -544,3 +559,4 @@ The platform layer provides:
 - Timing: `Sys_Milliseconds()`, `Sys_Microseconds()`
 - CPU affinity: `Sys_SetAffinityMask(mask)`
 - File system utilities: `Sys_FOpen`, `Sys_Mkdir`, `Sys_ListFiles`
+___BEGIN___COMMAND_DONE_MARKER___0

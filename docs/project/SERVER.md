@@ -1,4 +1,3 @@
-# Server Subsystem
 
 > Covers all files in `code/server/`. This is the most heavily modified subsystem in the fork. Custom changes are marked **[CUSTOM]**.
 
@@ -15,6 +14,7 @@
 7. [sv_game.c — QVM Game Interface](#sv_gamec--qvm-game-interface)
 8. [sv_world.c — Entity Spatial Index](#sv_worldc--entity-spatial-index)
 9. [sv_ccmds.c — Server Console Commands [CUSTOM]](#sv_ccmdsc--server-console-commands-custom)
+9a. [URT Server Additions [CUSTOM/URT]](#urt-server-additions-customurt)
 10. [sv_bot.c — Bot Integration](#sv_botc--bot-integration)
 11. [sv_net_chan.c — Server Netchan](#sv_net_chanc--server-netchan)
 12. [sv_filter.c — IP Filter/Ban System](#sv_filterc--ip-filterban-system)
@@ -22,6 +22,7 @@
 14. [Key Data Structures (server.h)](#key-data-structures-serverh)
 15. [All Server Cvars](#all-server-cvars)
 16. [Complete Call Graph — Server Tick](#complete-call-graph--server-tick)
+17. [Auth and Demo Cvars [URT]](#auth-and-demo-cvars-urt)
 
 ---
 
@@ -37,12 +38,12 @@
 | `sv_antilag.h` | ~80 | **NEW** | Antilag public API |
 | `sv_game.c` | 1170 | no | QVM syscall handler, G_TRACE intercept |
 | `sv_world.c` | 660 | no | Entity world sectors, SV_Trace, SV_LinkEntity |
-| `sv_ccmds.c` | 2652 | **YES** | Server console commands, map_restart fix |
+| `sv_ccmds.c` | ~3200 | **YES** | Server console commands, map_restart fix, server demo, clientScreenshot |
 | `sv_bot.c` | 450 | no | Bot client allocation, BotLib interface |
 | `sv_net_chan.c` | 300 | no | Server netchan encode/decode |
 | `sv_filter.c` | 1100 | no | IP ban/filter expression engine |
 | `sv_rankings.c` | 1537 | no | Player statistics/rankings |
-| `server.h` | 380 | **YES** | Server-internal types with gameTime fields |
+| `server.h` | ~500 | **YES** | Server-internal types with gameTime, auth, demo fields |
 
 ---
 
@@ -82,8 +83,7 @@ SV_Frame(msec):
       sv.timeResidual -= frameMsec
       sv.time += frameMsec
 
-      [ANTILAG] for i in range(sv_physicsScale):
-          SV_Antilag_RecordPositions()        ← shadow position snapshots
+      [ANTILAG] SV_Antilag_RecordPositions()        ← shadow position snapshots (all active clients)
 
       [GAME FRAME LOOP]
       sv.gameTimeResidual += frameMsec
@@ -376,7 +376,9 @@ Walks ring buffer backward from `head`, finds two entries bracketing `targetTime
 
 #### SV_SmoothGetAverageVelocity(clientNum, windowMs, outVelocity) [CUSTOM]
 
-Averages all velocity entries within last `windowMs` milliseconds. Used by `sv_velSmooth` to smooth rapid direction changes.
+Exponential weighted average of velocity entries within the last `windowMs` milliseconds. The most-recent sample carries weight 1.0; each older step is multiplied by 0.5 (half-life = 1 sample). At `sv_velSmooth=64` / `sv_fps=60` this yields ~4 samples with weights ≈ 53 % / 26 % / 13 % / 7 %, so the latest velocity dominates while enough history is present to suppress per-tick physics noise.
+
+**Why exponential instead of uniform:** a uniform sliding window gives every sample equal weight. As the window slides by one tick the dropped oldest sample and the newly added current sample can differ substantially (e.g. opposite directions during a turn), flipping `trDelta` noticeably between consecutive snapshots. The exponential weighting makes each new snapshot's `trDelta` a smooth continuation of the previous one, eliminating the trajectory kink at every snapshot boundary that manifests as blur/micro-stutter for fast-moving players.
 
 ### Snapshot System
 
@@ -407,18 +409,45 @@ for each entity (0 to sv.num_entities):
         usedBuffer = SV_SmoothGetPosition(es->number, targetTime, &origin, &vel)
     
     if !usedBuffer:
-        if bot:
-            origin = trBase + trDelta * (sv.time - sv.gameTime) * 0.001
-            vel    = trDelta
-        else (real player):
-            origin = ps->origin
+        if bot AND sv.time > sv.gameTime:     ← only when sv_gamehz creates a gap
+            // extrapolate from last game-frame boundary using ps->velocity
+            dt     = (sv.time - sv.gameTime) * 0.001
+            origin = trBase + ps->velocity * dt
             vel    = ps->velocity
+        else (bot, sv_gamehz 0):
+            origin = trBase          ← already fresh every tick
+            vel    = trDelta
+
+        if real player:
+            // ps->origin only advances when a usercmd is processed (GAME_CLIENT_THINK)
+            // or when G_RunClient fires (at sv_gamehz rate).  Between game frames,
+            // the observed player's ps->origin can lag sv.time by up to one packet
+            // interval → identical trBase in 2-3 consecutive snapshots → stutter.
+            // Fix: extrapolate from last Pmove time (ps->commandTime) to sv.time.
+            // Cap dt to the game-frame gap (sv.time - sv.gameTime) to avoid
+            // over-extrapolation.  At sv_gamehz 0, G_RunClient keeps
+            // ps->commandTime == sv.time every tick → dt == 0 → no-op.
+            if sv.time > sv.gameTime AND ps->commandTime < sv.time:
+                dt = min(sv.time - ps->commandTime, sv.time - sv.gameTime) * 0.001
+                origin = ps->origin + ps->velocity * dt
+            else:
+                origin = ps->origin  ← fresh (sv_gamehz 0 or usercmd this tick)
+            vel = ps->velocity
 
     [PHASE 2: apply trajectory]
 
+    if bot:
+        // Keep TR_INTERPOLATE — avoids visual/server mismatch when bots
+        // change direction at a game-frame boundary (TR_LINEAR would show
+        // stale-velocity extrapolation until the next game frame).
+        // Gate: only anchor when sv_gamehz creates a gap; at sv_gamehz 0
+        // trBase is already fresh every tick so no change is needed.
+        if sv.time > sv.gameTime:
+            VectorCopy(origin, es->pos.trBase)
+
     deadZone = DotProduct(vel, vel) > 100.0f  (speed > ~10 ups)
 
-    if sv_smoothClients:
+    else if sv_smoothClients:
         if deadZone:
             es->pos.trType  = TR_LINEAR
             es->pos.trBase  = origin
@@ -429,10 +458,8 @@ for each entity (0 to sv.num_entities):
     else if sv_extrapolate:
         if usedBuffer AND deadZone:
             VectorCopy(origin, es->pos.trBase)
-        else if bot:
-            VectorCopy(origin, es->pos.trBase)  // already extrapolated above
         else if real player AND deadZone:
-            VectorCopy(ps->origin, es->pos.trBase)  // use actual Pmove position
+            VectorCopy(ps->origin, es->pos.trBase)
 ```
 
 **Dead-zone explanation:** `DotProduct(vel, vel) > 100.0f` means `|vel| > 10 ups`. This filters Pmove ground-snap oscillations on stationary players. Without it, a player standing still would flutter between TR_LINEAR and TR_INTERPOLATE every few ticks, causing vibration.
@@ -499,19 +526,17 @@ typedef struct {
 } svShadowHistory_t;
 ```
 
-Up to 256 slots per client. At sv_fps 60, sv_physicsScale 3 → 180 Hz recording → 256/180 = ~1.4 seconds of history.
+Up to 256 slots per client. At sv_fps 60 → 60 Hz recording → 256/60 = ~4.3 seconds of history (capped by sv_antilagMaxMs).
 
 ### Public API
 
 #### void SV_Antilag_Init()
 
-Called from `SV_Init()`. Registers cvars: `sv_antilagEnable`, `sv_physicsScale`, `sv_antilagMaxMs`, `sv_antilagDebug`, `sv_antilagRateDebug`. Calls `SV_Antilag_ComputeConfig()`.
+Called from `SV_Init()`. Registers cvars: `sv_antilag`, `sv_antilagMaxMs`, `sv_antilagDebug`, `sv_antilagRateDebug`. Calls `SV_Antilag_ComputeConfig()`.
 
 #### void SV_Antilag_RecordPositions()
 
-Called from `SV_Frame()` — `sv_physicsScale` times per engine tick. Records `gent->r.currentOrigin`, `absmin`, `absmax` for all active non-bot clients.
-
-**Why sv_physicsScale times per tick:** More recordings = finer temporal resolution for the rewind. Default physicsScale=3 at sv_fps=60 = 180Hz recording → ~5.5ms granularity.
+Called once per engine tick from `SV_Frame()`. Records `gent->r.currentOrigin`, `absmin`, `absmax` for all active clients — including bots. Bots are recorded so that human shooters get accurate lag compensation when targeting bots (the shooter sees the bot at a position from ~(ping + snapshotMsec) ms ago, same as for human targets). `sv_antilag 1` auto-forces `g_antilag 0`, so no QVM FIFO pre-setup interferes with the shadow rewind.
 
 #### void SV_Antilag_NoteSnapshot(int clientNum)
 
@@ -523,7 +548,7 @@ Called from `SV_SendClientMessages()` after each snapshot send. Tracks snapshot 
 
 ```
 SV_Antilag_InterceptTrace:
-    if !sv_antilagEnable: return qfalse  (caller uses normal SV_Trace)
+    if !sv_antilag: return qfalse  (caller uses normal SV_Trace)
 
     if passEntityNum is invalid or bot: return qfalse
 
@@ -531,9 +556,8 @@ SV_Antilag_InterceptTrace:
         = svs.time - cl->ping, clamped to [svs.time - sv_antilagMaxMs, svs.time]
 
     rewound = SV_Antilag_RewindAll(passEntityNum, fireTime)
-        for each active non-bot non-shooter client:
-            ① sv_shadowSaved[i] = SV_Antilag_GetMostRecentPosition(i)
-               (overrides whatever the QVM's G_TimeShiftAllClients did)
+        for each active non-shooter client (humans and bots):
+            ① save gent->r.currentOrigin/absmin/absmax
             ② apply SV_Antilag_GetPositionAtTime(i, fireTime)
             ③ SV_LinkEntity(gent)
 
@@ -682,7 +706,7 @@ Returns content flags at point. Checks both world geometry (`CM_PointContents`) 
 ## sv_ccmds.c — Server Console Commands [CUSTOM]
 
 **File:** `code/server/sv_ccmds.c`  
-**Size:** ~2652 lines
+**Size:** ~3200 lines
 
 ### SV_MapRestart_f() [CUSTOM FIX]
 
@@ -716,6 +740,126 @@ SV_RestartGameProgs();
 | `systeminfo` | `SV_Systeminfo_f()` | Print SYSTEMINFO cvars |
 | `tell <n> <msg>` | `SV_Tell_f()` | Private message |
 | `say <msg>` | `SV_ConSay_f()` | Server broadcast |
+
+---
+
+## URT Server Additions [CUSTOM/URT]
+
+These additions are all guarded by compile-time flags and integrate UrbanTerror-specific server functionality.
+
+### Auth System (sv_init.c, sv_main.c, sv_client.c, server.h) [USE_AUTH]
+
+The engine provides hooks for an external auth server. The auth system is primarily QVM-side; the engine provides socket-level forwarding only.
+
+#### Cvars registered (sv_init.c)
+
+| Cvar | Flags | Notes |
+|---|---|---|
+| `sv_authServerIP` | `CVAR_TEMP\|CVAR_ROM` | Auth server IP address |
+| `sv_auth_engine` | `CVAR_ROM` | Auth engine version (read by QVM) |
+
+#### server.h additions
+
+`client_t` gains:
+```c
+#ifdef USE_AUTH
+    char    auth[MAX_NAME_LENGTH];   // auth token for this client
+#endif
+```
+
+#### SV_Auth_DropClient(client_t *drop, const char *reason, const char *message)
+
+Defined in `sv_client.c`. Sends separate `reason` (for log) and `message` (for client display) strings, then calls `SV_DropClient`. Used by the auth server packet handler when a player fails authentication.
+
+### Server Demo Recording (sv_ccmds.c, sv_snapshot.c, sv_client.c, server.h) [USE_SERVER_DEMO]
+
+Records server-side demos — captures the exact stream sent to each client. Demos can be played back in any client.
+
+#### server.h additions
+
+`client_t` gains:
+```c
+#ifdef USE_SERVER_DEMO
+    qboolean    demo_recording;   // currently recording this client?
+    fileHandle_t demo_file;       // open file handle
+    qboolean    demo_waiting;     // waiting for first keyframe
+    int         demo_backoff;     // exponential backoff counter
+    playerState_t demo_deltas;    // previous frame for delta compression
+#endif
+```
+
+Extern cvars:
+```c
+#ifdef USE_SERVER_DEMO
+extern cvar_t *sv_demonotice;
+extern cvar_t *sv_demofolder;
+#endif
+```
+
+#### sv_ccmds.c functions
+
+| Function | Description |
+|---|---|
+| `SVD_StartDemoFile(client, name)` | Open file, write gamestate header + configstrings + baselines |
+| `SVD_WriteDemoFile(client, msg)` | Per-snapshot recording with svc_EOF append |
+| `SVD_StopDemoFile(client)` | Write trailer markers, close file |
+| `SVD_CleanPlayerName(name, out)` | Sanitize player name for filesystem use |
+| `SV_StartRecordOne(client, name)` | Start recording one client |
+| `SV_StartRecordAll(name)` | Start recording all clients |
+| `SV_StopRecordOne(client)` | Stop recording one client |
+| `SV_StopRecordAll()` | Stop recording all clients |
+| `SV_StartServerDemo_f()` | Console command: `startserverdemo [client\|all] [name]` |
+| `SV_StopServerDemo_f()` | Console command: `stopserverdemo [client\|all]` |
+
+Demo files are written to `sv_demofolder` (default: `serverdemos/`). Filenames are sanitized player names with timestamp.
+
+#### USE_URT_DEMO conditional
+
+When `USE_URT_DEMO` is also defined, demo files use:
+- `.urtdemo` extension instead of `.dm_68`
+- URT protocol header (modversion + protocol + 2 reserved ints)
+- Backward-play size markers for URT4 demo playback compat
+
+#### sv_snapshot.c hook
+
+`SV_SendMessageToClient` calls `SVD_WriteDemoFile(client, msg)` after snapshot is built and before netchan transmit. Uses exponential backoff on the `demo_waiting` flag to force full keyframes at start of recording.
+
+### Client Screenshot (sv_ccmds.c, cl_cgame.c) [USE_FTWGL]
+
+Allows the server admin to request a screenshot from a connected client.
+
+#### sv_ccmds.c: SV_ClientScreenshot_f()
+
+Registered as `clientScreenshot` server console command. Usage: `clientScreenshot <clientNum>`.
+Sends `clientScreenshot [filename]` as a reliable server command to the specified client.
+
+#### cl_cgame.c: clientScreenshot handler
+
+`CL_CgameSystemCalls` intercepts the `clientScreenshot` server command and calls `screenshot silent [filename]` locally. Guarded by `#ifdef USE_FTWGL`.
+
+### Updated Console Commands (sv_ccmds.c)
+
+| Command | Function | Notes |
+|---|---|---|
+| `startserverdemo [client\|all] [name]` | `SV_StartServerDemo_f()` | Start server-side demo recording |
+| `stopserverdemo [client\|all]` | `SV_StopServerDemo_f()` | Stop server-side demo recording |
+| `clientScreenshot <clientNum>` | `SV_ClientScreenshot_f()` | Request screenshot from client |
+
+### Auth and Demo Cvars [URT]
+
+#### Auth Cvars (sv_init.c, USE_AUTH)
+
+| Cvar | Default | Flags | Notes |
+|------|---------|-------|-------|
+| `sv_authServerIP` | "" | `CVAR_TEMP\|CVAR_ROM` | Auth server address |
+| `sv_auth_engine` | "1" | `CVAR_ROM` | Auth engine version |
+
+#### Demo Cvars (sv_ccmds.c, USE_SERVER_DEMO)
+
+| Cvar | Default | Notes |
+|------|---------|-------|
+| `sv_demonotice` | "" | Message to send to client on auto-record start |
+| `sv_demofolder` | "serverdemos" | Directory for demo files |
 
 ---
 
@@ -869,7 +1013,10 @@ typedef struct client_s {
     int            lastSnapshotTime; // svs.time of last snapshot sent
     netchan_t      netchan;          // netchan.remoteAddress.type == NA_BOT for bots
     clientSnapshot_t frames[PACKET_BACKUP]; // snapshot history for delta
-    // ... download state, flood protection, multiview, demo recording ...
+    // ... download state, flood protection ...
+    // URT additions:
+    // #ifdef USE_AUTH:    auth[MAX_NAME_LENGTH]
+    // #ifdef USE_SERVER_DEMO: demo_recording, demo_file, demo_waiting, demo_backoff, demo_deltas
 } client_t;
 ```
 
@@ -904,19 +1051,21 @@ typedef struct client_s {
 | `sv_extrapolate` | 1 | Engine-side position extrapolation |
 | `sv_smoothClients` | 1 | TR_LINEAR trajectory mode |
 | `sv_bufferMs` | 0 | Ring buffer delay (0=off, -1=auto, 1-100=manual ms) |
-| `sv_velSmooth` | 32 | Velocity smoothing window (ms) |
+| `sv_velSmooth` | 64 | Velocity smoothing window (ms); EWA alpha=0.5/step |
 | `sv_busyWait` | 0 | Spin-wait last N ms per frame |
 | `sv_antiwarp` | 0 | Engine antiwarp (0=off, 1=constant, 2=decay) |
 | `sv_antiwarpTol` | 0 | Antiwarp tolerance ms (0=auto=gameMsec) |
 | `sv_antiwarpExtra` | 0 | Mode 2 extrapolation window ms (0=auto=awTol) |
 | `sv_antiwarpDecay` | 150 | Mode 2 decay duration ms |
+| `sv_allowClientAdaptiveTiming` | 1 | SERVERINFO, ARCHIVE. Allow connected clients to use `cl_adaptiveTiming`. Set to `0` to force all clients onto vanilla Q3e timing regardless of their local setting. Broadcast in SERVERINFO so clients read it from the gamestate on connect. |
+
+> **Full antiwarp documentation:** See [`SV_ANTIWARP.md`](SV_ANTIWARP.md) for mode details, decay timeline, interaction with sv_antilag, and configuration profiles.
 
 ### Antilag Cvars [CUSTOM] (sv_antilag.c)
 
 | Cvar | Default | Notes |
 |------|---------|-------|
-| `sv_antilagEnable` | 1 | Engine antilag on/off |
-| `sv_physicsScale` | 3 | Shadow recordings per engine tick |
+| `sv_antilag` | 0 | Engine antilag on/off (default off, set 1 to enable) |
 | `sv_antilagMaxMs` | 200 | Max rewind window (ms) |
 | `sv_antilagDebug` | 0 | Debug verbosity (0-2) |
 | `sv_antilagRateDebug` | 0 | Print per-client snap rate |
@@ -934,10 +1083,6 @@ Com_Frame(msec)
     └── [tick loop: while timeResidual >= frameMsec]
         ├── sv.time++
         │
-        ├── [sv_physicsScale times]:
-        │   SV_Antilag_RecordPositions()
-        │     └── for each client: record origin/absmin/absmax to shadow history
-        │
         ├── [game frame loop: while gameTimeResidual >= gameMsec]
         │   ├── SV_BotFrame(sv.gameTime)
         │   └── VM_Call(gvm, GAME_RUN_FRAME, sv.gameTime)
@@ -946,6 +1091,9 @@ Com_Frame(msec)
         │                   ├── SV_Antilag_RewindAll(shooter, fireTime)
         │                   ├── SV_Trace()  ← hit detection at rewound state
         │                   └── SV_Antilag_RestoreAll()
+        │
+        ├── SV_Antilag_RecordPositions()  ← AFTER game frame (shadow[T] == snapshot[T])
+        │     └── for each active human client (bots excluded — FIFO antilag handles bot targets): record origin/absmin/absmax to shadow history
         │
         ├── [if ring buffer active]:
         │   SV_SmoothRecordAll()
@@ -963,4 +1111,6 @@ Com_Frame(msec)
                   ├── SV_BuildClientSnapshot()  ← PVS culling
                   └── SV_WriteSnapshotToClient() ← delta encode + transmit
                 SV_Antilag_NoteSnapshot(clientNum)
+                #ifdef USE_SERVER_DEMO:
+                  SVD_WriteDemoFile(cl, msg)  ← server demo recording
 ```

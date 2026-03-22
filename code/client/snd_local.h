@@ -61,16 +61,17 @@ typedef struct sfx_s {
 	int				lastTimeUsed;
 	struct sfx_s	*next;
 #ifndef NO_DMAHD
-    qboolean		weaponsound;
+	qboolean		weaponsound;
 #endif
 } sfx_t;
 
 typedef struct {
-	int			channels;
-	int			samples;				// mono samples in buffer
+	unsigned int channels;
+	unsigned int samples;				// mono samples in buffer
 	int			fullsamples;			// samples with all channels in buffer (samples divided by channels)
 	int			submission_chunk;		// don't mix less than this #
-	int			samplebits;
+	int			samplebits;				// container bit width (e.g. 32 for 24-in-32 PCM)
+	int			validbits;				// valid bit depth (e.g. 24 for 24-in-32 PCM); 0 = same as samplebits
 	int			isfloat;
 	int			speed;
 	byte		*buffer;
@@ -99,12 +100,12 @@ typedef struct loopSound_s {
 #ifndef NO_DMAHD
 typedef struct
 {
-    int			vol; // Must be first member due to union (see channel_t)
-    int 		offset;
-    int 		bassvol;
-    int 		bassoffset;
-    int			reverbvol;
-    int			reverboffset;
+	int			vol;			// Must be first member due to union (see channel_t)
+	int			offset;
+	int			bassvol;
+	int			bassoffset;
+	int			reverbvol;
+	int			reverboffset;
 } ch_side_t;
 #endif
 
@@ -114,6 +115,20 @@ typedef struct
 	int			startSample;	// START_SAMPLE_IMMEDIATE = set immediately on next mix
 	int			entnum;			// to allow overriding a specific sound
 	int			entchannel;		// to allow overriding a specific sound
+#ifndef NO_DMAHD
+	union {
+		int		leftvol;		// 0-255 volume after spatialization
+		ch_side_t l;
+	};
+	union {
+		int		rightvol;		// 0-255 volume after spatialization
+		ch_side_t r;
+	};
+	vec3_t		sodrot;
+#else
+	int			leftvol;		// 0-255 volume after spatialization
+	int			rightvol;		// 0-255 volume after spatialization
+#endif
 	int			master_vol;		// 0-255 volume before spatialization
 	float		dopplerScale;
 	float		oldDopplerScale;
@@ -121,23 +136,6 @@ typedef struct
 	qboolean	fixed_origin;	// use origin instead of fetching entnum's origin
 	sfx_t		*thesfx;		// sfx structure
 	qboolean	doppler;
-
-#ifndef NO_DMAHD
-    union
-    {
-        int			leftvol;		// 0-255 volume after spatialization
-        ch_side_t	l;
-    };
-    union
-    {
-        int			rightvol;		// 0-255 volume after spatialization
-        ch_side_t	r;
-    };
-    vec3_t		sodrot;
-#else
-    int			leftvol;		// 0-255 volume after spatialization
-	int			rightvol;		// 0-255 volume after spatialization
-#endif
 } channel_t;
 
 

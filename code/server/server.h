@@ -66,15 +66,13 @@ typedef struct snapshotFrame_s {
 typedef struct {
 	serverState_t	state;
 	qboolean		restarting;			// if true, send configstring changes during SS_LOADING
+	int				pure;				// fixed at level spawn
+	int				maxclients;			// fixed at level spawn
 	int				serverId;			// changes each server start
-	int				restartedServerId;	// serverId before a map_restart
+	int				restartedServerId;	// changes each map restart
 	int				checksumFeed;		// the feed key that we use to compute the pure checksum strings
-	// https://zerowing.idsoftware.com/bugzilla/show_bug.cgi?id=475
-	// the serverId associated with the current checksumFeed (always <= serverId)
-	int				checksumFeedServerId;
 	int				snapshotCounter;	// incremented for each snapshot built
 	int				timeResidual;		// <= 1000 / sv_frame->value
-	int				nextFrameTime;		// when time > nextFrameTime, process world
 	char			*configstrings[MAX_CONFIGSTRINGS];
 	svEntity_t		svEntities[MAX_GENTITIES];
 
@@ -102,50 +100,46 @@ typedef struct {
 	byte			areabits[MAX_MAP_AREA_BYTES];		// portalarea visibility bits
 	playerState_t	ps;
 	int				num_entities;
-#ifdef USE_MV
-	qboolean		multiview;
-	int				version;
-	int				mergeMask;
-	int				first_psf;				// first playerState index
-	int				num_psf;				// number of playerStates to send
-	byte			psMask[MAX_CLIENTS/8];	// playerState mask
+#if 0
+	int				first_entity;		// into the circular sv_packet_entities[]
+										// the entities MUST be in increasing state number
+										// order, otherwise the delta compression will fail
 #endif
 	int				messageSent;		// time the message was transmitted
 	int				messageAcked;		// time the message was acked
 	int				messageSize;		// used to rate drop packets
 
 	int				frameNum;			// from snapshot storage to compare with last valid
-#ifdef USE_MV
-	entityState_t	*ents[ MAX_GENTITIES ];
-#else
 	entityState_t	*ents[ MAX_SNAPSHOT_ENTITIES ];
+
+#ifdef USE_MV
+	qboolean		multiview;
+	int				version;
+	int				mergeMask;
+	int				first_psf;
+	int				num_psf;
+	byte			psMask[MAX_CLIENTS/8];
 #endif
 } clientSnapshot_t;
-
-#ifdef USE_MV
-
-#define MAX_MV_FILES 4096 // for directory caching
-
-typedef byte entMask_t[ MAX_GENTITIES / 8 ];
-
-typedef struct psFrame_s {
-    int				clientSlot;
-    int				areabytes;
-    byte			areabits[ MAX_MAP_AREA_BYTES ]; // portalarea visibility bits
-    playerState_t	ps;
-    entMask_t		entMask;
-} psFrame_t;
-
-#endif // USE_MV
 
 typedef enum {
 	CS_FREE = 0,	// can be reused for a new connection
 	CS_ZOMBIE,		// client has been disconnected, but don't reuse
 					// connection for a couple seconds
-	CS_CONNECTED,	// has been assigned to a client_t, but no gamestate yet
+	CS_CONNECTED,	// has been assigned to a client_t, but no gamestate yet or downloading
 	CS_PRIMED,		// gamestate has been sent, but client hasn't sent a usercmd
 	CS_ACTIVE		// client is fully in game
 } clientState_t;
+
+#ifdef USE_MV
+typedef struct {
+	byte			areabits[MAX_MAP_AREA_BYTES];
+	int				areabytes;
+	playerState_t	ps;
+	byte			entMask[ MAX_GENTITIES / 8 ];
+	int				clientSlot;
+} psFrame_t;
+#endif
 
 typedef struct netchan_buffer_s {
 	msg_t           msg;
@@ -176,6 +170,12 @@ struct leakyBucket_s {
 	leakyBucket_t *prev, *next;
 };
 
+typedef enum {
+	GSA_INIT = 0,	// gamestate never sent with current sv.serverId
+	GSA_SENT_ONCE,	// gamestate sent once, client can reply with any (messageAcknowledge - gamestateMessageNum) >= 0 and correct serverId
+	GSA_SENT_MANY,	// gamestate sent many times, client must reply with exact gamestateMessageNum == gamestateMessageNum and correct serverId
+	GSA_ACKED		// gamestate acknowledged, no retansmissions needed
+} gameStateAck_t;
 
 typedef struct client_s {
 	clientState_t	state;
@@ -184,18 +184,20 @@ typedef struct client_s {
 	char			reliableCommands[MAX_RELIABLE_COMMANDS][MAX_STRING_CHARS];
 	int				reliableSequence;		// last added reliable message, not necessarily sent or acknowledged yet
 	int				reliableAcknowledge;	// last acknowledged reliable message
-    int             reliableSent;           // last sent reliable message, not necesarily acknowledged yet
 	int				messageAcknowledge;
 
 	int				gamestateMessageNum;	// netchan->outgoingSequence of gamestate
 	int				challenge;
 
 	usercmd_t		lastUsercmd;
-    int             lastMessageNum;         // for delta compression
 	int				lastClientCommand;	// reliable client message sequence
 	char			lastClientCommandString[MAX_STRING_CHARS];
 	sharedEntity_t	*gentity;			// SV_GentityNum(clientnum)
 	char			name[MAX_NAME_LENGTH];			// extracted from userinfo, high bits masked
+
+	gameStateAck_t	gamestateAck;
+	qboolean		downloading;		// set at "download", reset at gamestate retransmission
+	// int				serverId;		// last acknowledged serverId
 
 	// downloading
 	char			downloadName[MAX_QPATH]; // if not empty string, we are downloading
@@ -235,6 +237,8 @@ typedef struct client_s {
 	qboolean		csUpdated[MAX_CONFIGSTRINGS];
 	qboolean		compat;
 
+	int				awLastThinkTime;	// sv.gameTime of last real GAME_CLIENT_THINK (engine antiwarp)
+
 	// flood protection
 	rateLimit_t		cmd_rate;
 	rateLimit_t		info_rate;
@@ -245,34 +249,12 @@ typedef struct client_s {
 
 	qboolean		justConnected;
 
-	int				awLastThinkTime;	// sv.gameTime of last real GAME_CLIENT_THINK (engine antiwarp)
-
 	char			tld[3]; // "XX\0"
 	const char		*country;
 
 #ifdef USE_AUTH
-    char auth[MAX_NAME_LENGTH];
+	char			auth[MAX_NAME_LENGTH];
 #endif
-
-#ifdef USE_MV
-    struct {
-        int				protocol;
-
-        int				scoreQueryTime;
-        int				lastRecvTime; // any received command
-        int				lastSentTime; // any sent command
-#ifdef USE_MV_ZCMD
-        //  command compression
-		struct			{
-			int			deltaSeq;
-			lzctx_t		ctx;
-			lzstream_t	stream[ MAX_RELIABLE_COMMANDS ];
-		} z;
-#endif
-        qboolean		recorder;
-
-    } multiview;
-#endif // USE_MV
 
 #ifdef USE_SERVER_DEMO
 	qboolean	demo_recording;	// are we currently recording this client?
@@ -280,6 +262,23 @@ typedef struct client_s {
 	qboolean	demo_waiting;	// are we still waiting for the first non-delta frame?
 	int		demo_backoff;	// how many packets (-1 actually) between non-delta frames?
 	int		demo_deltas;	// how many delta frames did we let through so far?
+#endif
+
+#ifdef USE_MV
+	struct {
+		int				protocol;
+		int				scoreQueryTime;
+		int				lastRecvTime;
+		int				lastSentTime;
+#ifdef USE_MV_ZCMD
+		struct {
+			int			deltaSeq;
+			lzctx_t		ctx;
+			lzstream_t	stream[ MAX_RELIABLE_COMMANDS ];
+		} z;
+#endif
+		qboolean		recorder;
+	} multiview;
 #endif
 
 } client_t;
@@ -312,15 +311,13 @@ typedef struct {
 	int			lastValidFrame;			// updated with each snapshot built
 	snapshotFrame_t	snapFrames[ NUM_SNAPSHOT_FRAMES ];
 	snapshotFrame_t	*currFrame; // current frame that clients can refer
-    netadr_t 		redirectAddress;
 
 #ifdef USE_MV
-	int			numSnapshotPSF;				// sv_democlients->integer*PACKET_BACKUP*MAX_CLIENTS
-	int			nextSnapshotPSF;			// next snapshotPS to use
-	int			modSnapshotPSF;				// clamp value
-	psFrame_t	*snapshotPSF;				// [numSnapshotPS]
-	qboolean	emptyFrame;					// true if no game logic run during SV_Frame()
-#endif // USE_MV
+	int			numSnapshotPSF;
+	int			nextSnapshotPSF;
+	int			modSnapshotPSF;
+	psFrame_t	*snapshotPSF;
+#endif
 
 } serverStatic_t;
 
@@ -348,14 +345,14 @@ extern	cvar_t	*sv_gameHz;
 extern	cvar_t	*sv_snapshotFps;
 extern	cvar_t	*sv_busyWait;
 extern	cvar_t	*sv_pmoveMsec;
-extern	cvar_t	*sv_extrapolate;
 extern	cvar_t	*sv_smoothClients;
-extern	cvar_t	*sv_bufferMs;
-extern	cvar_t	*sv_velSmooth;
 extern	cvar_t	*sv_antiwarp;
 extern	cvar_t	*sv_antiwarpTol;
 extern	cvar_t	*sv_antiwarpExtra;
 extern	cvar_t	*sv_antiwarpDecay;
+extern	cvar_t	*sv_bufferMs;
+extern	cvar_t	*sv_velSmooth;
+extern	cvar_t	*sv_extrapolate;
 extern	cvar_t	*sv_timeout;
 extern	cvar_t	*sv_zombietime;
 extern	cvar_t	*sv_rconPassword;
@@ -364,25 +361,6 @@ extern	cvar_t	*sv_allowDownload;
 extern	cvar_t	*sv_maxclients;
 extern	cvar_t	*sv_maxclientsPerIP;
 extern	cvar_t	*sv_clientTLD;
-
-#ifdef USE_MV
-extern	fileHandle_t	sv_demoFile;
-extern	char	sv_demoFileName[ MAX_OSPATH ];
-extern	char	sv_demoFileNameLast[ MAX_OSPATH ];
-
-extern	int		sv_demoClientID;
-extern	int		sv_lastAck;
-extern	int		sv_lastClientSeq;
-
-extern	cvar_t	*sv_mvClients;
-extern	cvar_t	*sv_mvPassword;
-extern	cvar_t	*sv_demoFlags;
-extern	cvar_t	*sv_autoRecord;
-
-extern	cvar_t	*sv_mvFileCount;
-extern	cvar_t	*sv_mvFolderSize;
-
-#endif // USE_MV
 
 extern	cvar_t	*sv_privateClients;
 extern	cvar_t	*sv_hostname;
@@ -396,32 +374,35 @@ extern	cvar_t	*sv_referencedPakNames;
 extern	cvar_t	*sv_serverid;
 extern	cvar_t	*sv_minRate;
 extern	cvar_t	*sv_maxRate;
-extern	cvar_t	*sv_minPing;
-extern	cvar_t	*sv_maxPing;
 extern	cvar_t	*sv_dlRate;
 extern	cvar_t	*sv_gametype;
 extern	cvar_t	*sv_pure;
 extern	cvar_t	*sv_floodProtect;
 extern	cvar_t	*sv_lanForceRate;
-extern	cvar_t	*sv_strictAuth;
+extern	cvar_t	*sv_allowClientAdaptiveTiming;
 
 extern	cvar_t *sv_levelTimeReset;
 extern	cvar_t *sv_filter;
 
 #ifdef USE_AUTH
 extern	cvar_t	*sv_authServerIP;
-extern  cvar_t  *sv_auth_engine;
+extern	cvar_t	*sv_auth_engine;
+#endif
+
+#ifdef USE_SERVER_DEMO
+extern	cvar_t	*sv_demonotice;
+extern	cvar_t	*sv_demofolder;
+#endif
+
+#ifdef USE_MV
+extern	cvar_t	*sv_mvClients;
+extern	cvar_t	*sv_mvPassword;
 #endif
 
 #ifdef USE_BANS
 extern	cvar_t	*sv_banFile;
 extern	serverBan_t serverBans[SERVER_MAXBANS];
 extern	int serverBansCount;
-#endif
-
-#ifdef USE_SERVER_DEMO
-extern	cvar_t	*sv_demonotice;
-extern  cvar_t  *sv_demofolder;
 #endif
 
 //===========================================================
@@ -435,7 +416,6 @@ void SVC_RateRestoreBurstAddress( const netadr_t *from, int burst, int period );
 void SVC_RateRestoreToxicAddress( const netadr_t *from, int burst, int period );
 void SVC_RateDropAddress( const netadr_t *from, int burst, int period );
 
-void SV_FinalMessage( const char *message );
 void QDECL SV_SendServerCommand( client_t *cl, const char *fmt, ...) __attribute__ ((format (printf, 2, 3)));
 
 void SV_AddOperatorCommands( void );
@@ -455,7 +435,6 @@ void SV_UpdateConfigstrings( client_t *client );
 void SV_SetUserinfo( int index, const char *val );
 void SV_GetUserinfo( int index, char *buffer, int bufferSize );
 
-void SV_ChangeMaxClients( void );
 void SV_SpawnServer( const char *mapname, qboolean killBots );
 
 
@@ -467,16 +446,21 @@ void SV_GetChallenge( const netadr_t *from );
 void SV_InitChallenger( void );
 
 void SV_DirectConnect( const netadr_t *from );
+void SV_PrintClientStateChange( const client_t *cl, clientState_t newState );
 
 void SV_ExecuteClientMessage( client_t *cl, msg_t *msg );
 void SV_UserinfoChanged( client_t *cl, qboolean updateUserinfo, qboolean runFilter );
 
-void SV_ClientEnterWorld( client_t *client, usercmd_t *cmd );
+void SV_ClientEnterWorld( client_t *client );
 void SV_FreeClient( client_t *client );
 void SV_DropClient( client_t *drop, const char *reason );
 
 #ifdef USE_AUTH
 void SV_Auth_DropClient( client_t *drop, const char *reason, const char *message );
+#endif
+
+#ifdef USE_SERVER_DEMO
+void SVD_WriteDemoFile( const client_t *client, const msg_t *msg );
 #endif
 
 qboolean SV_ExecuteClientCommand( client_t *cl, const char *s );
@@ -488,28 +472,11 @@ int SV_SendQueuedMessages( void );
 void SV_FreeIP4DB( void );
 void SV_PrintLocations_f( client_t *client );
 
-#ifdef USE_MV
-void SV_TrackDisconnect( int clientNum );
-void SV_ForwardServerCommands( client_t *recorder /*, const client_t *client */ );
-void SV_MultiViewStopRecord_f( void );
-int SV_FindActiveClient( qboolean checkCommands, int skipClientNum, int minActive );
-void SV_SetTargetClient( int clientNum );
-#endif // USE_MV
-
 //
 // sv_ccmds.c
 //
 void SV_Heartbeat_f( void );
 client_t *SV_GetPlayerByHandle( void );
-
-#ifdef USE_SERVER_DEMO
-void SVD_WriteDemoFile(const client_t*, const msg_t*);
-#endif
-
-#ifdef USE_MV
-void SV_LoadRecordCache( void );
-void SV_SaveRecordCache( void );
-#endif
 
 //
 // sv_snapshot.c
@@ -523,9 +490,8 @@ void SV_SendClientSnapshot( client_t *client );
 
 void SV_InitSnapshotStorage( void );
 void SV_IssueNewSnapshot( void );
-
-// sv_snapshot.c — per-client position ring buffer
 void SV_SmoothInit( void );
+void SV_SmoothClearClient( int clientNum );
 void SV_SmoothRecordAll( void );
 
 int SV_RemainingGameState( void );

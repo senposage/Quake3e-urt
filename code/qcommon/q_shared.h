@@ -48,15 +48,7 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 #define GAMENAME_FOR_MASTER		"Quake3Arena"
 #define HEARTBEAT_FOR_MASTER	"QuakeArena-1"
 
-#define MV_PROTOCOL_VERSION	1 // multiview protocol version
-#define USE_MV				  // multiview enabled
-#define USE_MV_ZCMD		      // command compression
-
-#define GET_ABIT( byteArray, bitIndex ) ((byteArray)[ (bitIndex) / 8 ] & ( 1 << ( (bitIndex) & 7 ) ))
-#define SET_ABIT( byteArray, bitIndex ) (byteArray)[ (bitIndex) / 8 ] |= ( 1 << ( (bitIndex) & 7 ) )
-
 #define DEMOEXT	"dm_"			// standard demo extension
-#define URTDEMOEXT "urtdemo"
 
 #ifdef _MSC_VER
 
@@ -112,6 +104,24 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 #define Q_EXPORT
 #endif
 
+#if defined(__GNUC__) || defined(__clang__)
+#define NORETURN __attribute__((noreturn))
+#define NORETURN_PTR __attribute__((noreturn))
+#elif defined(_MSC_VER)
+#define NORETURN __declspec(noreturn)
+// __declspec doesn't work on function pointers
+#define NORETURN_PTR /* nothing */
+#else
+#define NORETURN /* nothing */
+#define NORETURN_PTR /* nothing */
+#endif
+
+#if defined(__GNUC__) || defined(__clang__)
+#define FORMAT_PRINTF(x, y) __attribute__((format (printf, x, y)))
+#else
+#define FORMAT_PRINTF(x, y) /* nothing */
+#endif
+
 /**********************************************************************
   VM Considerations
 
@@ -151,6 +161,8 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 short ShortSwap( short l );
 int LongSwap( int l );
 float FloatSwap( const float *f );
+void CopyShortSwap( void *dest, void *src );
+void CopyLongSwap( void *dest, void *src );
 
 #include "q_platform.h"
 
@@ -159,12 +171,11 @@ float FloatSwap( const float *f );
 #ifdef Q3_VM
 	typedef int intptr_t;
 #else
-	#ifdef _MSC_VER
-		#include <io.h>
+	#if defined (_MSC_VER) && !defined(__clang__)
 		typedef __int64 int64_t;
 		typedef __int32 int32_t;
 		typedef __int16 int16_t;
-		typedef __int8 int8_t;
+		typedef signed __int8 int8_t;
 		typedef unsigned __int64 uint64_t;
 		typedef unsigned __int32 uint32_t;
 		typedef unsigned __int16 uint16_t;
@@ -182,10 +193,22 @@ float FloatSwap( const float *f );
 	#endif
 #endif
 
-#if defined (_WIN32) && !defined(_MSC_VER)
+#if defined (_WIN32)
+#if !defined(_MSC_VER)
+// use GCC/Clang functions
 #define Q_setjmp __builtin_setjmp
 #define Q_longjmp __builtin_longjmp
-#else
+#elif idx64 && (_MSC_VER >= 1910)
+// use custom setjmp()/longjmp() implementations
+#define Q_setjmp Q_setjmp_c
+#define Q_longjmp Q_longjmp_c
+int Q_setjmp_c(void *);
+int Q_longjmp_c(void *, int);
+#else // !idx64 || MSVC<2017
+#define Q_setjmp setjmp
+#define Q_longjmp longjmp
+#endif
+#else // !_WIN32
 #define Q_setjmp setjmp
 #define Q_longjmp longjmp
 #endif
@@ -390,7 +413,7 @@ typedef	int	fixed16_t;
 #endif
 
 #ifndef M_LN2
-#define M_LN2      0.693147180559945309417
+#define M_LN2      0.693147180559945309417f
 #endif
 
 #ifdef __linux__
@@ -459,6 +482,10 @@ extern	vec4_t		colorDkGrey;
 #define S_COLOR_MAGENTA	"^6"
 #define S_COLOR_WHITE	"^7"
 
+#define S_COLOR_DEVEL	S_COLOR_CYAN
+#define S_COLOR_WARNING	S_COLOR_YELLOW
+#define S_COLOR_ERROR	S_COLOR_RED
+
 extern const vec4_t	g_color_table[ 64 ];
 extern int ColorIndexFromChar( char ccode );
 
@@ -470,7 +497,7 @@ extern int ColorIndexFromChar( char ccode );
 
 struct cplane_s;
 
-extern	vec3_t	vec3_origin;
+extern	const vec3_t	vec3_origin;
 extern	vec3_t	axisDefault[3];
 
 #define	nanmask (255<<23)
@@ -636,7 +663,7 @@ void CrossProduct( const vec3_t v1, const vec3_t v2, vec3_t cross );
 vec_t VectorNormalize (vec3_t v);		// returns vector length
 vec_t VectorNormalize2( const vec3_t v, vec3_t out );
 void Vector4Scale( const vec4_t in, vec_t scale, vec4_t out );
-void VectorRotate( vec3_t in, vec3_t matrix[3], vec3_t out );
+void VectorRotate( const vec3_t in, const vec3_t matrix[3], vec3_t out );
 int Q_log2(int val);
 
 float Q_acos(float c);
@@ -710,12 +737,12 @@ unsigned long Com_GenerateHashValue( const char *fname, const unsigned int size 
 
 void	COM_BeginParseSession( const char *name );
 int		COM_GetCurrentParseLine( void );
-char	*COM_Parse( const char **data_p );
-char	*COM_ParseExt( const char **data_p, qboolean allowLineBreak );
+const char	*COM_Parse( const char **data_p );
+const char	*COM_ParseExt( const char **data_p, qboolean allowLineBreak );
 int		COM_Compress( char *data_p );
-void	COM_ParseError( char *format, ... ) __attribute__ ((format (printf, 1, 2)));
-void	COM_ParseWarning( char *format, ... ) __attribute__ ((format (printf, 1, 2)));
-//int		COM_ParseInfos( char *buf, int max, char infos[][MAX_INFO_STRING] );
+void	COM_ParseError( const char *format, ... ) __attribute__ ((format (printf, 1, 2)));
+void	COM_ParseWarning( const char *format, ... ) __attribute__ ((format (printf, 1, 2)));
+//int		COM_ParseInfos( const char *buf, int max, char infos[][MAX_INFO_STRING] );
 
 char	*COM_ParseComplex( const char **data_p, qboolean allowLineBreak );
 
@@ -762,8 +789,6 @@ typedef struct pc_token_s
 
 // data is an in/out parm, returns a parsed out token
 
-void COM_MatchToken( const char**buf_p, const char *match );
-
 qboolean SkipBracedSection( const char **program, int depth );
 void SkipRestOfLine( const char **data );
 
@@ -773,12 +798,12 @@ void Parse3DMatrix( const char **buf_p, int z, int y, int x, float *m);
 
 int QDECL Com_sprintf( char *dest, int size, const char *fmt, ... ) __attribute__ ((format (printf, 3, 4)));
 
-char *Com_SkipTokens( char *s, int numTokens, char *sep );
-char *Com_SkipCharset( char *s, char *sep );
+const char *Com_SkipTokens( const char *s, int numTokens, const char *sep );
+const char *Com_SkipCharset( const char *s, const char *sep );
 
 void Com_RandomBytes( byte *string, int len );
 
-void Com_SortFileList( char **list, int nfiles, int fastSort );
+void Com_SortList( char** list, int n );
 
 // mode parm for FS_FOpenFile
 typedef enum {
@@ -823,6 +848,7 @@ void	Q_strcat( char *dest, int size, const char *src );
 int     Q_replace( const char *str1, const char *str2, char *src, int max_len );
 
 char	*Q_stradd( char *dst, const char *src );
+char	*Q_strncpy( char *dest, char *src, int destsize );
 
 // strlen that discounts Quake color sequences
 int Q_PrintStrlen( const char *string );
@@ -847,10 +873,6 @@ typedef struct
 	byte	b7;
 } qint64;
 
-typedef intptr_t (*syscall_t)( intptr_t *parms );
-typedef intptr_t (QDECL *dllSyscall_t)( intptr_t callNum, ... );
-typedef void (QDECL *dllEntry_t)( dllSyscall_t syscallptr );
-
 //=============================================
 /*
 short	BigShort(short l);
@@ -874,7 +896,7 @@ void Com_TruncateLongString( char *buffer, const char *s );
 //
 // key / value info strings
 //
-char *Info_ValueForKey( const char *s, const char *key );
+const char *Info_ValueForKey( const char *s, const char *key );
 void Info_Tokenize( const char *s );
 const char *Info_ValueForKeyToken( const char *key );
 #define Info_SetValueForKey( buf, key, value ) Info_SetValueForKey_s( (buf), MAX_INFO_STRING, (key), (value) )
@@ -885,8 +907,8 @@ const char *Info_NextPair( const char *s, char *key, char *value );
 int Info_RemoveKey( char *s, const char *key );
 
 // this is only here so the functions in q_shared.c and bg_*.c can link
-void	QDECL Com_Error( errorParm_t level, const char *fmt, ... ) __attribute__ ((noreturn, format (printf, 2, 3)));
-void	QDECL Com_Printf( const char *msg, ... ) __attribute__ ((format (printf, 1, 2)));
+void NORETURN FORMAT_PRINTF(2, 3) QDECL Com_Error( errorParm_t level, const char *fmt, ... );
+void FORMAT_PRINTF(1, 2) QDECL Com_Printf( const char *msg, ... );
 
 
 /*
@@ -1037,7 +1059,7 @@ typedef struct {
 	cplane_t	plane;		// surface normal at impact, transformed to world space
 	int			surfaceFlags;	// surface hit
 	int			contents;	// contents on other side of surface hit
-	int			entityNum;	// entity the contacted sirface is a part of
+	int			entityNum;	// entity the contacted surface is a part of
 } trace_t;
 
 // trace->entityNum can also be 0 to (MAX_GENTITIES-1)
@@ -1070,7 +1092,7 @@ typedef struct {
 
 // sound channels
 // channel 0 never willingly overrides
-// other channels will allways override a playing sound on that channel
+// other channels will always override a playing sound on that channel
 typedef enum {
 	CHAN_AUTO,
 	CHAN_LOCAL,		// menu sounds, etc
@@ -1097,16 +1119,27 @@ typedef enum {
 #define	SNAPFLAG_RATE_DELAYED	1
 #define	SNAPFLAG_NOT_ACTIVE		2	// snapshot used during connection and for zombies
 #define SNAPFLAG_SERVERCOUNT	4	// toggled every map_restart so transitions can be detected
-
 #ifdef USE_MV
 #define SNAPFLAG_MULTIVIEW		8	// this snapshot built from multiview stream
+#endif
+
+#ifdef USE_FTWGL
+#define USE_MV
+#define USE_MV_ZCMD
+#define MV_PROTOCOL_VERSION		1
+#endif
+
+#define GET_ABIT( byteArray, bitIndex ) ((byteArray)[ (bitIndex) / 8 ] & ( 1 << ( (bitIndex) & 7 ) ))
+#define SET_ABIT( byteArray, bitIndex ) (byteArray)[ (bitIndex) / 8 ] |= ( 1 << ( (bitIndex) & 7 ) )
+#ifndef PAD
+#define PAD(base, alignment)	(((base)+(alignment)-1) & ~((alignment)-1))
 #endif
 
 //
 // per-level limits
 //
 #define	MAX_CLIENTS			64		// absolute limit
-#define MAX_LOCATIONS		360     // 64 too low, some jump maps > 200
+#define MAX_LOCATIONS		64
 
 #define	GENTITYNUM_BITS		10		// don't need to send any more
 #define	MAX_GENTITIES		(1<<GENTITYNUM_BITS)

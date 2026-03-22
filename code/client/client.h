@@ -23,17 +23,17 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 
 #include "../qcommon/q_shared.h"
 #include "../qcommon/qcommon.h"
-#include "../qcommon/vm_local.h"
 #include "../renderercommon/tr_public.h"
+#include "../qcommon/vm_local.h"
 #include "../ui/ui_public.h"
-#include "keys.h"
-#include "snd_public.h"
 #include "../cgame/cg_public.h"
 #include "../game/bg_public.h"
+#include "snd_public.h"
+#include "keys.h"
 
 #ifdef USE_CURL
 #include "cl_curl.h"
-#endif /* USE_CURL */
+#endif
 
 // file full of random crap that gets used to create cl_guid
 #define QKEY_FILE "qkey"
@@ -64,18 +64,17 @@ typedef struct {
 											// making the snapshot current
 #ifdef USE_MV
 	struct {
-        int				areabytes;
-        byte			areamask[MAX_MAP_AREA_BYTES]; // portalarea visibility bits
-        byte			entMask[MAX_GENTITIES/8];
-        playerState_t	ps;
-        qboolean		valid;
-    } clps[ MAX_CLIENTS ];
-	qboolean	multiview;
-	int			version;
-	int			mergeMask;
-	byte		clientMask[MAX_CLIENTS/8];
-#endif // USE_MV
-
+		int				areabytes;
+		byte			areamask[MAX_MAP_AREA_BYTES];
+		byte			entMask[MAX_GENTITIES/8];
+		playerState_t	ps;
+		qboolean		valid;
+	} clps[ MAX_CLIENTS ];
+	qboolean		multiview;
+	int				version;
+	int				mergeMask;
+	byte			clientMask[MAX_CLIENTS/8];
+#endif
 } clSnapshot_t;
 
 
@@ -97,8 +96,7 @@ typedef struct {
 
 // the parseEntities array must be large enough to hold PACKET_BACKUP frames of
 // entities, so that when a delta compressed message arives from the server
-// it can be un-deltad from the original
-
+// it can be un-deltad from the original 
 #ifdef USE_MV
 #define	MAX_PARSE_ENTITIES	( PACKET_BACKUP * MAX_GENTITIES )
 #else
@@ -122,8 +120,10 @@ typedef struct {
 									// cleared when CL_AdjustTimeDelta looks at it
 	qboolean	newSnapshots;		// set on parse of any valid packet
 
-	int			snapshotMsec;		// measured interval between snapshots (exponential moving average)
-	float		frameInterpolation;	// estimated QVM fI: (serverTime - prevSnap) / (snap - prevSnap), clamped to [0,1] by serverTime cap
+	int			snapshotMsec;		// EMA of snapshot intervals, clamped [8,100]
+	float		frameInterpolation;	// current interpolation fraction for cgame
+	qboolean	vanillaServer;		// true if server lacks sv_snapshotFps (adaptive timing fully disabled)
+	qboolean	serverForbidsAdaptiveTiming;	// true if vanilla server or sv_allowClientAdaptiveTiming 0
 
 	gameState_t	gameState;			// configstrings
 	char		mapname[MAX_QPATH];	// extracted from CS_SERVERINFO
@@ -187,7 +187,7 @@ typedef struct {
 
 	int			clientNum;
 #ifdef USE_MV
-	int			clientView;
+	int			clientView;					// currently viewed client in multiview
 	int			zexpectDeltaSeq;			// for compressed server commands
 #endif
 	int			lastPacketSentTime;			// for retransmits during connection
@@ -240,11 +240,12 @@ typedef struct {
 	char		downloadURL[MAX_OSPATH];
 	CURL		*downloadCURL;
 	CURLM		*downloadCURLM;
-	char		mapname[MAX_CVAR_VALUE_STRING];
 #endif /* USE_CURL */
 
 	// demo information
-	int         demoprotocol;
+#ifdef USE_URT_DEMO
+	int			demoprotocol;
+#endif
 	char		demoName[MAX_OSPATH];
 	char		recordName[MAX_OSPATH]; // without extension
 	qboolean	explicitRecordName;
@@ -292,12 +293,6 @@ no client connection is active at all
 ==================================================================
 */
 
-typedef enum {
-	ITEM_TEXTSTYLE_NORMAL,
-	ITEM_TEXTSTYLE_SHADOWED,
-	ITEM_TEXTSTYLE_SHADOWEDLESS
-} textStyle_t;
-
 typedef struct {
 	netadr_t	adr;
 	int			start;
@@ -313,23 +308,24 @@ typedef struct {
 	int			netType;
 	int			gameType;
 	int		  	clients;
-	int         bots;
+	int			bots;
 	int		  	maxClients;
 	int			minPing;
 	int			maxPing;
 	int			ping;
 	qboolean	visible;
 	int			punkbuster;
-    int			auth; //@Barbatos: auth system
-    int			password; //@Barbatos: passworded server?
-    char 		modversion[MAX_NAME_LENGTH]; //@Barbatos - g_modversion
+#ifdef USE_AUTH
+	int			auth;
+	int			password;
+	char		modversion[MAX_NAME_LENGTH];
+#endif
 	int			g_humanplayers;
 	int			g_needpass;
 } serverInfo_t;
 
 typedef struct {
 	connstate_t	state;				// connection status
-	int			keyCatchers;		// bit flags
 	qboolean	gameSwitch;
 
 	qboolean	cddialog;			// bring up the cd needed dialog next frame
@@ -376,9 +372,6 @@ typedef struct {
 	qhandle_t	whiteShader;
 	qhandle_t	consoleShader;
 
-	fontInfo_t  font;
-	qboolean    fontFont;
-
 	int			lastVidRestart;
 	int			soundMuted;
 
@@ -386,6 +379,8 @@ typedef struct {
 
 	int			captureWidth;
 	int			captureHeight;
+
+	float		con_factor;
 
 	float		scale;
 	float		biasX;
@@ -432,8 +427,6 @@ extern	cvar_t	*cl_shownet;
 extern	cvar_t	*cl_autoNudge;
 extern	cvar_t	*cl_timeNudge;
 extern	cvar_t	*cl_showTimeDelta;
-extern	cvar_t	*cl_netgraph;
-extern	cvar_t	*cl_netlog;
 extern	cvar_t	*cl_adaptiveTiming;
 
 extern	cvar_t	*com_timedemo;
@@ -449,16 +442,19 @@ extern	cvar_t	*cl_mapAutoDownload;
 extern	cvar_t	*cl_dlDirectory;
 #endif
 extern	cvar_t	*cl_conXOffset;
+extern	cvar_t	*cl_conColor;
 extern	cvar_t	*cl_inGameVideo;
 
 extern	cvar_t	*cl_lanForcePackets;
 extern	cvar_t	*cl_autoRecordDemo;
+extern	cvar_t	*cl_drawRecording;
 
 #ifdef USE_AUTH
-extern  cvar_t	*cl_auth_engine;
-extern  cvar_t  *cl_auth;
-extern  cvar_t  *authc;
-extern  cvar_t  *authl; // Auth Login
+extern	cvar_t	*cl_auth_engine;
+extern	cvar_t	*cl_auth;
+extern	cvar_t	*authc;
+extern	cvar_t	*authl;
+extern	cvar_t	*cl_authSecure;
 #endif
 
 extern	cvar_t	*com_maxfps;
@@ -520,7 +516,7 @@ qboolean CL_GetModeInfo( int *width, int *height, float *windowAspect, int mode,
 void CL_InitInput( void );
 void CL_ClearInput( void );
 void CL_SendCmd( void );
-void CL_WritePacket( void );
+void CL_WritePacket( int repeat );
 
 //
 // cl_keys.c
@@ -549,51 +545,17 @@ qboolean CL_ValidPakSignature( const byte *data, int len );
 // console
 //
 
-#define  NUM_CON_TIMES  4
+extern cvar_t *con_scale;
 
-#define  CON_TEXTSIZE   65536
-
-typedef struct {
-    qboolean	initialized;
-
-    short	text[CON_TEXTSIZE];
-    int		current;		// line where next message will be printed
-    int		x;				// offset in current line for next print
-    int		display;		// bottom of console displays this line
-
-    int 	linewidth;		// characters across screen
-    int		totallines;		// total lines in console scrollback
-
-    float	xadjust;		// for wide aspect screens
-
-    float	displayFrac;	// aproaches finalFrac at scr_conspeed
-    float	finalFrac;		// 0.0 to 1.0 lines of console to display
-
-    int		vislines;		// in scanlines
-
-    int		times[NUM_CON_TIMES];	// cls.realtime time the line was generated
-    // for transparent notify lines
-    vec4_t	color;
-
-    int		viswidth;
-    int		vispage;
-
-    qboolean newline;
-
-} console_t;
-
-void Con_CheckResize( console_t* console );
+void Con_CheckResize( void );
 void Con_Init( void );
 void Con_Shutdown( void );
 void Con_ToggleConsole_f( void );
-void Con_DrawNotify( void );
 void Con_ClearNotify( void );
 void Con_RunConsole( void );
 void Con_DrawConsole( void );
 void Con_PageUp( int lines );
 void Con_PageDown( int lines );
-void Con_NextTab( void );
-void Con_PrevTab( void );
 void Con_Top( void );
 void Con_Bottom( void );
 void Con_Close( void );
@@ -624,7 +586,7 @@ void	SCR_DrawSmallStringExt( int x, int y, const char *string, const float *setC
 void	SCR_DrawSmallChar( int x, int y, int ch );
 void	SCR_DrawSmallString( int x, int y, const char *s, int len );
 
-// Net monitor
+// net monitor hooks
 void	SCR_NetMonitorAddIncoming( int bytes, int drops );
 void	SCR_NetMonitorAddOutgoing( int bytes );
 void	SCR_NetMonitorAddFrametime( int ft );
@@ -637,11 +599,30 @@ void	SCR_NetMonitorAddPing( int ping );
 void	SCR_NetMonitorAddFastAdjust( void );
 void	SCR_NetMonitorAddResetAdjust( void );
 void	SCR_NetMonitorAddSlowAdjust( int delta );
-void	SCR_LogConsoleInput( const char *cmd );
 void	SCR_LogTimingEvent( const char *tag, int serverTimeDelta, int deltaDelta );
 void	SCR_LogSnapLate( int measured, int expected );
 void	SCR_LogPingJitter( int ping, int prevPing );
+void	SCR_LogConnectInfo( const char *svFps, const char *snapFps,
+                             const char *allowAt, int snapshotMsec,
+                             qboolean vanilla, qboolean forbids );
+void	SCR_LogServerCmd( int seq, int storedSeq, const char *text );
+void	SCR_LogSnapState( int snapTime, int ping, int cmdTime, int msgSeq,
+                          int cmdSeq, int relSeq, int relAck );
+void	SCR_LogTimeout( int count, int elapsed, int limit );
+void	SCR_LogNote( const char *tag, const char *msg );
+void	SCR_LogPacketDrop( int dropped, int seq );
+void	SCR_LogCapRelease( int drift );
+void	SCR_LogOOBPacket( const char *cmd );
+void	SCR_LogOOBDisconnect( qboolean honored );
+void	SCR_LogUserinfoSend( const char *info );
+void	SCR_OOBIgnoredIncrement( void );
+void	SCR_LogDisconnect( const char *reason );
 void	SCR_CloseNetLog( void );
+
+// net monitor cvars
+extern cvar_t	*cl_netgraph;
+extern cvar_t	*cl_netlog;
+extern cvar_t	*cl_laggotannounce;
 
 //
 // cl_cin.c
@@ -659,9 +640,6 @@ void CIN_SetExtents (int handle, int x, int y, int w, int h);
 void CIN_UploadCinematic(int handle);
 void CIN_CloseAllVideos(void);
 
-int     SCR_FontWidth(const char* text, float scale);
-void    SCR_DrawFontText(float x, float y, float scale, vec4_t color, const char* text, int style);
-
 //
 // cl_cgame.c
 //
@@ -678,24 +656,23 @@ void CL_InitUI( void );
 void CL_ShutdownUI( void );
 int Key_GetCatcher( void );
 void Key_SetCatcher( int catcher );
-void LAN_LoadCachedServers( void );
-void LAN_SaveServersToCache( void );
 
 
 //
 // cl_net_chan.c
 //
 void CL_Netchan_Transmit( netchan_t *chan, msg_t *msg );
+void CL_Netchan_Enqueue( netchan_t *chan, msg_t *msg, int times );
 qboolean CL_Netchan_Process( netchan_t *chan, msg_t *msg );
 
 //
 // cl_avi.c
 //
-qboolean CL_OpenAVIForWriting( const char *filename, qboolean pipe );
+qboolean CL_OpenAVIForWriting( const char *filename, qboolean pipe, qboolean reopen );
 void CL_TakeVideoFrame( void );
 void CL_WriteAVIVideoFrame( const byte *imageBuffer, int size );
 void CL_WriteAVIAudioFrame( const byte *pcmBuffer, int size );
-qboolean CL_CloseAVI( void );
+qboolean CL_CloseAVI( qboolean reopen );
 qboolean CL_VideoRecording( void );
 
 //
@@ -705,15 +682,21 @@ size_t	CL_SaveJPGToBuffer( byte *buffer, size_t bufSize, int quality, int image_
 void	CL_SaveJPG( const char *filename, int quality, int image_width, int image_height, byte *image_buffer, int padding );
 void	CL_LoadJPG( const char *filename, unsigned char **pic, int *width, int *height );
 
+
+// base backend functions
+void	HandleEvents( void );
+
 // platform-specific
+void	GLimp_InitGamma(glconfig_t *config);
+void	GLimp_SetGamma(unsigned char red[256], unsigned char green[256], unsigned char blue[256]);
+
+// OpenGL
+#ifdef USE_OPENGL_API
 void	GLimp_Init( glconfig_t *config );
 void	GLimp_Shutdown( qboolean unloadDLL );
 void	GLimp_EndFrame( void );
-
-void	GLimp_InitGamma( glconfig_t *config );
-void	GLimp_SetGamma( unsigned char red[256], unsigned char green[256], unsigned char blue[256] );
-
 void	*GL_GetProcAddress( const char *name );
+#endif
 
 // Vulkan
 #ifdef USE_VULKAN_API

@@ -2,6 +2,8 @@ name: build
 
 on:
   pull_request:
+    branches:
+      - re-impl
     paths-ignore:
       - '**.md'
       - '*.txt'
@@ -9,7 +11,7 @@ on:
       - 'docs/*'
   push:
     branches:
-      - upstream-reimpl
+      - re-impl
     paths-ignore:
       - '**.md'
       - '*.txt'
@@ -24,39 +26,93 @@ permissions:
   contents: read
 
 jobs:
-  linux:
-    name: ${{ matrix.btype }} Linux ${{ matrix.arch }}
+  windows-msys32:
+    name: Windows ${{ matrix.arch }}
+    if: github.event_name != 'release' || github.event.release.target_commitish == 're-impl'
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x86_64, x86]
+        include:
+          - arch: x86_64
+            build_server: ""
+          - arch: x86
+            build_server: BUILD_SERVER=0
+
+    steps:
+    - name: Checkout current repo
+      uses: actions/checkout@v4
+
+    - name: Checkout msys32 tools from sibling repo
+      uses: actions/checkout@v4
+      with:
+        repository: ec-/msys32
+        path: msys
+
+    - name: Extract msys32.7z
+      run: |
+        7z x %GITHUB_WORKSPACE%/msys/msys32.7z -o%GITHUB_WORKSPACE%/msys
+      shell: cmd
+
+    - name: Prepend msys/bin to PATH
+      run: |
+           echo "PATH=$GITHUB_WORKSPACE/msys/mingw/bin;$GITHUB_WORKSPACE/msys/bin;$GITHUB_WORKSPACE/msys" >> $GITHUB_ENV
+      shell: bash
+
+    - name: Build
+      shell: cmd
+      run: |
+        make install ARCH=${{ matrix.arch }} DESTDIR=bin USE_SDL=0 USE_RENDERER_DLOPEN=0 RENDERER_DEFAULT=vulkan CNAME=quake3e-vulkan BUILD_SERVER=0
+        make clean ARCH=${{ matrix.arch }}
+        make install ARCH=${{ matrix.arch }} DESTDIR=bin USE_SDL=0 USE_RENDERER_DLOPEN=0 RENDERER_DEFAULT=opengl ${{ matrix.build_server }}
+
+    - name: Download soft_oal.dll
+      shell: powershell
+      run: |
+        $ver = "1.25.1"
+        $zip = "openal-soft-${ver}-bin.zip"
+        Invoke-WebRequest -Uri "https://github.com/kcat/openal-soft/releases/download/${ver}/${zip}" -OutFile $zip -UseBasicParsing
+        $winArch = if ("${{ matrix.arch }}" -eq "x86") { "Win32" } else { "Win64" }
+        Expand-Archive -Path $zip -DestinationPath "openal_tmp"
+        Copy-Item "openal_tmp/openal-soft-${ver}-bin/bin/${winArch}/soft_oal.dll" "bin/"
+        Remove-Item -Recurse -Force "openal_tmp", $zip
+
+    - uses: actions/upload-artifact@v4
+      with:
+        name: windows-${{ matrix.arch }}
+        path: bin
+        if-no-files-found: error
+        retention-days: 5
+
+  ubuntu-x86:
+    name: Linux ${{ matrix.arch }}
+    if: github.event_name != 'release' || github.event.release.target_commitish == 're-impl'
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
         arch: [x86, x86_64]
-        cc: [gcc]
-        btype: [Release, Debug]
         include:
-          - btype: Release
-            rule: install
-
-          - btype: Debug
-            rule: debug
-
           - arch: x86
             use_sdl: USE_SDL=0
+            build_server: BUILD_SERVER=0
 
           - arch: x86_64
             use_sdl: USE_SDL=1
+            build_server: ""
 
     steps:
 
     - name: Install tools
       run: |
-        if [ "${{ matrix.arch }}" == "x86" ]; then
+        if [ ${{ matrix.arch }} == "x86" ]; then
           sudo dpkg --add-architecture i386
           sudo apt-get -qq update
-          sudo apt-get -y install gcc-multilib libcurl4-openssl-dev:i386 mesa-common-dev:i386 libxxf86dga-dev:i386 libxrandr-dev:i386 libxxf86vm-dev:i386 libasound-dev:i386
+          sudo apt-get -y install gcc-multilib libcurl4-openssl-dev:i386 mesa-common-dev:i386 libxxf86dga-dev:i386 libxrandr-dev:i386 libxxf86vm-dev:i386 libasound-dev:i386 libopenal1:i386
         else
           sudo apt-get -qq update
-          sudo apt-get -y install libcurl4-openssl-dev mesa-common-dev libxxf86dga-dev libxrandr-dev libxxf86vm-dev libasound-dev libsdl2-dev
+          sudo apt-get -y install libcurl4-openssl-dev mesa-common-dev libxxf86dga-dev libxrandr-dev libxxf86vm-dev libasound-dev libsdl2-dev libopenal1
         fi
 
     - uses: actions/checkout@v4
@@ -64,64 +120,31 @@ jobs:
         submodules: recursive
 
     - name: Build
-      if: ${{ matrix.btype == 'Debug' || github.event_name == 'workflow_dispatch' || github.event_name == 'release' }}
       run: |
-        make ${{ matrix.rule }} -j$(nproc) ARCH=${{ matrix.arch }} COMPILE_ARCH=${{ matrix.arch }} CC=${{ matrix.cc }} DESTDIR=bin ${{ matrix.use_sdl }} USE_RENDERER_DLOPEN=0 RENDERER_DEFAULT=vulkan CNAME=quake3e-vulkan BUILD_SERVER=0
+        make install -j$(nproc) ARCH=${{ matrix.arch }} COMPILE_ARCH=${{ matrix.arch }} CC=gcc DESTDIR=bin ${{ matrix.use_sdl }} USE_RENDERER_DLOPEN=0 RENDERER_DEFAULT=vulkan CNAME=quake3e-vulkan BUILD_SERVER=0
         make clean ARCH=${{ matrix.arch }}
-        make ${{ matrix.rule }} -j$(nproc) ARCH=${{ matrix.arch }} COMPILE_ARCH=${{ matrix.arch }} CC=${{ matrix.cc }} DESTDIR=bin ${{ matrix.use_sdl }} USE_RENDERER_DLOPEN=0 RENDERER_DEFAULT=opengl
+        make install -j$(nproc) ARCH=${{ matrix.arch }} COMPILE_ARCH=${{ matrix.arch }} CC=gcc DESTDIR=bin ${{ matrix.use_sdl }} USE_RENDERER_DLOPEN=0 RENDERER_DEFAULT=opengl ${{ matrix.build_server }}
+
+    - name: Bundle libopenal.so.1
+      run: |
+        so=$(find /usr/lib -name "libopenal.so.1" | head -1)
+        if [ -z "$so" ]; then echo "ERROR: libopenal.so.1 not found after install" >&2; exit 1; fi
+        cp "$so" bin/libopenal.so.1
 
     - uses: actions/upload-artifact@v4
-      if: matrix.cc == 'gcc' && matrix.btype == 'Debug'
       with:
         name: linux-${{ matrix.arch }}
         path: bin
         if-no-files-found: error
         retention-days: 5
 
-  windows-mingw:
-    name: ${{ matrix.btype }} Windows-MinGW ${{ matrix.arch }}
-    runs-on: ubuntu-24.04
-    strategy:
-      fail-fast: false
-      matrix:
-        arch: [x86, x86_64]
-        btype: [Release, Debug]
-        include:
-          - btype: Release
-            rule: install
-
-          - btype: Debug
-            rule: debug
-
-    steps:
-
-    - name: Install MinGW
-      run: |
-        sudo apt-get -qq update
-        sudo apt-get -y install mingw-w64
-
-    - uses: actions/checkout@v4
-      with:
-        submodules: recursive
-
-    - name: Build
-      if: ${{ matrix.btype == 'Debug' || github.event_name == 'workflow_dispatch' || github.event_name == 'release' }}
-      run: |
-        make ${{ matrix.rule }} -j$(nproc) ARCH=${{ matrix.arch }} DESTDIR=bin PLATFORM=mingw32 USE_SDL=0 USE_RENDERER_DLOPEN=0 RENDERER_DEFAULT=vulkan CNAME=quake3e-vulkan BUILD_SERVER=0
-        make clean ARCH=${{ matrix.arch }} PLATFORM=mingw32
-        make ${{ matrix.rule }} -j$(nproc) ARCH=${{ matrix.arch }} DESTDIR=bin PLATFORM=mingw32 USE_SDL=0 USE_RENDERER_DLOPEN=0 RENDERER_DEFAULT=opengl
-
-    - uses: actions/upload-artifact@v4
-      if: ${{ matrix.btype == 'Debug' }}
-      with:
-        name: windows-mingw-${{ matrix.arch }}
-        path: bin
-        if-no-files-found: error
-        retention-days: 5
-
-  create-release:
-    if: (github.ref_name == 'upstream-reimpl' && github.event_name == 'push') || github.event_name == 'workflow_dispatch'
-    needs: [linux, windows-mingw]
+  create-testing:
+    if: >-
+      always() && !cancelled() &&
+      github.ref == 'refs/heads/re-impl' &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
+      (needs.windows-msys32.result == 'success' || needs.ubuntu-x86.result == 'success')
+    needs: [windows-msys32, ubuntu-x86]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -131,58 +154,94 @@ jobs:
 
       - name: Create binary archives
         run: |
-          mkdir -p client server
-          for dir in linux-x86 linux-x86_64 windows-mingw-x86 windows-mingw-x86_64; do
-            mkdir -p "client/$dir" "server/$dir"
-            find "$dir" -type f -name '*quake3e.ded*' -exec cp {} "server/$dir/" \;
-            find "$dir" -type f ! -name '*quake3e.ded*' -exec cp {} "client/$dir/" \;
-          done
-          7z a -r quake3e-urt-client-${{ github.ref_name }}.zip ./client/*
-          7z a -r quake3e-urt-server-${{ github.ref_name }}.zip ./server/*
+          [ -d ./linux-x86 ]       && 7z a -r quake3e-linux-x86.zip       ./linux-x86/*       || true
+          [ -d ./linux-x86_64 ]    && 7z a -r quake3e-linux-x86_64.zip    ./linux-x86_64/*    || true
+          [ -d ./windows-x86 ]     && 7z a -r quake3e-windows-x86.zip     ./windows-x86/*     || true
+          [ -d ./windows-x86_64 ]  && 7z a -r quake3e-windows-x86_64.zip  ./windows-x86_64/*  || true
 
       - name: Create latest build
         uses: czietz/action-automatic-releases@latest
         with:
           repo_token: ${{ secrets.GITHUB_TOKEN }}
-          automatic_release_tag: "latest-${{ github.ref_name }}"
+          automatic_release_tag: "latest"
           prerelease: false
-          title: Latest Build (${{ github.ref_name }})
+          title: Latest Build
           files: |
             *.zip
 
   update-release:
-    if: ${{ github.event_name == 'release' }}
-    needs: [linux, windows-mingw]
+    if: >-
+      always() && !cancelled() &&
+      github.event_name == 'release' &&
+      github.event.release.target_commitish == 're-impl' &&
+      (needs.windows-msys32.result == 'success' || needs.ubuntu-x86.result == 'success')
+    needs: [windows-msys32, ubuntu-x86]
     runs-on: ubuntu-latest
     permissions:
       contents: write
 
     strategy:
+      fail-fast: false
       matrix:
         include:
           - artifact_dir: linux-x86
-            artifact_name: quake3e-urt-linux-x86.zip
+            artifact_name: quake3e-linux-x86.zip
 
           - artifact_dir: linux-x86_64
-            artifact_name: quake3e-urt-linux-x86_64.zip
+            artifact_name: quake3e-linux-x86_64.zip
 
-          - artifact_dir: windows-mingw-x86
-            artifact_name: quake3e-urt-windows-x86.zip
+          - artifact_dir: windows-x86
+            artifact_name: quake3e-windows-x86.zip
 
-          - artifact_dir: windows-mingw-x86_64
-            artifact_name: quake3e-urt-windows-x86_64.zip
+          - artifact_dir: windows-x86_64
+            artifact_name: quake3e-windows-x86_64.zip
 
     steps:
       - name: Download Artifacts
         uses: actions/download-artifact@v4
 
       - name: Create archive
-        run: 7z a -r ${{ matrix.artifact_name }} ./${{ matrix.artifact_dir }}/*
+        id: create_archive
+        run: |
+          if [ -d "./${{ matrix.artifact_dir }}" ]; then
+            7z a -r ${{ matrix.artifact_name }} ./${{ matrix.artifact_dir }}/*
+            echo "created=true" >> $GITHUB_OUTPUT
+          else
+            echo "Artifact directory ${{ matrix.artifact_dir }} not found, skipping"
+            echo "created=false" >> $GITHUB_OUTPUT
+          fi
 
       - name: Upload archive
-        uses: svenstaro/upload-release-action@latest
+        if: steps.create_archive.outputs.created == 'true'
+        uses: "svenstaro/upload-release-action@latest"
         with:
           repo_token: ${{ secrets.GITHUB_TOKEN }}
           tag: ${{ github.ref }}
           overwrite: true
           file: ${{ matrix.artifact_name }}
+
+  cleanup-old-runs:
+    name: Delete old workflow runs
+    if: >-
+      always() && !cancelled() &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
+      github.ref == 'refs/heads/re-impl'
+    needs: [windows-msys32, ubuntu-x86]
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - name: Delete old workflow runs (keep latest)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          WORKFLOW: build.yml
+          KEEP: 1
+        run: |
+          run_ids=$(gh api "repos/$REPO/actions/workflows/$WORKFLOW/runs" \
+            --jq --argjson keep "$KEEP" '.workflow_runs | sort_by(.run_number) | reverse | .[$keep:] | .[].id')
+          while IFS= read -r id; do
+            [ -z "$id" ] && continue
+            echo "Deleting run $id"
+            gh api "repos/$REPO/actions/runs/$id" -X DELETE || true
+          done <<< "$run_ids"

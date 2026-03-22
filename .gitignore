@@ -5,14 +5,12 @@ output/
 *.user
 cmake-*
 .idea
-.gitignore
-*.json
-last_session.md
-
-# — reference only, do not distribute
-UrbanTerror42_source/
 UrbanTerror42_Source/
-etlegacy-master/
-.claude
-ioq3
-build_output.log
+.claud
+.git
+build/
+*.o
+qvmrnd/
+
+# Debug log files
+netdebug_*.log

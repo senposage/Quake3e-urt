@@ -156,6 +156,7 @@ cvar_t							*dmaHD_Enable = NULL;
 cvar_t							*dmaHD_Interpolation;
 cvar_t							*dmaHD_Mixer;
 cvar_t							*dmaEX_StereoSeparation;
+cvar_t							*dmaHD_debugLevel;
 
 
 extern loopSound_t				loopSounds[];
@@ -171,6 +172,38 @@ extern portable_samplepair_t	s_rawsamples[];
 #define DMAHD_PAINTBUFFER_SIZE	65536
 static portable_samplepair_t	dmaHD_paintbuffer[DMAHD_PAINTBUFFER_SIZE];
 static int						dmaHD_snd_vol;
+
+// Peak limiter state: tracks the current gain reduction (1.0 = unity, <1.0 = attenuation).
+// Fast attack (immediate gain reduction when mix would clip), slow release (15 % recovery
+// per paint chunk, ~100-200 ms to full unity at 60 fps) prevents both hard clipping and
+// audible gain pumping.
+static float					s_dmaHD_limiterGain = 1.0f;
+
+// Normalisation divisor for converting the 24.8 fixed-point paint accumulator
+// to a [-1.0, 1.0] float sample, matching S_TransferPaintBuffer in snd_mix.c.
+#define DMAHD_FLOAT_RDIV   (1.0f / (32768.0f * 256.0f - 128.0f))
+
+// Clamp bounds for the float output path (24.8 fixed-point accumulator limits).
+#define DMAHD_FLOAT_MAX    (32767 * 256)    // 0x7FFF00
+#define DMAHD_FLOAT_MIN    (-32768 * 256)   // -0x800000
+
+// Clamp bounds for the 32-bit int PCM output path (24-bit signed range).
+#define DMAHD_INT24_MAX    0x7FFFFF         //  8388607
+#define DMAHD_INT24_MIN    (-0x800000)      // -8388608
+
+// Minimum output samples to fade to zero at the end of a resampled buffer.
+// The actual fade length is computed adaptively from the step scale (see
+// dmaHD_ResampleSfx) so that it always covers the boundary-wraparound
+// contamination from ALL interpolation modes regardless of the output rate
+// WASAPI reports.  This constant acts as a floor: even at the lowest
+// supported upsampling ratio the fade is at least 16 samples long.
+#define DMAHD_ENDPAD_MIN   16
+
+// Tracks the last s_soundtime value processed by dmaHD_Update_Mix so that
+// the mixer is not called twice for the same hardware position.  Kept at
+// module scope (not function-local static) so it can be reset when
+// s_soundtime is reinitialised by S_StopAllSounds / vid_restart.
+static int dmaHD_lastsoundtime = -1;
 
 qboolean g_tablesinit = qfalse;
 float g_voltable[256];
@@ -292,18 +325,28 @@ static float dmaHD_NormalizeSamplePosition(float t, int samples) {
 }
 static int dmaHD_GetSampleRaw_8bitMono(int index, int samples, byte* data)
 {
-    if (index < 0) index += samples; else if (index >= samples) index -= samples;
+    /* Negative indices arise from the warm-up pre-loop (idx_smp starts at
+     * -4*stepscale); wrap them up to the end of the source buffer so the
+     * filter primes from near-silence.  Indices that reach or exceed
+     * 'samples' -- from the Hermite/cubic x+1,x+2 lookahead or the
+     * no-interpolation round-up -- must NOT wrap back to sample[0] (the
+     * attack peak): that wraparound is the root cause of the click/pop at
+     * the boundary.  Return silence (0) instead. */
+    if (index < 0) index += samples;
+    if (index < 0 || index >= samples) return 0;
     return (int)(((byte)(data[index])-128)<<8);
 }
 static int dmaHD_GetSampleRaw_16bitMono(int index, int samples, byte* data)
 {
-    if (index < 0) index += samples; else if (index >= samples) index -= samples;
+    if (index < 0) index += samples;
+    if (index < 0 || index >= samples) return 0;
     return (int)LittleShort(((short*)data)[index]);
 }
 static int dmaHD_GetSampleRaw_8bitStereo(int index, int samples, byte* data)
 {
     int left, right;
-    if (index < 0) index += samples; else if (index >= samples) index -= samples;
+    if (index < 0) index += samples;
+    if (index < 0 || index >= samples) return 0;
     left = (int)(((byte)(data[index * 2])-128)<<8);
     right = (int)(((byte)(data[index * 2 + 1])-128)<<8);
     return (left + right) / 2;
@@ -311,7 +354,8 @@ static int dmaHD_GetSampleRaw_8bitStereo(int index, int samples, byte* data)
 static int dmaHD_GetSampleRaw_16bitStereo(int index, int samples, byte* data)
 {
     int left, right;
-    if (index < 0) index += samples; else if (index >= samples) index -= samples;
+    if (index < 0) index += samples;
+    if (index < 0 || index >= samples) return 0;
     left = (int)LittleShort(((short*)data)[index * 2]);
     right = (int)LittleShort(((short*)data)[index * 2 + 1]);
     return (left + right) / 2;
@@ -389,6 +433,10 @@ static int dmaHD_GetNoInterpolationSample(float t, int samples, byte *data,
     // Get points
     x = (int)t;
 
+    // Round to nearest: if the fractional part is > 0.5, advance to the next
+    // sample.  If x reaches samples (i.e. the floor of t equals soundLength-1
+    // and the fractional part rounds up), dmaHD_GetSampleRaw now returns 0
+    // (silence) rather than wrapping to sample[0] (the attack peak).
     if (FLOAT_DECIMAL_PART(t) > 0.5) x++;
 
     return dmaHD_GetSampleRaw(x, samples, data);
@@ -441,13 +489,18 @@ void dmaHD_ResampleSfx( sfx_t *sfx, int channels, int inrate, int inwidth, byte 
     hp_last = sample;
     hp_lastsample = sample;
     //buffer[idx_hp++] = sample;
-    hp_a = 0.95f;
+    // Scale coefficients so cutoff frequencies stay constant regardless of dma.speed.
+    // Originals were calibrated for 44100 Hz: hp_a=0.95 (~360 Hz HP), lp_a=0.03 (~211 Hz LP).
+    {
+        float rate_scale = 44100.0f / (float)dma.speed;
+        hp_a = 1.0f - (1.0f - 0.95f) * rate_scale;
+        lp_a = 0.03f * rate_scale;
+    }
 
     // Set up Low pass filter.
     idx_lp = outcount;
     lp_last = bsample;
-    lp_a = 0.03f;
-    lp_inva = (1 - lp_a);
+    lp_inva = (1.0f - lp_a);
 
     // Now do actual high/low pass on actual data.
     for (;idx_hp < outcount; idx_hp++)
@@ -466,6 +519,63 @@ void dmaHD_ResampleSfx( sfx_t *sfx, int channels, int inrate, int inwidth, byte 
         lp_data = lp_a * (float)bsample + lp_inva * lp_last;
         buffer[idx_lp++] = SMPCLAMP(lp_data);
         lp_last = lp_data;
+    }
+
+    /* --- End-of-buffer boundary -- defensive fade ----------------------------
+     * ROOT CAUSE (now fixed in dmaHD_GetSampleRaw_*):
+     * Every GetSampleRaw_* variant previously wrapped out-of-bounds indices
+     * modulo soundLength (correct for seamless-loop sounds, wrong for non-
+     * looping ones).  Whenever any interpolation or rounding step read one
+     * or two indices past the end of the source buffer, it silently returned
+     * sample[0] (the attack peak) instead of silence.  This contaminated:
+     *
+     *   * buffer[0..3]  -- the warm-up pre-loop reads from negative positions
+     *     that normalise to near soundLength; their Hermite x+2 lookahead
+     *     exceeded soundLength and wrapped to 0, injecting the attack peak
+     *     into the HP filter's initial state -> click at the START of each
+     *     sound.
+     *
+     *   * buffer[outcount-1] -- the last loop iteration's Hermite reads x+2
+     *     = soundLength, which wrapped to 0 -> HP filter spike -> click at
+     *     the END of each non-looping sound.
+     *
+     * FIXED: GetSampleRaw now returns 0 for index >= samples (silence) while
+     * preserving the negative-index wrap that is needed for the warm-up path.
+     *
+     * SECONDARY (belt-and-suspenders) fade:
+     * The linear fade below additionally zeroes the last n_pad output samples
+     * of both sub-buffers.  It guards against any residual HP/LP filter
+     * "tail" energy at the end of the buffer (the high-pass filter has
+     * an exponential decay that asymptotes to zero but never reaches it
+     * exactly), preventing a step discontinuity from the last non-zero
+     * sample to the silence that follows when playback ends.
+     * n_pad is adaptive so it covers the maximum HP filter decay at any
+     * WASAPI output rate (44100 - 192000 Hz).
+     */
+    {
+        /* n_pad = ceilf(2 / stepscale) + 4 covers all interpolation modes.
+         * The worst-case lookahead is Hermite (reads x+1 and x+2 = 2 input
+         * samples past the end), each spanning 1/stepscale output samples.
+         * The no-interpolation and bass paths (round-up wraps 1 input sample)
+         * are covered by the +4 margin.  Floored at DMAHD_ENDPAD_MIN.
+         * dma.speed comes from WASAPI GetMixFormat and can be any supported
+         * rate (44100, 48000, 96000, 192000 Hz); adaptive sizing ensures full
+         * coverage at high output rates where a fixed constant would fail. */
+        int n_pad = (stepscale > 0.0f) ? (int)ceilf(2.0f / stepscale) + 4 : DMAHD_ENDPAD_MIN;
+        int n, div, i;
+        if (n_pad < DMAHD_ENDPAD_MIN) n_pad = DMAHD_ENDPAD_MIN;
+        n   = (outcount < n_pad) ? outcount : n_pad;
+        div = (n > 1) ? (n - 1) : 1;
+        for (i = 0; i < n; i++)
+        {
+            int scale256 = ((n - 1 - i) * 256) / div;
+            int idx      = outcount - n + i;
+            buffer[idx]            = (short)(((int)buffer[idx]            * scale256) >> 8);
+            buffer[outcount + idx] = (short)(((int)buffer[outcount + idx] * scale256) >> 8);
+        }
+        if (dmaHD_debugLevel && dmaHD_debugLevel->integer >= 1)
+            Com_DPrintf("dmaHD: %s resampled %d->%d Hz, end-fade %d samples (stepscale %.4f)\n",
+                sfx->soundName, inrate, dma.speed, n, (double)stepscale);
     }
 
     sfx->soundData = (sndBuffer*)buffer;
@@ -710,7 +820,11 @@ void dmaHD_TransferPaintBuffer(int endtime)
     int      snd_linear_count;
     short*   snd_out;
     short*   snd_outtmp;
+    float*   float_out;
+    int*     int32_out;
     unsigned long *pbuf = (unsigned long *)dma.buffer;
+    int      clipped = 0;     // count of samples that hit the clamp limit
+    int      totalSamples = 0; // total scalar samples written (accumulates snd_linear_count)
 
     snd_p = (int*)dmaHD_paintbuffer;
     ls_paintedtime = s_paintedtime;
@@ -720,25 +834,68 @@ void dmaHD_TransferPaintBuffer(int endtime)
         // handle recirculating buffer issues
         lpos = ls_paintedtime & ((dma.samples >> 1) - 1);
 
-        snd_out = (short *)pbuf + (lpos << 1);
-
         snd_linear_count = (dma.samples >> 1) - lpos;
         if (ls_paintedtime + snd_linear_count > endtime)
             snd_linear_count = endtime - ls_paintedtime;
 
         snd_linear_count <<= 1;
+        totalSamples += snd_linear_count;
 
-        // write a linear blast of samples
-        for (snd_outtmp = snd_out, i = 0; i < snd_linear_count; ++i)
+        if ( dma.isfloat && dma.samplebits == 32 )
         {
-            val = *snd_p++ >> 8;
-            *snd_outtmp++ = SMPCLAMP(val);
+            // 32-bit IEEE float output (native WASAPI float path).
+            // Normalise 24.8 fixed-point accumulator to [-1.0, 1.0].
+            float_out = (float *)pbuf + (lpos << 1);
+            for (i = 0; i < snd_linear_count; ++i)
+            {
+                val = *snd_p++;
+                if (val > DMAHD_FLOAT_MAX) { val = DMAHD_FLOAT_MAX; clipped++; }
+                else if (val < DMAHD_FLOAT_MIN) { val = DMAHD_FLOAT_MIN; clipped++; }
+                *float_out++ = (float)(val + 128) * DMAHD_FLOAT_RDIV;
+            }
+            // AVI capture expects 16-bit PCM; skip for float output path.
+        }
+        else if ( !dma.isfloat && dma.samplebits == 32 )
+        {
+            // 32-bit integer PCM output (e.g. 24-valid-bits-in-32-bit container).
+            // Windows stores the valid bits MSB-aligned, so the 24-bit value
+            // occupies bits [31:8] of the 32-bit container (i.e. val << 8).
+            // The accumulator is naturally in 24-bit range; clamp then shift.
+            int32_out = (int *)pbuf + (lpos << 1);
+            for (i = 0; i < snd_linear_count; ++i)
+            {
+                val = *snd_p++;
+                if (val > DMAHD_INT24_MAX) { val = DMAHD_INT24_MAX; clipped++; }
+                else if (val < DMAHD_INT24_MIN) { val = DMAHD_INT24_MIN; clipped++; }
+                *int32_out++ = val << 8;
+            }
+            // AVI capture expects 16-bit PCM; skip for 32-bit int output path.
+        }
+        else
+        {
+            // 16-bit PCM output (DirectSound / 16-bit WASAPI fallback).
+            // The 24.8 accumulator is shifted right by 8 here; the result can still
+            // exceed [-32768, 32767] when many loud channels are active, so we detect
+            // the overload here (after >>8, before SMPCLAMP) to count true clip events.
+            snd_out = (short *)pbuf + (lpos << 1);
+            for (snd_outtmp = snd_out, i = 0; i < snd_linear_count; ++i)
+            {
+                val = *snd_p++ >> 8;
+                if (val < -32768 || val > 32767) clipped++;
+                *snd_outtmp++ = SMPCLAMP(val);
+            }
+
+            if (CL_VideoRecording())
+                CL_WriteAVIAudioFrame((byte *)snd_out, snd_linear_count << 1);
         }
 
         ls_paintedtime += (snd_linear_count>>1);
+    }
 
-        if (CL_VideoRecording())
-            CL_WriteAVIAudioFrame((byte *)snd_out, snd_linear_count << 1);
+    if (clipped > 0 && dmaHD_debugLevel && dmaHD_debugLevel->integer >= 1)
+    {
+        Com_DPrintf(S_COLOR_YELLOW "dmaHD: paint buffer clipped %d/%d samples (mix overload -- may cause distortion)\n",
+            clipped, totalSamples);
     }
 }
 
@@ -750,6 +907,7 @@ void dmaHD_PaintChannels( int endtime )
     sfx_t	*sc;
     int		ltime, count;
     int		sampleOffset;
+    int		activeCh;   // for debug: count of channels being mixed
 #ifdef MAX_RAW_STREAMS
     int		stream;
 #endif
@@ -816,6 +974,7 @@ s_volume->value*256;
 #endif
 
         // paint in the channels.
+        activeCh = 0;
         ch = s_channels;
         for ( i = 0; i < MAX_CHANNELS ; i++, ch++ )
         {
@@ -824,9 +983,18 @@ s_volume->value*256;
             ltime = s_paintedtime;
             sc = ch->thesfx;
             sampleOffset = ltime - ch->startSample;
+
+            // Unexpected negative sampleOffset means the channel's startSample is
+            // ahead of the current paint time -- log it so we can investigate.
+            if (sampleOffset < 0 && dmaHD_debugLevel && dmaHD_debugLevel->integer >= 1)
+            {
+                Com_DPrintf(S_COLOR_YELLOW "dmaHD: ch[%d] negative sampleOffset %d for %s (startSample %d paintedtime %d)\n",
+                    i, sampleOffset, sc->soundName, ch->startSample, s_paintedtime);
+            }
+
             count = end - ltime;
             if (sampleOffset + count >= sc->soundLength) count = sc->soundLength - sampleOffset;
-            if (count > 0) dmaHD_PaintChannelFrom16(ch, sc, count, sampleOffset, 0);
+            if (count > 0) { dmaHD_PaintChannelFrom16(ch, sc, count, sampleOffset, 0); activeCh++; }
         }
 
         // paint in the looped channels.
@@ -849,8 +1017,56 @@ s_volume->value*256;
                 {
                     dmaHD_PaintChannelFrom16(ch, sc, count, sampleOffset, ltime - s_paintedtime);
                     ltime += count;
+                    activeCh++;
                 }
             } while (ltime < end);
+        }
+
+        if (dmaHD_debugLevel && dmaHD_debugLevel->integer >= 1 && activeCh > (MAX_CHANNELS / 2))
+        {
+            Com_DPrintf(S_COLOR_CYAN "dmaHD: mixing %d active channels (loop: %d) -- high channel load\n",
+                activeCh, numLoopChannels);
+        }
+
+        // Peak limiter -- prevents paint-buffer clipping / mix distortion when many
+        // channels are simultaneously active (e.g. sustained automatic fire at high
+        // sv_fps).  Algorithm: fast attack (gain snaps immediately to the level needed
+        // to keep the peak within the output range), slow release (15 % per paint chunk
+        // ~ 100-200 ms to unity at 60 fps) to avoid abrupt volume jumps between chunks.
+        {
+            int numSamples = (end - s_paintedtime) * 2; // stereo: 2 ints per sample pair
+            int *p = (int *)dmaHD_paintbuffer;
+            int peak = 0;
+            int i2;
+
+            for (i2 = 0; i2 < numSamples; i2++) {
+                int v = p[i2];
+                if (v < 0) v = -v;
+                if (v > peak) peak = v;
+            }
+
+            // Fast attack: immediately drop gain if this chunk would otherwise clip.
+            if (peak > DMAHD_FLOAT_MAX) {
+                float needed = (float)DMAHD_FLOAT_MAX / (float)peak;
+                if (needed < s_dmaHD_limiterGain)
+                    s_dmaHD_limiterGain = needed;
+            }
+
+            // Apply gain and begin slow release toward unity.
+            if (s_dmaHD_limiterGain < 1.0f) {
+                int scale256 = (int)(s_dmaHD_limiterGain * 256.0f);
+                for (i2 = 0; i2 < numSamples; i2++)
+                    p[i2] = (p[i2] * scale256) >> 8;
+
+                if (dmaHD_debugLevel && dmaHD_debugLevel->integer >= 1)
+                    Com_DPrintf(S_COLOR_CYAN "dmaHD: peak limiter active -- gain %.3f (peak %d, %d active ch)\n",
+                        (double)s_dmaHD_limiterGain, peak, activeCh);
+
+                // Release: ease back 15 % of the remaining distance to 1.0 each chunk.
+                s_dmaHD_limiterGain += (1.0f - s_dmaHD_limiterGain) * 0.15f;
+                if (s_dmaHD_limiterGain > 1.0f)
+                    s_dmaHD_limiterGain = 1.0f;
+            }
         }
 
         // transfer out according to DMA format
@@ -1288,7 +1504,6 @@ void dmaHD_Update_Mix(void)
     int samps;
     static int lastTime = 0.0f;
     int mixahead, op, thisTime, sane;
-    static int lastsoundtime = -1;
 
     if (!s_soundStarted || s_soundMuted) return;
 
@@ -1297,8 +1512,23 @@ void dmaHD_Update_Mix(void)
     // Updates s_soundtime
     S_GetSoundtime();
 
-    if (s_soundtime <= lastsoundtime) return;
-    lastsoundtime = s_soundtime;
+    /* Guard against s_soundtime being reset (vid_restart, level change).
+     * If it jumped backward by more than one second's worth of samples the
+     * sound subsystem was reinitialised (s_soundtime set back to 0 by
+     * S_Base_Init / S_Base_StopAllSounds).  Without this check the function-
+     * local static lastsoundtime would remain at the old large value and the
+     * mixer would silently skip every call until s_soundtime climbed back up --
+     * causing complete silence for several seconds after a vid_restart. */
+    if ((dmaHD_lastsoundtime - s_soundtime) > (int)dma.speed)
+    {
+        Com_DPrintf(S_COLOR_YELLOW "dmaHD: s_soundtime reset detected (%d -> %d), resetting mixer state\n",
+            dmaHD_lastsoundtime, s_soundtime);
+        dmaHD_lastsoundtime = s_soundtime - 1;
+        s_dmaHD_limiterGain = 1.0f;
+    }
+
+    if (s_soundtime <= dmaHD_lastsoundtime) return;
+    dmaHD_lastsoundtime = s_soundtime;
 
     // clear any sound effects that end before the current time,
     // and start any new sounds
@@ -1309,6 +1539,14 @@ void dmaHD_Update_Mix(void)
     mixahead = (int)((float)dma.speed * s_mixahead->value);
 
     if (mixahead < op) mixahead = op;
+
+    // Log when the mixer needs to catch up by more than 100 ms -- indicates stall/hitch
+    // that may produce audible artifacts (pops, silence gaps).
+    if (dmaHD_debugLevel && dmaHD_debugLevel->integer >= 1 && sane > 100)
+    {
+        Com_DPrintf(S_COLOR_YELLOW "dmaHD: mix stall -- %d ms since last mix (op %d samples, mixahead %d samples)\n",
+            sane, op, mixahead);
+    }
 
     // mix ahead of current position
     endtime = s_soundtime + mixahead;
@@ -1361,7 +1599,9 @@ void dmaHD_SoundInfo(void)
             case 21: Com_Printf(" dmaEX2 sound mixer with no reverb [21]\n"); break;
             case 30: Com_Printf(" dmaEX sound mixer [30]\n"); break;
         }
-        Com_Printf(" %d ch / %d Hz / %d bps\n", dma.channels, dma.speed, dma.samplebits);
+        Com_Printf(" %d ch / %d Hz / %d bps%s\n", dma.channels, dma.speed,
+            dma.validbits ? dma.validbits : dma.samplebits,
+            (dma.validbits && dma.validbits != dma.samplebits) ? " (24-in-32 PCM)" : "");
         if (s_numSfx > 0 || g_dmaHD_allocatedsoundmemory > 0)
         {
             Com_Printf(" %d sounds in %.2f MiB\n", s_numSfx, (float)g_dmaHD_allocatedsoundmemory / 1048576.0f);
@@ -1454,6 +1694,14 @@ qboolean dmaHD_Init(soundInterface_t *si)
     }
 
     dmaHD_InitTables();
+
+    dmaHD_debugLevel = Cvar_Get("dmaHD_debugLevel", "0", CVAR_TEMP);
+    Cvar_SetDescription(dmaHD_debugLevel,
+        "dmaHD diagnostic logging level. "
+        "0 = off (default). "
+        "1 = log mix-overload clipping, peak limiter activations, mix stalls (>100 ms), "
+        "high channel load (>48 active channels), and unexpected channel states. "
+        "All output is routed through Com_DPrintf (requires developer 1).");
 
     // Override function pointers to dmaHD version, the rest keep base.
     si->SoundInfo = dmaHD_SoundInfo;
