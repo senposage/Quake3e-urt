@@ -382,7 +382,7 @@ void SV_Antilag_Init( void ) {
     SV_Antilag_ComputeConfig();
 
     Com_Printf( "SV_Antilag: shadow=%dHz slots=%d covers~%dms maxRewind=%dms\n",
-        sv_fps ? sv_fps->integer : 40,
+        1000 / sv_shadowTickMs,
         sv_shadowHistorySlots,
         sv_shadowHistorySlots * sv_shadowTickMs,
         sv_antilagMaxMs->integer );
@@ -402,7 +402,7 @@ void SV_Antilag_RecordPositions( void ) {
             sv_antilag_lastFpsValue = currentFps;
             Com_Memset( sv_shadowHistory, 0, sizeof( sv_shadowHistory ) );
             Com_Printf( "SV_Antilag: reconfigured -- shadow Hz=%d, historySlots=%d (history flushed)\n",
-                currentFps, sv_shadowHistorySlots );
+                1000 / sv_shadowTickMs, sv_shadowHistorySlots );
         }
     }
 
@@ -471,7 +471,7 @@ void SV_Antilag_NoteSnapshot( int clientNum ) {
 
         Com_Printf( "RATE cl[%2d] %-16s | snap: obs=%.1fHz target=%dHz | pkt: %.1fHz | ping=%dms\n",
             clientNum, cl->name, obsHz,
-            cl->snapshotHz > 0 ? cl->snapshotHz : sv_fps->integer,
+            1000 / ( cl->snapshotMsec > 0 ? cl->snapshotMsec : 1 ),
             pktHz, cl->ping );
     }
 }
