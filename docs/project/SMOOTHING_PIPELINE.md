@@ -150,11 +150,12 @@ appearing in front of or behind a moving player.
 
 ### sv_velSmooth
 
-When `sv_velSmooth > 0`, the per-client position ring buffer (which also records
+When `sv_velSmooth != 0`, the per-client position ring buffer (which also records
 velocity each tick) is queried for an exponentially-smoothed average velocity
-over the last `sv_velSmooth` ms.  This eliminates the 50/50 velocity flip that
+over the last `velSmoothMs` ms.  This eliminates the 50/50 velocity flip that
 occurs at direction-change frames (one tick says +300, next says -300) and
 gives the client a smooth, continuous `trDelta` to extrapolate.
+`-1` (default) = auto: window = 4 * frameMsec (e.g. 80ms at sv_fps 50).
 
 ### sv_bufferMs
 
@@ -198,18 +199,19 @@ serverinfo (custom server detection), the thresholds scale with
 `cl.snapshotMsec`:
 
 ```c
-resetTime  = max(snapshotMsec * 10, 500)  // e.g. 160 ms at 60Hz, 500 ms floor
-fastAdjust = max(snapshotMsec *  2,  50)  // e.g.  32 ms at 60Hz,  50 ms floor
+resetTime  = max(snapshotMsec * 10, 500)  // e.g. 500 ms at 50Hz (floor), 100 ms at 100Hz
+fastAdjust = max(snapshotMsec *  2,  50)  // e.g.  50 ms at 50Hz (floor),  20 ms at 100Hz
 ```
 
 At 20 Hz (`snapshotMsec = 50`): `resetTime = 500`, `fastAdjust = 100` --
-identical to vanilla.  At 60 Hz: `resetTime = 160`, `fastAdjust = 32`.  At
+identical to vanilla.  At 50 Hz (default): `resetTime = 500` (floor), `fastAdjust = 50` (floor) --
+also equivalent to vanilla.  At 100 Hz: `resetTime = 100`, `fastAdjust = 20`.  At
 125 Hz: `resetTime = 80`, `fastAdjust = 16`.
 
 The slow-drift backward step is also scaled:
 
 ```c
-slowFrac -= (snapshotMsec < 30) ? 2 : 4;  // +/-0.5 ms/snap at 60Hz, 1 ms/snap at 20Hz
+slowFrac -= (snapshotMsec < 30) ? 2 : 4;  // +/-0.5 ms/snap at 50Hz (default), 1 ms/snap at 20Hz
 ```
 
 This keeps the drift rate proportional to the snapshot interval, so recovery
@@ -540,7 +542,7 @@ This is enforced at two levels:
 | Cvar | Side | Default | Description |
 |---|---|---|---|
 | `sv_smoothClients` | Server | `1` | Convert TR_INTERPOLATE player snapshots to TR_LINEAR with velocity |
-| `sv_velSmooth` | Server | `0` | EMA velocity smoothing window (ms). 0=disabled |
+| `sv_velSmooth` | Server | `-1` | EMA velocity smoothing window (ms). -1=auto (4*frameMsec). 0=disabled |
 | `sv_bufferMs` | Server | `0` | Position delay (ms). -1=auto (one snap interval). 0=disabled |
 | `cl_adaptiveTiming` | Client | `1` | Scale timing thresholds with snapshotMsec. 0=vanilla |
 | `sv_allowClientAdaptiveTiming` | Server | `1` | Allow client to use cl_adaptiveTiming (sent in serverinfo) |
