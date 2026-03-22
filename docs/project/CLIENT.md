@@ -673,9 +673,15 @@ Called from other client files to feed data into the widget:
 
 #### Net Debug Logging
 
-`cl_netlog 1`: logs FAST/RESET/SNAP LATE/PING JITTER events to a session log file.
-`cl_netlog 2`: also logs periodic per-second statistics.
+`cl_netlog 1`: logs FAST/RESET/SNAP LATE/PING JITTER/DROP/TIMEOUT/DISCONNECT events to `netdebug_YYYYMMDD_HHMMSS.log`. High-frequency +button13/-button13/+button14/-button14 server commands are filtered out.
+`cl_netlog 2`: also opens a separate `netgraph_YYYYMMDD_HHMMSS.log` with raw per-snap SNAP records, per-second STATS lines, OOB packets, and USERINFO sends. The main debug log stays readable; the netgraph log is for detailed offline analysis.
 `netgraph_dump` command: writes a full stats snapshot to the log file on demand.
+
+#### Net Monitor Graph Legend
+
+The laggometer graph below the text rows has two halves:
+- **Top half (ping bars):** bar height proportional to RTT. Green = <80 ms, yellow = <150 ms, red = >=150 ms.
+- **Bottom half (snap quality bars):** full-height solid colour per snap. Green = OK, yellow = Jitter (late arrival), orange = Choke (rate-delayed), red = Drop (netchan gap).
 
 ---
 

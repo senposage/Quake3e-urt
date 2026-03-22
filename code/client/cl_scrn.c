@@ -91,6 +91,8 @@ static int	netMonDispSnapGapMax;
 static int	netMonDispFtAvg;
 static int	netMonDispFtMax;
 static float	netMonDispFiAvg;
+static int	netMonDispSnapLeadMin;
+static int	netMonDispSnapLeadMax;
 
 // Per-frame fI accumulator (for 1-second average)
 static float	netMonFiSum;
@@ -168,9 +170,12 @@ static int      nmExtrapStartSeq;
 // Forward declarations for log helpers defined later in the file
 static void SCR_OpenNetLog( void );
 static void SCR_WriteLog( const char *line );
+static void SCR_WriteLog2( const char *line );
 
 // Session log file (opened lazily when cl_netlog > 0)
 static fileHandle_t	netLogFile;
+// Separate high-frequency netgraph log (opened lazily when cl_netlog >= 2)
+static fileHandle_t	netLogFile2;
 
 /*
 ================
@@ -887,32 +892,56 @@ static void SCR_OpenNetLog( void ) {
 	char    path[MAX_OSPATH];
 	char    header[256];
 
-	if ( netLogFile )
-		return;
-
 	Com_RealTime( &t );
-	Com_sprintf( path, sizeof(path), "netdebug_%04d%02d%02d_%02d%02d%02d.log",
-		1900 + t.tm_year, 1 + t.tm_mon, t.tm_mday,
-		t.tm_hour, t.tm_min, t.tm_sec );
 
-	netLogFile = FS_FOpenFileWrite( path );
-	if ( netLogFile ) {
-		Com_sprintf( header, sizeof(header),
-			"=== Quake3e Net Debug Log  %04d-%02d-%02d %02d:%02d:%02d ===\n"
-			"  cl_netlog=%d"
-			"  (1=CONNECT+SVCMD+FAST/RESET+SNAPLATE+TIMEOUT+DISCONNECT"
-			"  2=+SNAP+STATS)\n\n",
+	if ( !netLogFile ) {
+		Com_sprintf( path, sizeof(path), "netdebug_%04d%02d%02d_%02d%02d%02d.log",
 			1900 + t.tm_year, 1 + t.tm_mon, t.tm_mday,
-			t.tm_hour, t.tm_min, t.tm_sec,
-			cl_netlog->integer );
-		FS_Write( header, strlen(header), netLogFile );
-		Com_Printf( "Net debug log opened: %s\n", path );
+			t.tm_hour, t.tm_min, t.tm_sec );
+		netLogFile = FS_FOpenFileWrite( path );
+		if ( netLogFile ) {
+			Com_sprintf( header, sizeof(header),
+				"=== Quake3e Net Debug Log  %04d-%02d-%02d %02d:%02d:%02d ===\n"
+				"  cl_netlog=%d"
+				"  (1=CONNECT+SVCMD+FAST/RESET+SNAPLATE+TIMEOUT+DISCONNECT"
+				"  2=also opens netgraph log with raw SNAP+STATS+OOB+USERINFO)\n\n",
+				1900 + t.tm_year, 1 + t.tm_mon, t.tm_mday,
+				t.tm_hour, t.tm_min, t.tm_sec,
+				cl_netlog->integer );
+			FS_Write( header, strlen(header), netLogFile );
+			Com_Printf( "Net debug log opened: %s\n", path );
+		}
+	}
+
+	/* When cl_netlog >= 2, open a separate high-frequency netgraph log so
+	   the main debug log stays readable with only important events. */
+	if ( cl_netlog->integer >= 2 && !netLogFile2 ) {
+		Com_sprintf( path, sizeof(path), "netgraph_%04d%02d%02d_%02d%02d%02d.log",
+			1900 + t.tm_year, 1 + t.tm_mon, t.tm_mday,
+			t.tm_hour, t.tm_min, t.tm_sec );
+		netLogFile2 = FS_FOpenFileWrite( path );
+		if ( netLogFile2 ) {
+			Com_sprintf( header, sizeof(header),
+				"=== Quake3e Netgraph Raw Log  %04d-%02d-%02d %02d:%02d:%02d ===\n"
+				"  cl_netlog=%d  (raw SNAP+STATS+OOB+USERINFO data)\n\n",
+				1900 + t.tm_year, 1 + t.tm_mon, t.tm_mday,
+				t.tm_hour, t.tm_min, t.tm_sec,
+				cl_netlog->integer );
+			FS_Write( header, strlen(header), netLogFile2 );
+			Com_Printf( "Netgraph raw log opened: %s\n", path );
+		}
 	}
 }
 
 static void SCR_WriteLog( const char *line ) {
 	if ( netLogFile )
 		FS_Write( line, strlen(line), netLogFile );
+}
+
+/* Write to the high-frequency netgraph log (cl_netlog >= 2). */
+static void SCR_WriteLog2( const char *line ) {
+	if ( netLogFile2 )
+		FS_Write( line, strlen(line), netLogFile2 );
 }
 
 void SCR_LogTimingEvent( const char *tag, int serverTimeDelta, int deltaDelta ) {
@@ -1019,6 +1048,11 @@ void SCR_LogServerCmd( int seq, int storedSeq, const char *text ) {
 	if ( !cl_netlog || !cl_netlog->integer )
 		return;
 
+	/* Skip high-frequency button state commands that add no debugging value. */
+	if ( !Q_stricmpn( text, "+button13", 9 ) || !Q_stricmpn( text, "-button13", 9 ) ||
+	     !Q_stricmpn( text, "+button14", 9 ) || !Q_stricmpn( text, "-button14", 9 ) )
+		return;
+
 	SCR_OpenNetLog();
 	Com_RealTime( &t );
 	Q_strncpyz( truncated, text, sizeof(truncated) );
@@ -1053,7 +1087,7 @@ void SCR_LogSnapState( int snapTime, int ping, int cmdTime, int msgSeq,
 		"  cmdSeq=%d  relSeq=%d  relAck=%d\n",
 		t.tm_hour, t.tm_min, t.tm_sec,
 		snapTime, ping, cmdTime, msgSeq, cmdSeq, relSeq, relAck );
-	SCR_WriteLog( line );
+	SCR_WriteLog2( line );
 }
 
 
@@ -1198,7 +1232,7 @@ void SCR_LogOOBPacket( const char *cmd ) {
 	Com_sprintf( line, sizeof(line),
 		"[%02d:%02d:%02d] OOB:PACKET  cmd='%s'\n",
 		t.tm_hour, t.tm_min, t.tm_sec, cmd );
-	SCR_WriteLog( line );
+	SCR_WriteLog2( line );
 }
 
 
@@ -1300,7 +1334,7 @@ void SCR_LogUserinfoSend( const char *info ) {
 		Info_ValueForKey( info, "authc" ),
 		Info_ValueForKey( info, "authl" ),
 		Info_ValueForKey( info, "snaps" ) );
-	SCR_WriteLog( line );
+	SCR_WriteLog2( line );
 }
 
 
@@ -1517,6 +1551,9 @@ static void SCR_NetMonUpdate( void ) {
 		netMonDispFiAvg      = ( netMonFiCount > 0 ) ? ( netMonFiSum / netMonFiCount ) : 0.0f;
 		netMonFiSum          = 0.0f;
 		netMonFiCount        = 0;
+		netMonDispSnapLeadMin = dtMin;
+		netMonDispSnapLeadMax = dtMax;
+		/* netMonDtMin/Max are re-initialised by netMonDtValid on next call */
 
 		/* record into 30-second ring buffer for laggot announce */
 		if ( cl_netgraph->integer ) {
@@ -1532,7 +1569,7 @@ static void SCR_NetMonUpdate( void ) {
 		}
 
 		/* optional periodic stats line in the log */
-		if ( cl_netlog->integer >= 2 && netLogFile ) {
+		if ( cl_netlog->integer >= 2 && netLogFile2 ) {
 			qtime_t t;
 			char    logline[256];
 			Com_RealTime( &t );
@@ -1551,7 +1588,7 @@ static void SCR_NetMonUpdate( void ) {
 				snapGapAvg, snapGapMax,
 				capHits, extrapCnt,
 				fastCnt, resetCnt, slowCnt );
-			SCR_WriteLog( logline );
+			SCR_WriteLog2( logline );
 		}
 
 		/* laggot announce: scan 30s ring buffer for worst values */
@@ -1653,7 +1690,7 @@ static void SCR_DrawNetMonitor( void ) {
 
 	graphH = NM_GRAPH_HALF_H * 2.0f * scale;  // total graph area height
 	bw = NM_COLS * charW + pad * 2.0f;
-	bh = NM_ROWS * charH + graphH + pad * 3.0f;  // extra pad between text and graph
+	bh = NM_ROWS * charH + graphH + pad * 3.0f + 2.0f * charH;  // +2 legend rows
 
 	bx = cl_netgraph_x->value;
 	by = cl_netgraph_y->value;
@@ -1696,8 +1733,9 @@ static void SCR_DrawNetMonitor( void ) {
 		netMonDispFtAvg, netMonDispFtMax );
 	NM_DrawRow( &tx, &ty, bx + pad, charW, charH, col, line );
 
-	/* row 5 - snap lead: how far cl.serverTime is ahead of the latest snapshot */
-	Com_sprintf( line, sizeof(line), "SnapLead: %+dms", cl.serverTime - cl.snap.serverTime );
+	/* row 5 - snap lead: 1-second min/max range (smoothed for readability) */
+	Com_sprintf( line, sizeof(line), "SnapLead:%+d..%+dms",
+		netMonDispSnapLeadMin, netMonDispSnapLeadMax );
 	NM_DrawRow( &tx, &ty, bx + pad, charW, charH, colorWhite, line );
 
 	/* row 6 - drops + extrapolations + caps
@@ -1831,6 +1869,49 @@ static void SCR_DrawNetMonitor( void ) {
 
 		re.SetColor( NULL );
 	}
+
+	/* --- Legend ---
+	   Two rows of color-coded labels below the graph explain the bar colours.
+	   Row 1 (top half): ping height bars -- colour shows RTT tier.
+	   Row 2 (bot half): snap quality bars -- colour shows connection quality. */
+	{
+		const char *p;
+		/* ty is still at the bottom of the text rows; graph sat at ty+pad*0.5.
+		   Place legend below: graph_bottom + half_pad gap. */
+		float ly  = ty + pad + graphH;
+		float ly2 = ly + charH;
+		float lx;
+
+		/* dim separator line: sits halfway between graph bottom and legend row 1 */
+		SCR_FillRect( bx + pad, ly - pad * 0.35f,
+		              bw - pad * 2.0f, 1.0f * scale, colorDimGray );
+
+		/* row 1: ping key  -- format: "Ping: <80 <150 >=150" (20 chars) */
+		lx = bx + pad;
+		re.SetColor( colorDimGray );
+		for ( p = "Ping: "; *p; p++ ) { SCR_DrawChar( (int)lx, (int)ly, charW, *p ); lx += charW; }
+		re.SetColor( colorGreen );
+		for ( p = "<80 "; *p; p++ )   { SCR_DrawChar( (int)lx, (int)ly, charW, *p ); lx += charW; }
+		re.SetColor( colorYellow );
+		for ( p = "<150 "; *p; p++ )  { SCR_DrawChar( (int)lx, (int)ly, charW, *p ); lx += charW; }
+		re.SetColor( colorRed );
+		for ( p = ">=150"; *p; p++ )  { SCR_DrawChar( (int)lx, (int)ly, charW, *p ); lx += charW; }
+
+		/* row 2: snap quality key -- "Snap: OK Jitt Chk Drop" (22 chars) */
+		lx = bx + pad;
+		re.SetColor( colorDimGray );
+		for ( p = "Snap: "; *p; p++ ) { SCR_DrawChar( (int)lx, (int)ly2, charW, *p ); lx += charW; }
+		re.SetColor( colorGreen );
+		for ( p = "OK "; *p; p++ )    { SCR_DrawChar( (int)lx, (int)ly2, charW, *p ); lx += charW; }
+		re.SetColor( colorYellow );
+		for ( p = "Jitt "; *p; p++ )  { SCR_DrawChar( (int)lx, (int)ly2, charW, *p ); lx += charW; }
+		re.SetColor( colorOrange );
+		for ( p = "Chk "; *p; p++ )   { SCR_DrawChar( (int)lx, (int)ly2, charW, *p ); lx += charW; }
+		re.SetColor( colorRed );
+		for ( p = "Drop"; *p; p++ )   { SCR_DrawChar( (int)lx, (int)ly2, charW, *p ); lx += charW; }
+
+		re.SetColor( NULL );
+	}
 }
 
 #undef NM_PING_HIGH
@@ -1857,6 +1938,9 @@ void SCR_Init( void ) {
 	Cvar_SetDescription( cl_netgraph,
 		"Show the net monitor overlay.\n"
 		"0 = off, 1 = on\n"
+		"The overlay has 10 stat rows followed by a laggometer graph.\n"
+		"Graph top half: ping bars (green <80ms, yellow <150ms, red >=150ms).\n"
+		"Graph bot half: snap quality (green=OK, yellow=Jitter, orange=Choke, red=Drop).\n"
 		"Default: 0" );
 
 	cl_netgraph_x = Cvar_Get( "cl_netgraph_x", "460", CVAR_PRIVATE );
