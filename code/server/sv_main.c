@@ -1575,7 +1575,7 @@ void SV_Frame( int msec ) {
 			thisFrameMsec++;
 		}
 
-		sv.timeResidual -= frameMsec;
+		sv.timeResidual -= thisFrameMsec;
 		svs.time += thisFrameMsec;
 		sv.time += thisFrameMsec;
 
@@ -1596,7 +1596,7 @@ void SV_Frame( int msec ) {
 			// applied to the inner game-tick loop so sv.gameTime advances at
 			// exactly sv_gameHz Hz (or sv_fps Hz when sv_gameHz <= 0).
 			_gameMsecRem = 1000 % _gameHz;
-			sv.gameTimeResidual += frameMsec;
+			sv.gameTimeResidual += thisFrameMsec;
 
 			while ( sv.gameTimeResidual >= _gameMsec ) {
 				int thisGameMsec = _gameMsec;
@@ -1605,7 +1605,7 @@ void SV_Frame( int msec ) {
 					sv.gameTimeResidualFrac -= _gameHz;
 					thisGameMsec++;
 				}
-				sv.gameTimeResidual -= _gameMsec;
+				sv.gameTimeResidual -= thisGameMsec;
 				sv.gameTime += thisGameMsec;
 				_gameFrameRan = qtrue;
 
